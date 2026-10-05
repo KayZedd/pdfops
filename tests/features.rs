@@ -1055,17 +1055,35 @@ fn right_to_left_text_is_shaped_and_laid_out_from_the_right() {
         eprintln!("skipped: {e}");
         return;
     }
-    // Glyphs are drawn left to right, so the last letter of the last word comes first.
+    // The text reads back as it was given, though its glyphs are drawn from the left,
+    // the last letter of the last word first.
     let text = &texts(&out)[0];
     assert!(
-        text.contains("\u{5dd}\u{5dc}\u{5d5}\u{5e2} \u{5dd}\u{5d5}\u{5dc}\u{5e9}"),
+        text.contains("\u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{5e2}\u{5d5}\u{5dc}\u{5dd}"),
         "{text}"
     );
     let footer = words(&out, 1);
     let (olam, shalom) = (&footer[footer.len() - 2], &footer[footer.len() - 1]);
     assert!(
-        olam.0.starts_with('\u{5dd}') && olam.1[2] < shalom.1[0],
+        olam.0.starts_with('\u{5e2}') && olam.1[2] < shalom.1[0],
         "{footer:?}"
+    );
+    // So it is found, marked and replaced by the words a person types.
+    let found = call(
+        "pdf_search",
+        json!({"input": out, "query": "\u{5e2}\u{5d5}\u{5dc}\u{5dd}"}),
+    );
+    assert_eq!(found["total_matches"], 1, "{found}");
+    let gone = dir.path().join("gone.pdf");
+    let v = call(
+        "pdf_redact",
+        json!({"input": out, "output": gone, "texts": ["\u{5e2}\u{5d5}\u{5dc}\u{5dd}"]}),
+    );
+    assert_eq!(v["text_matches"], 1, "{v}");
+    let text = &texts(&gone)[0];
+    assert!(
+        text.contains("\u{5e9}\u{5dc}\u{5d5}\u{5dd}") && !text.contains('\u{5e2}'),
+        "{text}"
     );
 
     let made = pdfops::tools::call(

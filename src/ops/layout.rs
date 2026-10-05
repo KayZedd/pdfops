@@ -108,6 +108,119 @@ impl Word {
             (self.bbox[1] + self.bbox[3]) / 2.0,
         )
     }
+
+    /// What each glyph reads as, in the order the glyphs are drawn.
+    pub(crate) fn pieces(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().enumerate().map(|(i, part)| {
+            let end = self.parts.get(i + 1).map_or(self.text.len(), |next| next.0);
+            &self.text[part.0..end]
+        })
+    }
+
+    /// The word as it is read. `text` holds it as it is drawn, which for Hebrew and
+    /// Arabic is back to front.
+    pub fn read(&self) -> String {
+        line_text(&[self])
+    }
+}
+
+/// The order in which pieces of a line are read, given from left to right as they
+/// are drawn; `None` where that is the same order.
+///
+/// A page holds text where it is drawn, so what runs from the right comes out back to
+/// front: its last letter is the leftmost glyph. This undoes what a typesetter did to
+/// the line: stretches that run from the right are turned round, and in a line that
+/// runs from the right as a whole, so is their sequence. A glyph that reads as several
+/// characters, as a ligature does, moves as one.
+///
+/// With each piece comes whether it stands in text running from the right. There a
+/// bracket is drawn as its mirror image, and reads as the one it was typed as: see
+/// `mirrored`.
+pub(crate) fn reading_order(pieces: &[&str]) -> Option<Vec<(usize, bool)>> {
+    use unicode_bidi::BidiClass::{AL, L, R};
+    let (mut from_right, mut from_left) = (0usize, 0usize);
+    for c in pieces.iter().flat_map(|p| p.chars()) {
+        match unicode_bidi::bidi_class(c) {
+            R | AL => from_right += 1,
+            L => from_left += 1,
+            _ => {}
+        }
+    }
+    if from_right == 0 {
+        return None;
+    }
+    let base = if from_right > from_left {
+        unicode_bidi::Level::rtl()
+    } else {
+        unicode_bidi::Level::ltr()
+    };
+    let text = pieces.concat();
+    let bidi = unicode_bidi::BidiInfo::new(&text, Some(base));
+    let mut at = 0;
+    let levels: Vec<u8> = pieces
+        .iter()
+        .map(|piece| {
+            let level = bidi.levels.get(at).map_or(base.number(), |l| l.number());
+            at += piece.len();
+            level
+        })
+        .collect();
+    let highest = *levels.iter().max()?;
+    let lowest_odd = levels.iter().copied().filter(|l| l % 2 == 1).min()?;
+    let mut order: Vec<usize> = (0..pieces.len()).collect();
+    for level in (lowest_odd..=highest).rev() {
+        let mut i = 0;
+        while i < order.len() {
+            let mut j = i;
+            while j < order.len() && levels[order[j]] >= level {
+                j += 1;
+            }
+            order[i..j].reverse();
+            i = j.max(i + 1);
+        }
+    }
+    Some(order.into_iter().map(|i| (i, levels[i] % 2 == 1)).collect())
+}
+
+/// A bracket as it was typed, given as it is drawn in text running from the right.
+pub(crate) fn mirrored(piece: &str) -> &str {
+    match piece {
+        "(" => ")",
+        ")" => "(",
+        "[" => "]",
+        "]" => "[",
+        "{" => "}",
+        "}" => "{",
+        "<" => ">",
+        ">" => "<",
+        "\u{ab}" => "\u{bb}",
+        "\u{bb}" => "\u{ab}",
+        other => other,
+    }
+}
+
+/// The text of words that stand on one line, given from left to right, as it is read.
+pub(crate) fn line_text(line: &[&Word]) -> String {
+    let mut pieces: Vec<&str> = Vec::new();
+    for (i, word) in line.iter().enumerate() {
+        if i > 0 {
+            pieces.push(" ");
+        }
+        pieces.extend(word.pieces());
+    }
+    match reading_order(&pieces) {
+        Some(order) => order
+            .into_iter()
+            .map(|(i, turned)| {
+                if turned {
+                    mirrored(pieces[i])
+                } else {
+                    pieces[i]
+                }
+            })
+            .collect(),
+        None => pieces.concat(),
+    }
 }
 
 /// A straight horizontal or vertical stroke, the raw material of table grids.
@@ -405,29 +518,43 @@ pub fn lines(words: &[Word]) -> Vec<Vec<&Word>> {
 /// The words as running text, in the order the page draws them.
 ///
 /// Drawing order is the author's reading order far more often than any geometric
-/// guess is: it keeps columns, sidebars and captions together.
+/// guess is: it keeps columns, sidebars and captions together. Within a line that
+/// holds text running from the right, the order is the one it is read in.
 pub fn plain_text(words: &[Word]) -> String {
+    use unicode_bidi::BidiClass::{AL, R};
     let mut out = String::new();
-    let mut previous: Option<&Word> = None;
+    let mut line: Vec<&Word> = Vec::new();
+    let finish = |line: &mut Vec<&Word>, out: &mut String| {
+        let from_right = |c: char| matches!(unicode_bidi::bidi_class(c), R | AL);
+        if line.iter().any(|w| w.text.chars().any(from_right)) {
+            line.sort_by(|a, b| a.bbox[0].total_cmp(&b.bbox[0]));
+            out.push_str(&line_text(line));
+        } else {
+            for (i, word) in line.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                out.push_str(&word.text);
+            }
+        }
+        line.clear();
+    };
     for word in words {
-        if let Some(before) = previous {
+        if let Some(before) = line.last() {
             let drop = word.center().1 - before.center().1;
             let size = before.size.min(word.size);
             // On the same line: level with the word before, or, for text that is not
             // horizontal, starting about where that word ended.
-            if drop.abs() < 0.5 * size || (word.start - before.end).hypot() < 1.2 * size {
-                out.push(' ');
-            } else {
-                out.push('\n');
+            if drop.abs() >= 0.5 * size && (word.start - before.end).hypot() >= 1.2 * size {
                 // More than a line's worth of space separates paragraphs.
-                if drop.abs() > 1.7 * before.size.max(word.size) {
-                    out.push('\n');
-                }
+                let apart = drop.abs() > 1.7 * before.size.max(word.size);
+                finish(&mut line, &mut out);
+                out.push_str(if apart { "\n\n" } else { "\n" });
             }
         }
-        out.push_str(&word.text);
-        previous = Some(word);
+        line.push(word);
     }
+    finish(&mut line, &mut out);
     out
 }
 
@@ -482,16 +609,11 @@ pub fn layout(a: LayoutArgs) -> Result<Value> {
                 let words = grouped
                     .iter()
                     .flatten()
-                    .map(|w| describe(w.text.clone(), w.bbox, w));
+                    .map(|w| describe(w.read(), w.bbox, w));
                 v["words"] = words.collect();
             } else {
                 let lines = grouped.iter().map(|line| {
-                    let text = line
-                        .iter()
-                        .map(|w| w.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    describe(text, union(line.iter().map(|w| w.bbox)), line[0])
+                    describe(line_text(line), union(line.iter().map(|w| w.bbox)), line[0])
                 });
                 v["lines"] = lines.collect();
             }
@@ -534,12 +656,7 @@ fn cell_text(words: &[&Word]) -> String {
     let owned: Vec<Word> = words.iter().map(|w| (*w).clone()).collect();
     lines(&owned)
         .iter()
-        .map(|line| {
-            line.iter()
-                .map(|w| w.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
+        .map(|line| line_text(line))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -769,10 +886,7 @@ fn into_columns<'w>(line: &Cells<'w>, columns: &[(f64, f64)]) -> Cells<'w> {
 }
 
 fn joined(cell: &[&Word]) -> String {
-    cell.iter()
-        .map(|w| w.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
+    line_text(cell)
 }
 
 /// Whether the line continues the row above it rather than starting a row of its own.
@@ -1011,5 +1125,53 @@ mod tests {
             "| a\\|b | c |\n| --- | --- |\n| 1,5 | say \"hi\" |"
         );
         assert_eq!(csv(&rows), "a|b,c\n\"1,5\",\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn text_running_from_the_right_is_read_back_in_its_own_order() {
+        // Each piece is what one glyph reads as; they come as drawn, from the left.
+        let read = |drawn: &[&str]| -> Option<String> {
+            reading_order(drawn).map(|order| {
+                order
+                    .into_iter()
+                    .map(|(i, turned)| if turned { mirrored(drawn[i]) } else { drawn[i] })
+                    .collect()
+            })
+        };
+        let glyphs = |text: &'static str| -> Vec<&'static str> {
+            text.char_indices()
+                .map(|(i, c)| &text[i..i + c.len_utf8()])
+                .collect()
+        };
+        assert_eq!(read(&glyphs("plain text, 12.5 (a)")), None);
+        // A Hebrew word: its last letter is drawn first.
+        assert_eq!(
+            read(&glyphs("\u{5dd}\u{5d5}\u{5dc}\u{5e9}")).unwrap(),
+            "\u{5e9}\u{5dc}\u{5d5}\u{5dd}"
+        );
+        // Two Hebrew words in an English sentence change places as well, and the
+        // sentence around them stays.
+        assert_eq!(
+            read(&glyphs(
+                "He said \u{5dd}\u{5dc}\u{5d5}\u{5e2} \u{5dd}\u{5d5}\u{5dc}\u{5e9}, then left."
+            ))
+            .unwrap(),
+            "He said \u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{5e2}\u{5d5}\u{5dc}\u{5dd}, then left."
+        );
+        // A line that runs from the right as a whole: the Latin and the number in it
+        // keep their order. The brackets are drawn as the eye expects them, so the one
+        // on the right, which is read first, has the shape of a closing one.
+        assert_eq!(
+            read(&glyphs(
+                ".\u{5d5}\u{5db}\u{5d5}\u{5ea}\u{5d1} PDF 1.7 (\u{5d8}\u{5e4}\u{5e9}\u{5de}) \u{5d4}\u{5d6}"
+            ))
+            .unwrap(),
+            "\u{5d6}\u{5d4} (\u{5de}\u{5e9}\u{5e4}\u{5d8}) PDF 1.7 \u{5d1}\u{5ea}\u{5d5}\u{5db}\u{5d5}."
+        );
+        // A ligature reads as two letters and moves as one glyph.
+        assert_eq!(
+            read(&["\u{645}", "\u{644}\u{627}", "\u{633}"]).unwrap(),
+            "\u{633}\u{644}\u{627}\u{645}"
+        );
     }
 }

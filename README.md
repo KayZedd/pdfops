@@ -321,9 +321,13 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
   the text: a usual sans-serif draws what it can and others stand in for the rest, so Polish,
   Chinese and Hindi can sit in one line. `create` lays a line out as a whole, so a comma after a
   Hebrew word in an English sentence lands where the sentence goes on, and a paragraph that runs
-  from the right is set against the right margin. One limit: reading the text back gives it in
-  drawing order, right-to-left words reversed and some Indic and Thai clusters with their
-  characters regrouped.
+  from the right is set against the right margin. One limit: reading such text back gives some
+  Indic and Thai clusters with their characters regrouped.
+- **Right-to-left text is read in the order it is read in.** A page holds Hebrew and Arabic as
+  they are drawn, last letter first. `text`, `search`, `layout`, `tables`, `redact --text`,
+  `replace --find` and `annotate --text` turn each line back, so a word is found by typing it.
+  Letters stay in the form the file has them in: Arabic stored as presentation forms is not
+  folded back to plain letters.
 - **Redaction** deletes what is under the areas from the page content: glyphs, image pixels,
   drawings lying wholly inside an area, and annotations with the form values they show. Images are
   blanked whatever they are stored as (scans in fax or JBIG2 coding, JPEG in any colour model,

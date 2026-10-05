@@ -1549,19 +1549,36 @@ pub(crate) fn text_areas(
 ) -> Vec<(Area, String, usize)> {
     let mut areas = Vec::new();
     for line in layout::lines(&page.words) {
-        // The line as one string, with each glyph's byte range and box.
+        // What each glyph reads as, with its box, and the spaces between words.
+        let mut pieces: Vec<(&str, Option<Area>)> = Vec::new();
+        for (i, word) in line.iter().enumerate() {
+            if i > 0 {
+                pieces.push((" ", None));
+            }
+            pieces.extend(
+                word.pieces()
+                    .zip(&word.parts)
+                    .map(|(piece, part)| (piece, Some(part.1))),
+            );
+        }
+        // The line as one string in the order it is read, which is how a text to
+        // find is given, with each glyph's byte range and box.
+        let drawn: Vec<&str> = pieces.iter().map(|p| p.0).collect();
+        let order = layout::reading_order(&drawn)
+            .unwrap_or_else(|| (0..pieces.len()).map(|i| (i, false)).collect());
         let mut text = String::new();
         let mut glyphs: Vec<(usize, usize, Area)> = Vec::new();
-        for word in &line {
-            if !text.is_empty() {
-                text.push(' ');
+        for (i, turned) in order {
+            let (piece, bbox) = pieces[i];
+            let piece = if turned {
+                layout::mirrored(piece)
+            } else {
+                piece
+            };
+            if let Some(bbox) = bbox {
+                glyphs.push((text.len(), text.len() + piece.len(), bbox));
             }
-            let base = text.len();
-            for (i, (offset, bbox)) in word.parts.iter().enumerate() {
-                let end = word.parts.get(i + 1).map_or(word.text.len(), |next| next.0);
-                glyphs.push((base + offset, base + end, *bbox));
-            }
-            text.push_str(&word.text);
+            text.push_str(piece);
         }
         for (which, pattern) in patterns.iter().enumerate() {
             for found in pattern.find_iter(&text) {
