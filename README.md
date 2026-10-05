@@ -347,7 +347,8 @@ The short version. `pdfops <command> --help` has the detail for each command.
 - **Merging and page work** keep bookmarks and links that lead to pages in the output, and
   rename the form fields of later inputs `doc2.<name>` so equal names do not share a value.
 - **Damaged files** are repaired for reading and rebuilt for writing; the result then carries
-  `repaired_inputs`. A damaged file that is also encrypted is not rebuilt. **Protected files stay protected** when edited; only `decrypt` removes it.
+  `repaired_inputs`. A damaged file that is also encrypted is not rebuilt. **Protected files stay
+  protected** when edited; only `decrypt` removes the protection.
 - **Limits.** 4 GiB and 300 seconds per command by default: `--max-memory`, `--timeout`, or
   `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`; 0 lifts a limit. Rasters are capped at 64 megapixels.
 - **Create** takes Markdown, and the HTML in it for what it says: headings, emphasis, links,
