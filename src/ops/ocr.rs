@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::ops::render::{check_dpi, page_png};
+use crate::progress::Progress;
 use crate::{doc, pagespec};
 
 const PROGRAM: &str = "tesseract";
@@ -420,12 +421,14 @@ pub fn recognise(
     let data = engine.data_dir(lang)?;
     let all = pdf.pages();
     let settings = InterpreterSettings::default();
+    let progress = Progress::new("ocr", pages.len());
     Ok(pages
         .par_iter()
         .map(|&n| {
             let text = page_png(&all[n as usize - 1], &settings, dpi)
                 .map_err(|e| e.to_string())
                 .and_then(|(png, ..)| recognise_png(&png, lang, dpi, data));
+            progress.tick(json!({"page": n, "recognised": text.is_ok()}));
             (n, text)
         })
         .collect())

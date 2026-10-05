@@ -11,6 +11,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::progress::Progress;
 use crate::{doc, pagespec};
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
@@ -424,6 +425,7 @@ pub fn split(a: SplitArgs) -> Result<Value> {
         .unwrap_or_else(|| "part".into());
 
     let outline = doc::outline(&d);
+    let progress = Progress::new("split", parts.len());
     let files: Vec<Value> = parts
         .par_iter()
         .enumerate()
@@ -435,6 +437,7 @@ pub fn split(a: SplitArgs) -> Result<Value> {
                 outline: &outline,
             }])?;
             let size = doc::save(&mut out, &path)?;
+            progress.tick(json!({"part": i + 1, "file": path}));
             Ok(json!({"file": path, "source_pages": pages, "size_bytes": size}))
         })
         .collect::<Result<_>>()?;

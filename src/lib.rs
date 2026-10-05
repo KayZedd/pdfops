@@ -10,5 +10,6 @@ pub mod limits;
 pub mod mcp;
 pub mod ops;
 pub mod pagespec;
+pub mod progress;
 pub mod sandbox;
 pub mod tools;

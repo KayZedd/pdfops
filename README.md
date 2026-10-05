@@ -144,6 +144,7 @@ pdfops text scan.pdf --ocr --ocr-lang pol+eng           # OCR only the pages tha
 pdfops tables report.pdf --pages 4 --format markdown
 pdfops layout report.pdf --pages 4 --level words        # bbox, font and size per word
 pdfops render report.pdf --pages 1-3 --dpi 150 -o out/  # look at charts and layout
+pdfops --stream ocr scan.pdf --lang pol                 # a line per page as it finishes
 pdfops images report.pdf -o images/
 ```
 
@@ -191,6 +192,12 @@ pdfops annotations marked.pdf
 
 - **Output.** Every command prints one JSON document on stdout. Errors go to stderr as
   `{"error": "..."}` with exit status 1. Add `--pretty` to indent.
+- **Progress.** With `--stream`, `ocr`, `text --ocr`, `render`, `images`, `split`, `redact` and
+  `replace` print one line of JSON per finished page or file,
+  `{"event":"progress","step":"render","done":7,"total":20,"page":12,...}`, and the usual result as
+  the last line. Pages are worked on in parallel, so events come in the order the work finishes;
+  each names its page and `done` rises by one per line. Over MCP the same events arrive as
+  `notifications/progress` when the call carries a progress token.
 - **Writing.** Commands that write take `-o`. It may be the input file: output goes through a
   temporary file.
 - **Pages** are 1-based and comma separated: `3`, `2-5`, `7-` (to the end), `-4` (from the start),

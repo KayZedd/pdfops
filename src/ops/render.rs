@@ -21,6 +21,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::progress::Progress;
 use crate::{doc, pagespec};
 
 /// Largest raster edge in pixels; the rasteriser addresses pixels with 16 bits.
@@ -117,6 +118,7 @@ pub fn render(a: RenderArgs) -> Result<Value> {
     std::fs::create_dir_all(&a.out_dir)?;
 
     let settings = InterpreterSettings::default();
+    let progress = Progress::new("render", pages.len());
     let files: Vec<Value> = pages
         .par_iter()
         .map(|&n| {
@@ -124,6 +126,7 @@ pub fn render(a: RenderArgs) -> Result<Value> {
             let path = a.out_dir.join(format!("page-{n:04}.png"));
             std::fs::write(&path, png)
                 .with_context(|| format!("cannot write {}", path.display()))?;
+            progress.tick(json!({"page": n, "file": path}));
             Ok(json!({"page": n, "file": path, "width": width, "height": height}))
         })
         .collect::<Result<_>>()?;
@@ -347,6 +350,7 @@ pub fn images(a: ImagesArgs) -> Result<Value> {
         }
     }
 
+    let progress = Progress::new("images", jobs.len());
     let results: Vec<Value> = jobs
         .par_iter()
         .flat_map_iter(|(n, wanted)| {
@@ -360,6 +364,7 @@ pub fn images(a: ImagesArgs) -> Result<Value> {
                 Mode::Export { done, .. } => done,
                 Mode::List(_) => unreachable!("interpret returns the mode it was given"),
             };
+            progress.tick(json!({"page": n, "images": done.len()}));
             let owner = &owner;
             done.into_iter().map(move |(key, outcome)| {
                 let (_, w, h) = owner[&key];

@@ -443,3 +443,144 @@ fn mcp_server_survives_a_call_that_hits_a_limit() {
     assert_eq!(replies[1]["result"]["isError"], false, "{}", replies[1]);
     assert_eq!(replies[1]["result"]["structuredContent"]["pages"], 2);
 }
+
+#[test]
+fn stream_prints_an_event_per_page_and_the_result_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = common::sample(dir.path(), "a.pdf", 3);
+    let bin = env!("CARGO_BIN_EXE_pdfops");
+    let run = |args: &[&str]| {
+        let out = Command::new(bin).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).expect("every line is JSON"))
+            .collect::<Vec<Value>>()
+    };
+    let (input, pages) = (pdf.to_str().unwrap(), dir.path().join("png"));
+    // --pretty must not break the one-document-per-line rule.
+    let lines = run(&[
+        "--stream",
+        "--pretty",
+        "render",
+        input,
+        "-o",
+        pages.to_str().unwrap(),
+    ]);
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    let (result, events) = lines.split_last().unwrap();
+    // Pages finish in any order; the count rises by one a line and every page is named once.
+    for (i, event) in events.iter().enumerate() {
+        assert_eq!(
+            (
+                &event["event"],
+                &event["step"],
+                &event["done"],
+                &event["total"]
+            ),
+            (
+                &json!("progress"),
+                &json!("render"),
+                &json!(i + 1),
+                &json!(3)
+            )
+        );
+        assert!(std::path::Path::new(event["file"].as_str().unwrap()).exists());
+    }
+    let mut seen: Vec<u64> = events.iter().map(|e| e["page"].as_u64().unwrap()).collect();
+    seen.sort_unstable();
+    assert_eq!(seen, [1, 2, 3]);
+    assert_eq!(result["files"].as_array().unwrap().len(), 3);
+    assert!(result.get("event").is_none());
+
+    let parts = dir.path().join("parts");
+    let lines = run(&["--stream", "split", input, "-o", parts.to_str().unwrap()]);
+    assert_eq!((lines.len(), &lines[3]["parts"]), (4, &json!(3)));
+    let out = dir.path().join("out.pdf");
+    let lines = run(&[
+        "--stream",
+        "redact",
+        input,
+        "--text",
+        "keyword",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(lines.len(), 4);
+    assert_eq!(
+        (&lines[2]["step"], &lines[2]["page"]),
+        (&json!("redact"), &json!(3))
+    );
+
+    // Without the flag there is exactly one line, as before.
+    assert_eq!(
+        run(&["render", input, "-o", pages.to_str().unwrap()]).len(),
+        1
+    );
+    // Raw text is not JSON, so it cannot be streamed.
+    let out = Command::new(bin)
+        .args(["--stream", "text", input, "--raw"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success() && out.stdout.is_empty());
+}
+
+#[test]
+fn mcp_server_sends_progress_when_asked_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = common::sample(dir.path(), "a.pdf", 3);
+    let call = |id: u32, meta: Value| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+            "name": "pdf_render",
+            "arguments": {"input": pdf, "out_dir": dir.path().join(id.to_string())},
+            "_meta": meta,
+        }})
+    };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pdfops"))
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "{}", call(1, json!({"progressToken": "tok-7"}))).unwrap();
+        writeln!(stdin, "{}", call(2, json!({}))).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    let lines: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    // Three notifications, then the reply to the first call; the second call asked for none.
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    for (i, note) in lines[..3].iter().enumerate() {
+        assert_eq!(note["method"], "notifications/progress");
+        assert!(note.get("id").is_none());
+        let p = &note["params"];
+        assert_eq!(
+            (&p["progressToken"], &p["progress"], &p["total"]),
+            (&json!("tok-7"), &json!(i + 1), &json!(3))
+        );
+        assert!(p["message"].as_str().unwrap().starts_with("render: page "));
+    }
+    for (line, id) in lines[3..].iter().zip([1, 2]) {
+        assert_eq!(
+            (&line["id"], &line["result"]["isError"]),
+            (&json!(id), &json!(false))
+        );
+        assert_eq!(
+            line["result"]["structuredContent"]["files"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+}

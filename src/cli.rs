@@ -24,6 +24,9 @@ pub struct Cli {
     /// Indent the JSON output
     #[arg(long, global = true)]
     pretty: bool,
+    /// Print a line of JSON for every finished page or file while working; the result is the last line
+    #[arg(long, global = true)]
+    stream: bool,
     /// Memory a command may hold, in MiB; 0 for no limit
     #[arg(long, global = true, env = "PDFOPS_MAX_MEMORY", default_value_t = 4096)]
     max_memory: usize,
@@ -115,6 +118,9 @@ fn run(command: Command, limits: (usize, u64)) -> Result<Option<Value>> {
         Command::Info(a) => read::info(a)?,
         Command::Text(a) => {
             let raw = a.raw;
+            if raw && crate::progress::enabled() {
+                anyhow::bail!("raw text cannot be streamed: every streamed line is JSON");
+            }
             let value = read::text(a)?;
             if raw {
                 println!("{}", read::raw_text(&value));
@@ -171,7 +177,11 @@ pub fn main() -> ExitCode {
     let cli = Cli::parse();
     // Parser panics are reported as JSON errors below, not as backtraces.
     std::panic::set_hook(Box::new(|_| {}));
-    let pretty = cli.pretty;
+    // Streamed output is one JSON document per line, so the result cannot be indented.
+    let pretty = cli.pretty && !cli.stream;
+    if cli.stream {
+        crate::progress::enable();
+    }
     let limits = (cli.max_memory, cli.timeout);
     // The server itself is long-lived and small; its limits apply to each call it starts.
     if !matches!(cli.command, Command::Mcp { .. }) {

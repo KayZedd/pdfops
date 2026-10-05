@@ -30,6 +30,7 @@ use serde_json::{Value, json};
 use crate::font::TextFont;
 use crate::ops::edit::{append_content, own_resources, prune, visual_space};
 use crate::ops::layout;
+use crate::progress::Progress;
 use crate::{doc, pagespec};
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
@@ -1219,6 +1220,7 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
     let mut pages: Vec<u32> = areas.keys().copied().collect();
     pages.sort_unstable();
     let mut report = Vec::new();
+    let progress = Progress::new("redact", pages.len());
     for &n in &pages {
         let id = *ids
             .get(n as usize - 1)
@@ -1311,6 +1313,7 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
                 .collect();
         }
         report.push(entry);
+        progress.tick(json!({"page": n}));
     }
 
     // The structure tree can repeat page text as alternative descriptions, and nothing
@@ -1392,6 +1395,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
     let ids = doc::page_ids(&d);
     let mut report = Vec::new();
     let mut total = 0;
+    let progress = Progress::new("replace", found.len());
     for (n, areas, texts, olds) in &found {
         let id = *ids
             .get(*n as usize - 1)
@@ -1477,6 +1481,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
                 .collect();
         }
         report.push(entry);
+        progress.tick(json!({"page": n}));
     }
     if total == 0 {
         bail!(
