@@ -278,3 +278,39 @@ pub fn ocr_lang() -> Option<String> {
         .or(langs.first())
         .map(|l| l.to_string())
 }
+
+/// Serves fixed responses over HTTP on a local port and returns the base URL.
+pub fn serve(routes: Vec<(&'static str, Vec<u8>)>) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                request.push(byte[0]);
+            }
+            let path = String::from_utf8_lossy(&request)
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            let reply = match routes.iter().find(|r| r.0 == path) {
+                Some((_, body)) => {
+                    let mut out = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    out.extend_from_slice(body);
+                    out
+                }
+                None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            };
+            let _ = stream.write_all(&reply);
+        }
+    });
+    base
+}

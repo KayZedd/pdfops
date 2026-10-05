@@ -13,8 +13,14 @@ Fast PDF operations for AI agents. A single Rust binary with no native PDF libra
 cargo install --git https://github.com/KayZedd/pdfops
 ```
 
-Requires Rust 1.92 or newer. OCR additionally needs the `tesseract` program and a language pack
-(for example `tesseract-ocr-eng` on Debian, `tesseract-data-eng` on Arch); nothing else does.
+Requires Rust 1.92 or newer. OCR additionally needs the `tesseract` program; nothing else does.
+Language data is fetched on request, without administrator rights:
+
+```sh
+pdfops ocr-langs                     # is tesseract there, which languages can be used
+pdfops ocr-install --lang pol+eng    # download language data into the user's data directory
+pdfops ocr-install --engine          # install tesseract itself where that needs no password
+```
 
 ## Commands
 
@@ -24,6 +30,7 @@ Requires Rust 1.92 or newer. OCR additionally needs the `tesseract` program and 
 | `text` | Extract text page by page, with a character budget and optional OCR fallback |
 | `search` | Find text or a regex, returns pages and snippets |
 | `ocr` | Recognise text on scanned pages |
+| `ocr-langs` / `ocr-install` | Check the OCR setup, download language data, install tesseract |
 | `outline` | Bookmarks with target pages |
 | `render` | Pages to PNG, for charts and layout |
 | `images` | Extract the images drawn on pages |
@@ -140,7 +147,11 @@ follow the selection, not the source.
   JPEG and JPEG 2000 are written as stored; everything else (Flate, LZW, CCITT fax, JBIG2, palette,
   masks) is decoded to PNG.
 - **OCR** quality and languages are tesseract's. Recognised text is returned, not written into the
-  PDF.
+  PDF. When a language is missing, the error names the `ocr-install` call that fixes it, so an agent
+  can recover on its own. Data comes from the `tessdata_fast` repository (`--best` for the larger
+  models) and is kept in `~/.local/share/pdfops/tessdata`, or `PDFOPS_TESSDATA` if set. Installing
+  tesseract itself uses the system package manager; where that needs a password, the command to
+  run is returned instead.
 - **Signatures.** Any change to a signed PDF invalidates its digital signatures.
 
 ## Development

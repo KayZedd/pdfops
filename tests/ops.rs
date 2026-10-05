@@ -912,7 +912,7 @@ fn ocr_reads_pages_without_a_text_layer() {
 
     let e = call_err("pdf_ocr", json!({"input": pdf, "lang": "zzz"}));
     assert!(
-        e.contains("no language data for 'zzz'") && e.contains(&lang),
+        e.contains("ocr-install --lang zzz") && e.contains(&lang),
         "{e}"
     );
 }

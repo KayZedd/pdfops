@@ -34,6 +34,10 @@ enum Command {
     Search(read::SearchArgs),
     /// Recognise text on scanned pages with OCR (needs the tesseract program)
     Ocr(ocr::OcrArgs),
+    /// Show whether tesseract is installed and which OCR languages can be used
+    OcrLangs(ocr::OcrLangsArgs),
+    /// Download OCR language data (no administrator rights needed), optionally install tesseract itself
+    OcrInstall(ocr::OcrInstallArgs),
     /// List the outline (bookmarks / table of contents) with target pages
     Outline(read::OutlineArgs),
     /// Render pages to PNG files, e.g. to look at scans, charts or layout
@@ -82,6 +86,8 @@ fn run(command: Command) -> Result<Option<Value>> {
         }
         Command::Search(a) => read::search(a)?,
         Command::Ocr(a) => ocr::ocr(a)?,
+        Command::OcrLangs(a) => ocr::ocr_langs(a)?,
+        Command::OcrInstall(a) => ocr::ocr_install(a)?,
         Command::Outline(a) => read::outline(a)?,
         Command::Render(a) => render::render(a)?,
         Command::Images(a) => render::images(a)?,

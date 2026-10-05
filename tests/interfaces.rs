@@ -34,8 +34,9 @@ fn mcp_handshake_and_tool_listing() {
             "{name} has no description"
         );
         assert_eq!(tool["inputSchema"]["type"], "object", "{name}");
+        let no_input = ["pdf_merge", "pdf_ocr_langs", "pdf_ocr_install"].contains(&name);
         assert!(
-            tool["inputSchema"]["properties"]["input"].is_object() || name == "pdf_merge",
+            tool["inputSchema"]["properties"]["input"].is_object() || no_input,
             "{name}"
         );
     }
@@ -182,4 +183,88 @@ fn mcp_server_speaks_over_stdio() {
         lines[1]["result"]["tools"].as_array().unwrap().len(),
         pdfops::tools::TOOLS.len()
     );
+}
+
+#[test]
+fn ocr_install_downloads_language_data_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = vec![7u8; 4096];
+    let base = common::serve(vec![
+        ("/tst.traineddata", model.clone()),
+        ("/tiny.traineddata", vec![1; 10]),
+    ]);
+
+    let (file, size, fetched) =
+        pdfops::ops::ocr::install_language("tst", dir.path(), &base).unwrap();
+    assert!(fetched && size == 4096);
+    assert_eq!(std::fs::read(&file).unwrap(), model);
+    // Already present: no second download, and nothing half-written left behind.
+    let (_, _, fetched) =
+        pdfops::ops::ocr::install_language("tst", dir.path(), "http://127.0.0.1:1").unwrap();
+    assert!(!fetched);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+    let err = |lang: &str| {
+        format!(
+            "{:#}",
+            pdfops::ops::ocr::install_language(lang, dir.path(), &base).unwrap_err()
+        )
+    };
+    assert!(
+        err("nope").contains("no language 'nope'"),
+        "{}",
+        err("nope")
+    );
+    assert!(err("tiny").contains("not a language model"));
+    // A code is never allowed to reach outside the data directory or the server path.
+    assert!(err("../x").contains("invalid language code"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn cli_ocr_install_then_lists_the_language() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = common::serve(vec![("/tst.traineddata", vec![7u8; 4096])]);
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_pdfops"))
+            .args(args)
+            .env("PDFOPS_TESSDATA", dir.path())
+            .env("PDFOPS_TESSDATA_URL", &base)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    };
+    let (ok, stdout, stderr) = run(&["ocr-install", "--lang", "tst"]);
+    assert!(ok, "{stderr}");
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["languages"][0]["downloaded"], true);
+    assert!(dir.path().join("tst.traineddata").is_file());
+
+    let (_, stdout, _) = run(&["ocr-langs"]);
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["downloaded_languages"], json!(["tst"]));
+    assert_eq!(v["tessdata_dir"], json!(dir.path()));
+
+    let (ok, _, stderr) = run(&["ocr-install"]);
+    assert!(!ok && stderr.contains("nothing to install"));
+}
+
+#[test]
+fn engine_install_command_follows_the_package_manager() {
+    use pdfops::ops::ocr::engine_command;
+    let (cmd, root) = engine_command(|p| p == "apt-get").unwrap();
+    assert_eq!(
+        (cmd.join(" ").as_str(), root),
+        ("apt-get install -y tesseract-ocr", true)
+    );
+    let (cmd, root) = engine_command(|p| p == "brew").unwrap();
+    assert_eq!(
+        (cmd.join(" ").as_str(), root),
+        ("brew install tesseract", false)
+    );
+    assert!(engine_command(|_| false).is_none());
 }

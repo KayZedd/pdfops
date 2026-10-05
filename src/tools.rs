@@ -36,6 +36,8 @@ pub const TOOLS: &[Tool] = &[
     tool!("text", read::TextArgs, read::text),
     tool!("search", read::SearchArgs, read::search),
     tool!("ocr", ocr::OcrArgs, ocr::ocr),
+    tool!("ocr-langs", ocr::OcrLangsArgs, ocr::ocr_langs),
+    tool!("ocr-install", ocr::OcrInstallArgs, ocr::ocr_install),
     tool!("outline", read::OutlineArgs, read::outline),
     tool!("render", render::RenderArgs, render::render),
     tool!("images", render::ImagesArgs, render::images),
