@@ -4,7 +4,7 @@ name: Corpus
 # A crash, a hang or an invalid output file fails the run.
 on:
   push:
-    branches: [main]
+    branches: [main, next]
     paths: ["src/**", "Cargo.lock", "scripts/corpus.py", ".github/workflows/corpus.yml"]
   schedule:
     - cron: "0 4 * * 1"

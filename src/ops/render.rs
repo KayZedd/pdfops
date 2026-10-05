@@ -70,7 +70,7 @@ pub struct ImagesArgs {
 
 /// Pixels per point for a page of `w` by `h` points: the requested resolution,
 /// lowered as far as the size caps demand.
-fn raster_scale(w: f32, h: f32, dpi: f32) -> f32 {
+pub(crate) fn raster_scale(w: f32, h: f32, dpi: f32) -> f32 {
     let (w, h) = (w.max(1.0), h.max(1.0));
     (dpi / 72.0)
         .min(MAX_EDGE / w.max(h))

@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
 use crate::ops::{
-    annotate, assemble, create, edit, forms, layout, ocr, read, redact, render, sign,
+    annotate, assemble, create, edit, forms, layout, ocr, read, redact, render, scan, sign,
 };
 use crate::{mcp, tools};
 
@@ -57,6 +57,8 @@ enum Command {
     Outline(read::OutlineArgs),
     /// List annotations: highlights, comments, links and other markup, with their positions
     Annotations(annotate::AnnotationsArgs),
+    /// Inspect a PDF for scripts, automatic actions, attached files, disguised content and hidden text
+    Scan(scan::ScanArgs),
     /// Render pages to PNG files, e.g. to look at scans, charts or layout
     Render(render::RenderArgs),
     /// Extract the images drawn on pages to files (JPEG and JPEG 2000 as stored, the rest as PNG)
@@ -79,6 +81,8 @@ enum Command {
     Redact(redact::RedactArgs),
     /// Replace text in place, written in the document's own font where it has the glyphs
     Replace(redact::ReplaceArgs),
+    /// Remove scripts, automatic and risky actions, attachments, XFA and media, then verify by scanning
+    Sanitize(scan::SanitizeArgs),
     /// Set title, author, subject, keywords or creator
     SetMeta(edit::SetMetaArgs),
     /// Shrink a PDF: lossless by default, optionally re-encoding and downscaling images
@@ -136,6 +140,7 @@ fn run(command: Command, limits: (usize, u64)) -> Result<Option<Value>> {
         Command::OcrInstall(a) => ocr::ocr_install(a)?,
         Command::Outline(a) => read::outline(a)?,
         Command::Annotations(a) => annotate::annotations(a)?,
+        Command::Scan(a) => scan::scan(a)?,
         Command::Render(a) => render::render(a)?,
         Command::Images(a) => render::images(a)?,
         Command::Create(a) => create::create(a)?,
@@ -147,6 +152,7 @@ fn run(command: Command, limits: (usize, u64)) -> Result<Option<Value>> {
         Command::Annotate(a) => annotate::annotate(a)?,
         Command::Redact(a) => redact::redact(a)?,
         Command::Replace(a) => redact::replace(a)?,
+        Command::Sanitize(a) => scan::sanitize(a)?,
         Command::SetMeta(a) => edit::set_meta(a)?,
         Command::Compress(a) => edit::compress(a)?,
         Command::Encrypt(a) => edit::encrypt(a)?,
@@ -167,6 +173,10 @@ fn run(command: Command, limits: (usize, u64)) -> Result<Option<Value>> {
                 crate::sandbox::set_root(root)?;
             }
             let args = serde_json::from_reader(std::io::stdin().lock())?;
+            // Not a tool: the part of `scan` that it runs away from itself.
+            if name == scan::HIDDEN_TEXT_CALL {
+                return Ok(Some(scan::hidden_text_call(args)?));
+            }
             tools::call(&name, args)?
         }
         Command::Tools => Value::Array(tools::definitions()),
@@ -187,6 +197,7 @@ pub fn main() -> ExitCode {
     if !matches!(cli.command, Command::Mcp { .. }) {
         crate::limits::set_max_memory(limits.0);
         crate::limits::set_timeout(limits.1);
+        scan::isolate_rendering();
     }
     let outcome = std::panic::catch_unwind(|| run(cli.command, limits)).unwrap_or_else(|_| {
         Err(anyhow::anyhow!(
@@ -195,7 +206,9 @@ pub fn main() -> ExitCode {
     });
     match outcome {
         Ok(None) => ExitCode::SUCCESS,
-        Ok(Some(value)) => {
+        Ok(Some(mut value)) => {
+            // One command per process, so every rebuilt file was an input of this one.
+            tools::note_repairs(&mut value, |_| true);
             let text = if pretty {
                 serde_json::to_string_pretty(&value)
             } else {

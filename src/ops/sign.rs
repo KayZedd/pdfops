@@ -383,7 +383,7 @@ fn add_signature(
 pub fn sign(a: SignArgs) -> Result<Value> {
     let identity = load_identity(&a)?;
     // Checks that the file is sound; the bytes are needed again for appending.
-    let mut d = doc::load(&a.input, None)?;
+    let (mut d, rebuilt) = doc::load_noting(&a.input, None)?;
     if d.was_encrypted() {
         bail!(
             "{} is encrypted; remove the protection first with the decrypt command",
@@ -405,6 +405,10 @@ pub fn sign(a: SignArgs) -> Result<Value> {
     let original =
         std::fs::read(&a.input).map_err(|e| anyhow!("cannot read {}: {e}", a.input.display()))?;
     let appended = (|| -> Result<Vec<u8>> {
+        // A rebuilt document no longer matches the bytes it came from.
+        if rebuilt {
+            bail!("the file was damaged and had to be rebuilt");
+        }
         let mut update = lopdf::IncrementalDocument::create_from(original.clone(), d.clone());
         let mut addition = std::mem::take(&mut update.new_document);
         add_signature(&d, &mut addition, signer.as_deref(), &a, now)?;

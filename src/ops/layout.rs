@@ -15,7 +15,7 @@ use hayro::hayro_interpret::hayro_cmap::BfString;
 use hayro::hayro_interpret::util::TransformExt;
 use hayro::hayro_interpret::{
     BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
-    InterpreterCache, InterpreterSettings, SoftMask, interpret_page,
+    InterpreterCache, InterpreterSettings, Paint, SoftMask, interpret_page,
 };
 use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, BezPath, PathSeg, Point, Rect, Shape};
@@ -89,6 +89,11 @@ pub struct Word {
     pub font: Option<Arc<str>>,
     pub bold: bool,
     pub italic: bool,
+    /// Drawn in the invisible text mode: extracted as text, but nothing is painted.
+    pub invisible: bool,
+    /// None of its glyphs has an outline, as when a font is neither embedded nor known.
+    /// Only established when a page is scanned for what can be seen.
+    pub(crate) blank: bool,
     /// Each glyph's byte offset into `text` and its box, for marking part of a word.
     pub(crate) parts: Vec<(usize, [f64; 4])>,
     /// Where the first glyph starts and where the next one would, on the baseline.
@@ -120,6 +125,9 @@ pub struct PageLayout {
     pub height: f64,
     pub words: Vec<Word>,
     rules: Vec<Rule>,
+    /// Areas drawn on translucently or with a blend mode, which show what is under them.
+    /// Only recorded when a page is scanned for what can be seen.
+    pub(crate) veils: Vec<[f64; 4]>,
 }
 
 type FontInfo = (Option<Arc<str>>, bool, bool);
@@ -131,9 +139,21 @@ struct Collector {
     open: bool,
     rules: Vec<Rule>,
     fonts: HashMap<u128, FontInfo>,
+    /// Whether to note what bears on visibility: glyphs without outlines, translucent drawing.
+    visibility: bool,
+    veils: Vec<[f64; 4]>,
+    /// One entry per open transparency group: whether it lets what is under it show.
+    groups: Vec<bool>,
 }
 
 impl Collector {
+    /// Notes an area as drawn on translucently, if it is, or if a group it sits in is.
+    fn veil(&mut self, sheer: bool, area: Rect) {
+        if self.visibility && (sheer || self.groups.contains(&true)) {
+            self.veils.push([area.x0, area.y0, area.x1, area.y1]);
+        }
+    }
+
     fn rule(&mut self, a: Point, b: Point) {
         // Slightly slanted strokes still count; scanned-in forms are rarely exact.
         if (a.y - b.y).abs() < 1.0 && (a.x - b.x).abs() > 3.0 {
@@ -156,13 +176,39 @@ impl Collector {
 
 impl<'a> Device<'a> for Collector {
     fn push_clip_path(&mut self, _: &ClipPath) {}
-    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
-    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
     fn pop_clip(&mut self) {}
-    fn pop_transparency_group(&mut self) {}
+
+    fn push_transparency_group(
+        &mut self,
+        opacity: f32,
+        mask: Option<SoftMask<'a>>,
+        blend: BlendMode,
+    ) {
+        self.groups
+            .push(opacity < 1.0 || mask.is_some() || blend != BlendMode::Normal);
+    }
+
+    fn pop_transparency_group(&mut self) {
+        self.groups.pop();
+    }
+
+    fn draw_image(&mut self, _: Image<'a, '_>, props: ImageDrawProps<'a>) {
+        let sheer = props.soft_mask.is_some() || props.blend_mode != BlendMode::Normal;
+        // An image fills the unit square of its own space.
+        self.veil(
+            sheer,
+            (props.transform * Rect::new(0.0, 0.0, 1.0, 1.0).to_path(0.1)).bounding_box(),
+        );
+    }
 
     fn draw_path(&mut self, path: &BezPath, props: DrawProps<'a>, mode: &DrawMode) {
         let path = props.transform * path.clone();
+        let sheer = props.soft_mask.is_some()
+            || props.blend_mode != BlendMode::Normal
+            || matches!(&props.paint, Paint::Color(c) if c.to_rgba().to_rgba8()[3] < 255);
+        if self.visibility {
+            self.veil(sheer, path.bounding_box());
+        }
         match mode {
             DrawMode::Stroke(_) | DrawMode::FillAndStroke(..) => {
                 for seg in path.segments() {
@@ -190,7 +236,8 @@ impl<'a> Device<'a> for Collector {
         }
     }
 
-    fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, props: DrawProps<'a>, _: &DrawMode) {
+    fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, props: DrawProps<'a>, mode: &DrawMode) {
+        let invisible = matches!(mode, DrawMode::Invisible);
         for glyph in run.glyphs() {
             // Glyph space is 1000 units per em.
             let to_page: Affine = props.transform * glyph.transform();
@@ -201,6 +248,9 @@ impl<'a> Device<'a> for Collector {
                 ),
                 Glyph::Type3(_) => (500.0, None),
             };
+            // A glyph the renderer has no shape for paints nothing, whatever a viewer shows.
+            let blank =
+                self.visibility && matches!(&**glyph, Glyph::Outline(o) if o.outline().is_empty());
             let origin = to_page * Point::new(0.0, 0.0);
             let end = to_page * Point::new(advance, 0.0);
             let up = (to_page * Point::new(0.0, 1000.0)) - origin;
@@ -246,9 +296,11 @@ impl<'a> Device<'a> for Collector {
                     (gap.x * along.x + gap.y * along.y).abs() < 0.15 * size
                         && (gap.x * along.y - gap.y * along.x).abs() < 0.4 * size
                         && (w.size - size).abs() < 0.1 * size
+                        && w.invisible == invisible
                 });
             if continues {
                 let word = self.words.last_mut().expect("checked above");
+                word.blank &= blank;
                 word.parts.push((word.text.len(), bbox));
                 word.text.push_str(&text);
                 word.bbox = [
@@ -281,6 +333,8 @@ impl<'a> Device<'a> for Collector {
                     font,
                     bold,
                     italic,
+                    invisible,
+                    blank,
                     parts: vec![(0, bbox)],
                     start: origin,
                     end,
@@ -293,6 +347,12 @@ impl<'a> Device<'a> for Collector {
 
 /// Interprets a page and returns its words and ruling lines.
 pub fn scan(page: &Page<'_>) -> PageLayout {
+    scan_with(page, true, false)
+}
+
+/// Like `scan`, with or without what the page's annotations and form fields draw, and
+/// optionally noting what bears on whether the words can be seen.
+pub(crate) fn scan_with(page: &Page<'_>, annotations: bool, visibility: bool) -> PageLayout {
     let (w, h) = page.render_dimensions();
     let cache = InterpreterCache::new();
     let mut context = Context::new(
@@ -300,15 +360,22 @@ pub fn scan(page: &Page<'_>) -> PageLayout {
         Rect::new(0.0, 0.0, w as f64, h as f64),
         &cache,
         page.xref(),
-        InterpreterSettings::default(),
+        InterpreterSettings {
+            render_annotations: annotations,
+            ..Default::default()
+        },
     );
-    let mut collector = Collector::default();
+    let mut collector = Collector {
+        visibility,
+        ..Default::default()
+    };
     interpret_page(page, &mut context, &mut collector);
     PageLayout {
         width: w as f64,
         height: h as f64,
         words: collector.words,
         rules: collector.rules,
+        veils: collector.veils,
     }
 }
 
@@ -573,6 +640,243 @@ fn segments<'w>(line: &[&'w Word]) -> Vec<Vec<&'w Word>> {
     out
 }
 
+/// One line of text as cells, each a run of words.
+type Cells<'w> = Vec<Vec<&'w Word>>;
+
+fn extent(cell: &[&Word]) -> (f64, f64) {
+    (cell[0].bbox[0], cell[cell.len() - 1].bbox[2])
+}
+
+/// Whether a line belongs to a list of contents: a title, a row of dots, a page number.
+fn has_leaders(line: &Cells<'_>) -> bool {
+    let words = || line.iter().flatten();
+    let loose: usize = words()
+        .filter(|w| w.text.chars().all(|c| matches!(c, '.' | '·' | '…')))
+        .map(|w| w.text.chars().count())
+        .sum();
+    loose >= 4 || words().any(|w| w.text.contains("...."))
+}
+
+/// How many rows may cross a gap between two columns without closing it.
+///
+/// A heading set across two columns, or one cell that runs over, should not
+/// make one column of two; in a short table every row counts.
+fn crossings_allowed(rows: usize) -> usize {
+    if rows >= 4 {
+        (rows * 15 / 100).max(1)
+    } else {
+        0
+    }
+}
+
+/// The stretches of x that hold a column each, from the cells of a block's rows.
+///
+/// Columns are first the stretches covered by some cell. A stretch is then cut
+/// where few rows cover it while more do on both sides: that is a gap between
+/// two columns with something lying across it.
+fn column_spans(rows: &[&Cells<'_>]) -> Vec<(f64, f64)> {
+    let mut spans: Vec<(f64, f64)> = rows
+        .iter()
+        .flat_map(|row| row.iter().map(|cell| extent(cell)))
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut covered: Vec<(f64, f64)> = Vec::new();
+    for &(from, to) in &spans {
+        match covered.last_mut() {
+            Some(last) if from <= last.1 + 2.0 => last.1 = last.1.max(to),
+            _ => covered.push((from, to)),
+        }
+    }
+    let allowed = crossings_allowed(rows.len());
+    if allowed == 0 {
+        return covered;
+    }
+    let mut columns = Vec::new();
+    for (from, to) in covered {
+        let mut edges: Vec<f64> = spans
+            .iter()
+            .flat_map(|s| [s.0, s.1])
+            .filter(|x| *x >= from && *x <= to)
+            .collect();
+        edges.sort_by(f64::total_cmp);
+        edges.dedup();
+        // Each stretch between two edges with the number of cells lying over it.
+        let pieces: Vec<(f64, f64, usize)> = edges
+            .windows(2)
+            .map(|e| {
+                let middle = (e[0] + e[1]) / 2.0;
+                let over = spans
+                    .iter()
+                    .filter(|s| s.0 <= middle && middle <= s.1)
+                    .count();
+                (e[0], e[1], over)
+            })
+            .collect();
+        let mut start = from;
+        let mut i = 0;
+        while i < pieces.len() {
+            if pieces[i].2 > allowed {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            while j < pieces.len() && pieces[j].2 <= allowed {
+                j += 1;
+            }
+            let (low_from, low_to) = (pieces[i].0, pieces[j - 1].1);
+            // A dip counts only with busier stretches on both sides of it.
+            let busy_before = pieces[..i].iter().any(|p| p.2 > allowed);
+            let busy_after = pieces[j..].iter().any(|p| p.2 > allowed);
+            if busy_before && busy_after && low_to - low_from >= 3.0 {
+                columns.push((start, low_from));
+                start = low_to;
+            }
+            i = j;
+        }
+        columns.push((start, to));
+    }
+    columns
+}
+
+/// The words of one line, sorted into the block's columns.
+fn into_columns<'w>(line: &Cells<'w>, columns: &[(f64, f64)]) -> Cells<'w> {
+    let overlap = |from: f64, to: f64, column: &(f64, f64)| to.min(column.1) - from.max(column.0);
+    let best = |from: f64, to: f64| {
+        (0..columns.len())
+            .max_by(|&a, &b| {
+                overlap(from, to, &columns[a]).total_cmp(&overlap(from, to, &columns[b]))
+            })
+            .unwrap_or(0)
+    };
+    let mut row: Cells<'w> = vec![Vec::new(); columns.len()];
+    for cell in line {
+        let (from, to) = extent(cell);
+        let of = |w: &Word| best(w.bbox[0], w.bbox[2]);
+        // Two columns set close together come as one run of words. It is taken apart
+        // where a change of column coincides with more room than a space takes.
+        let parts = cell
+            .windows(2)
+            .any(|p| of(p[0]) != of(p[1]) && p[1].bbox[0] - p[0].bbox[2] > 0.5 * p[0].size);
+        if parts {
+            for &word in cell {
+                row[of(word)].push(word);
+            }
+        } else {
+            row[best(from, to)].extend(cell.iter().copied());
+        }
+    }
+    row
+}
+
+fn joined(cell: &[&Word]) -> String {
+    cell.iter()
+        .map(|w| w.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether the line continues the row above it rather than starting a row of its own.
+///
+/// `tighter` says that the line sits closer to the one above than rows of this table do.
+fn continues(above: &Cells<'_>, line: &Cells<'_>, tighter: bool) -> bool {
+    let filled = |row: &Cells<'_>| row.iter().filter(|c| !c.is_empty()).count();
+    let wordy = |cell: &[&Word]| cell.iter().any(|w| w.text.chars().any(char::is_alphabetic));
+    if line[0].is_empty() {
+        // Text under cells that have text, with nothing in the first column: a cell
+        // that wrapped. Figures alone are a row, such as a total set under its column.
+        return line
+            .iter()
+            .zip(above)
+            .all(|(cell, over)| cell.is_empty() || !over.is_empty())
+            && line.iter().any(|cell| wordy(cell));
+    }
+    // A label with nothing beside it, then a line that reads on: the label wrapped,
+    // and the figures stand on its last line.
+    if above[0].is_empty() || filled(above) != 1 || above[0].iter().any(|w| !wordy(&[*w])) {
+        return false;
+    }
+    let indent = line[0][0].bbox[0] - above[0][0].bbox[0];
+    let lowercase = line[0][0]
+        .text
+        .chars()
+        .next()
+        .is_some_and(char::is_lowercase);
+    lowercase || (tighter && indent >= 0.4 * line[0][0].size)
+}
+
+/// Builds the table of a block of lines, or the tables of its parts where a line of
+/// running text cuts through it.
+fn block_tables(block: &[Cells<'_>], tables: &mut Vec<Table>) {
+    let wide: Vec<&Cells<'_>> = block.iter().filter(|line| line.len() >= 2).collect();
+    if wide.len() < 2 {
+        return;
+    }
+    let columns = column_spans(&wide);
+    if columns.len() < 2 {
+        return;
+    }
+    // A line in one piece that lies across columns is text around the table, not a row.
+    let crosses = |line: &Cells<'_>| {
+        let (from, to) = extent(&line[0]);
+        line.len() == 1
+            && columns
+                .iter()
+                .filter(|c| to.min(c.1) - from.max(c.0) > 1.0)
+                .count()
+                >= 2
+    };
+    if let Some(cut) = block.iter().position(crosses) {
+        block_tables(&block[..cut], tables);
+        block_tables(&block[cut + 1..], tables);
+        return;
+    }
+    if block.iter().filter(|line| has_leaders(line)).count() * 2 >= block.len() {
+        return;
+    }
+
+    let top = |line: &Cells<'_>| line[0][0].center().1;
+    let mut pitches: Vec<f64> = block.windows(2).map(|p| top(&p[1]) - top(&p[0])).collect();
+    pitches.sort_by(f64::total_cmp);
+    let pitch = pitches.get(pitches.len() / 2).copied().unwrap_or(0.0);
+
+    let mut rows: Vec<Cells<'_>> = Vec::new();
+    for (i, line) in block.iter().enumerate() {
+        let row = into_columns(line, &columns);
+        let gap = if i > 0 {
+            top(line) - top(&block[i - 1])
+        } else {
+            0.0
+        };
+        let close = gap <= 1.6 * line[0][0].size;
+        match rows.last_mut() {
+            Some(above) if close && continues(above, &row, gap <= 0.93 * pitch) => {
+                for (cell, more) in above.iter_mut().zip(row) {
+                    cell.extend(more);
+                }
+            }
+            _ => rows.push(row),
+        }
+    }
+    // A last line that stands alone under the table was only taken on trial.
+    if block.last().is_some_and(|line| line.len() == 1) && rows.len() > 1 {
+        let last = &rows[rows.len() - 1];
+        if last.iter().filter(|c| !c.is_empty()).count() == 1 && !last[0].is_empty() {
+            rows.pop();
+        }
+    }
+    if rows.len() < 2 {
+        return;
+    }
+    tables.push(Table {
+        bbox: union(rows.iter().flatten().flatten().map(|w| w.bbox)),
+        rows: rows
+            .iter()
+            .map(|row| row.iter().map(|cell| joined(cell)).collect())
+            .collect(),
+        method: "alignment",
+    });
+}
+
 /// Tables without ruling lines, found from text that lines up in columns.
 fn aligned_tables(page: &PageLayout, taken: &[[f64; 4]]) -> Vec<Table> {
     let inside = |w: &Word| {
@@ -582,64 +886,36 @@ fn aligned_tables(page: &PageLayout, taken: &[[f64; 4]]) -> Vec<Table> {
             .any(|b| cx >= b[0] && cx <= b[2] && cy >= b[1] && cy <= b[3])
     };
     let free: Vec<Word> = page.words.iter().filter(|w| !inside(w)).cloned().collect();
-    let rows: Vec<Vec<Vec<&Word>>> = lines(&free).iter().map(|l| segments(l)).collect();
+    let lines: Vec<Cells<'_>> = lines(&free).iter().map(|l| segments(l)).collect();
+    let top = |line: &Cells<'_>| line[0][0].center().1;
+    // A line in one piece may sit inside a table: a heading over a group of rows, a
+    // label that wrapped, a single figure. It is taken along when the table goes on
+    // within two lines of it and the lines are not far apart.
+    let near = |a: usize, b: usize| top(&lines[b]) - top(&lines[a]) <= 2.5 * lines[b][0][0].size;
 
     let mut tables = Vec::new();
     let mut start = 0;
-    while start < rows.len() {
-        // A block is a run of consecutive lines that each have several cells.
-        let mut end = start;
-        while end < rows.len() && rows[end].len() >= 2 {
-            end += 1;
+    while start < lines.len() {
+        if lines[start].len() < 2 {
+            start += 1;
+            continue;
         }
-        if end - start >= 2 {
-            let block = &rows[start..end];
-            // Columns are the stretches of x covered by some cell; the gaps between them separate columns.
-            let mut spans: Vec<(f64, f64)> = block
-                .iter()
-                .flatten()
-                .map(|cell| (cell[0].bbox[0], cell[cell.len() - 1].bbox[2]))
-                .collect();
-            spans.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let mut columns: Vec<(f64, f64)> = Vec::new();
-            for (from, to) in spans {
-                match columns.last_mut() {
-                    Some(last) if from <= last.1 + 2.0 => last.1 = last.1.max(to),
-                    _ => columns.push((from, to)),
+        let mut end = start + 1;
+        loop {
+            let ahead = (end..lines.len().min(end + 3))
+                .take_while(|&k| k == end || lines[k - 1].len() < 2)
+                .find(|&k| lines[k].len() >= 2);
+            match ahead {
+                Some(next) if (end..=next).all(|k| k == next && next == end || near(k - 1, k)) => {
+                    end = next + 1;
                 }
-            }
-            if columns.len() >= 2 {
-                let text: Vec<Vec<String>> = block
-                    .iter()
-                    .map(|row| {
-                        let mut cells = vec![Vec::<&Word>::new(); columns.len()];
-                        for cell in row {
-                            let x = cell[0].bbox[0];
-                            let col = columns
-                                .iter()
-                                .position(|c| x >= c.0 - 2.0 && x <= c.1 + 2.0)
-                                .unwrap_or(0);
-                            cells[col].extend(cell.iter().copied());
-                        }
-                        cells
-                            .iter()
-                            .map(|c| {
-                                c.iter()
-                                    .map(|w| w.text.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            })
-                            .collect()
-                    })
-                    .collect();
-                tables.push(Table {
-                    bbox: union(block.iter().flatten().flatten().map(|w| w.bbox)),
-                    rows: text,
-                    method: "alignment",
-                });
+                _ => break,
             }
         }
-        start = end.max(start + 1);
+        // One more line may be the wrapped end of the last row.
+        let trailing = end < lines.len() && lines[end].len() == 1 && near(end - 1, end);
+        block_tables(&lines[start..end + usize::from(trailing)], &mut tables);
+        start = end;
     }
     tables
 }

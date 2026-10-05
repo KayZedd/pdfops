@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>Fast PDF tools for AI agents.</b><br>
-  One binary, 29 tools, JSON in and out. Works as a CLI, an MCP server and a Rust library.
+  One binary, 31 tools, JSON in and out. Works as a CLI, an MCP server and a Rust library.
 </p>
 
 <p align="center">
@@ -25,7 +25,8 @@ $ pdfops stamp offer.pdf --image signature.png --x 380 --y 690 -o signed.pdf
 - **Built for agents.** Every command returns one JSON document, errors say what to do next, and
   text can be read under a character budget with a resume point.
 - **Everything in one place.** Reading, layout, tables, OCR, rendering, page surgery, stamping,
-  redaction, annotations, signatures, forms, encryption and creation: 29 tools behind one schema.
+  redaction, annotations, signatures, forms, encryption, inspection and creation: 31 tools behind
+  one schema.
 - **Nothing to set up.** A single binary with no PDF libraries, no Python and no runtime. Only OCR
   needs an extra program, and pdfops can fetch the language data itself.
 - **Fast.** Files open in milliseconds whatever their size, and page work runs on all cores. See the
@@ -35,6 +36,9 @@ $ pdfops stamp offer.pdf --image signature.png --x 380 --y 690 -o signed.pdf
 - **Safe on files you did not write.** Every command runs under a memory cap and a time limit, the
   MCP server runs each call in a process of its own and can be confined to one directory, and
   every command is exercised against a corpus of 988 hostile and malformed PDFs in CI.
+- **Knows what a file is up to.** `scan` reports scripts, actions that fire by themselves, attached
+  programs, disguised names and text that is extracted but cannot be seen, the carrier of prompt
+  injection. `sanitize` removes the active content and proves it by scanning the result.
 
 ## Quick start
 
@@ -100,6 +104,7 @@ pdfops ocr-install --engine          # install tesseract itself where that needs
 | | `render` | Pages to PNG, to look at charts, scans and layout |
 | | `images` | The images drawn on pages, as files |
 | | `ocr` | Recognised text of scanned pages |
+| | `scan` | Scripts, automatic actions, attachments, disguised content and hidden text, by severity |
 | **Build** | `create` | A new PDF from Markdown |
 | | `merge` | Several PDFs into one |
 | | `pages` | Keep, reorder, duplicate or delete pages |
@@ -116,6 +121,7 @@ pdfops ocr-install --engine          # install tesseract itself where that needs
 | **Protect** | `encrypt` | AES-256 passwords and permissions |
 | | `decrypt` | Remove password protection |
 | | `sign` | Sign digitally with a certificate, keeping earlier signatures valid |
+| | `sanitize` | Remove scripts, risky actions, attachments, XFA and media, then verify by scanning |
 | **Setup** | `ocr-langs` | Whether tesseract is installed and which languages are usable |
 | | `ocr-install` | Download OCR language data, optionally install tesseract |
 
@@ -178,6 +184,8 @@ pdfops fill form.pdf --set name="Ada Lovelace" --set agree=true -o filled.pdf
 pdfops encrypt in.pdf --owner-password secret --deny-copy -o locked.pdf
 pdfops sign in.pdf --p12 identity.p12 --p12-password secret --reason "Approved" -o signed.pdf
 pdfops signatures signed.pdf                            # valid, unchanged, who and when
+pdfops scan inbox/offer.pdf                             # what is in it, before reading it
+pdfops sanitize inbox/offer.pdf -o offer-clean.pdf      # scripts, actions, attachments removed
 ```
 
 Markup:
@@ -225,6 +233,8 @@ pdfops annotations marked.pdf
 | Add and list annotations | ✓ | ✓ | ✓ | list | – | – |
 | Sign digitally | ✓ | – | – | – | – | – |
 | Verify signatures | ✓ | – | – | – | – | ✓ |
+| Inspect for active content and hidden text | ✓ | – | – | – | – | – |
+| Remove active content | ✓ | ✓ | – | – | – | – |
 | Memory and time limits per call | ✓ | – | – | – | – | – |
 | Create from Markdown | ✓ | from HTML | – | – | – | – |
 | Built-in MCP server and tool schemas | ✓ | – | – | – | – | – |
@@ -314,8 +324,33 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
   change and writes nothing. `redact` lists every area with the text that matched and the counts of
   glyphs, images, drawings and annotations that would go; `replace` lists every match with its box,
   the old and new text, which font would write it and by how much it would overflow.
+- **Scan** inspects structure; it is not a virus scanner and never calls a file safe. The verdict is
+  `nothing found` or `findings`, each finding has a severity (`high`, `medium`, `low`, `info`), the
+  objects it sits in and samples, and the result lists what was checked and what was not. It reads
+  the raw bytes as well as the parsed objects, so a file that does not open, or hides a name behind
+  `#xx` escapes or inside a packed object, is still judged. With `--clamav` the file is also passed
+  to `clamscan` when that is installed; no signature database is bundled.
+- **Hidden text** is found by looking: every page is rendered, and a word that leaves no trace in
+  the picture is reported with its page, box, reason and text, whether it is in the invisible text
+  mode, in the colour of its background, under a flat shape, clipped away, smaller than 1.5 points
+  or off the page. The judgement is made from pdfops' own rendering, and is withheld where that
+  cannot be relied on: under translucent or blended drawing, and for fonts it cannot draw. Rendering runs in a process of its own, so a file built to exhaust memory or
+  time costs this one check and is reported as `resource_exhaustion`; the rest of the result stands. Invisible text over visible content, which scanned pages with recognised text
+  have, is reported apart as `invisible_text_layer` with severity `info`. Text under a picture that
+  is not a flat colour is not detected, and neither is text inside annotations and form fields. The boxes can be passed to `redact --rect`.
+- **Sanitize** removes JavaScript, actions that run by themselves or start programs, send form
+  data or open other files, embedded files, XFA forms and media annotations; `--keep` leaves a
+  group in place. Ordinary web links stay, and hidden text is not touched. The result is scanned
+  before it is written, and nothing is written if any of it is still there. Like every rewrite, it
+  invalidates digital signatures.
 - **Tables** drawn with ruling lines are read cell by cell and are reliable. Tables without lines
-  are inferred from column alignment (`detected_by: alignment`) and deserve a look before trusting.
+  are inferred from column alignment (`detected_by: alignment`): columns are the stretches of the
+  page that rows fill, kept apart even where a heading lies across two of them; a label or a
+  description that wraps is joined to its row; rows with empty cells, a heading over a group of
+  rows and a figure set alone under its column stay in the table; running text between two tables
+  splits them, and a list of contents with dot leaders is not a table. It is still inference:
+  whether a line continues the row above is judged from indentation, spacing and capitals, so such
+  tables deserve a look before trusting.
 - **Create** understands headings, emphasis, links, nested lists, quotes, code blocks, tables, rules
   and local images. HTML inside the Markdown is ignored; there is no HTML or CSS engine.
 - **Bookmarks.** `merge`, `pages` and `split` keep the bookmarks whose target page is in the output.
@@ -338,8 +373,11 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
   `--timeout` (seconds), or `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`, change that, and 0 lifts a
   limit. Hitting one is an ordinary error. Rasters are capped at 64 megapixels.
 - **Damaged files** are read by a parser that repairs them, so `text`, `tables`, `render` and the
-  other reading commands work. Commands that write refuse such a file rather than save it with
-  parts missing, and say how to repair it first.
+  other reading commands work. Commands that write rebuild such a file from what that parser sees:
+  every object the catalog and the pages reach, with the page tree laid out afresh. The result then
+  carries `repaired_inputs`, and what could not be read is missing from the output, exactly as it
+  is from `text` and `render`. A damaged file that is also encrypted, or in which no page can be
+  read, is refused. Signing a rebuilt file rewrites it, so signatures it carried do not survive.
 - **Protected files stay protected.** Editing an encrypted file writes it back encrypted with the
   same passwords and permissions. Only `decrypt` removes protection.
 - **Signing** appends to the file, so signatures already present stay valid. The signature is

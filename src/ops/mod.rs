@@ -12,4 +12,5 @@ pub mod ocr;
 pub mod read;
 pub mod redact;
 pub mod render;
+pub mod scan;
 pub mod sign;

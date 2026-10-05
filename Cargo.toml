@@ -25,6 +25,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 cms = { version = "0.2.3", features = ["builder"] }
 der = "0.7"
+flate2 = "1.1"
 fontdb = "0.24.0"
 getrandom = "0.4"
 hayro = "0.8.0"
@@ -38,12 +39,14 @@ qrcode = { version = "0.14.1", default-features = false }
 rayon = "1.12.0"
 regex = "1.13.1"
 rsa = { version = "0.9.10", features = ["sha2"] }
+rustybuzz = "0.20"
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10"
 subsetter = "0.2.6"
 ttf-parser = "0.25"
+unicode-bidi = "0.3"
 ureq = "3.4.2"
 x509-cert = "0.2"
 

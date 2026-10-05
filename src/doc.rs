@@ -3,36 +3,87 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
+use hayro::hayro_syntax::object::{Dict, MaybeRef, Object as LazyObject, ObjectIdentifier};
 use hayro::hayro_syntax::{LoadPdfError, Pdf};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 /// Attributes a page may inherit from its ancestors in the page tree.
 pub const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
 
-/// Loads a PDF, decrypting it when it is encrypted.
+/// Loads a PDF for rewriting, decrypting it when it is encrypted.
+///
+/// A file the strict reader cannot take in full is rebuilt from what the
+/// repairing reader sees; `repaired_inputs` then names it.
 pub fn load(path: &Path, password: Option<&str>) -> Result<Document> {
-    let (doc, bytes) = read(path, password)?;
-    if let Some(reason) = damage(&doc, bytes, password) {
-        bail!(
-            "{} is damaged ({reason}). It can be read but not rewritten safely; repair it first, e.g. with `qpdf in.pdf repaired.pdf`",
+    Ok(load_noting(path, password)?.0)
+}
+
+/// Like `load`, and says whether the document had to be rebuilt.
+pub fn load_noting(path: &Path, password: Option<&str>) -> Result<(Document, bool)> {
+    let bytes =
+        Arc::new(std::fs::read(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?);
+    let strict = parse(&bytes, path, password);
+    // An encrypted file is rebuilt from decrypted objects, and nothing here could
+    // encrypt those again; such a file is taken as it is or not at all.
+    let encrypted = trailer_has_encrypt(&bytes);
+    let reason = match strict {
+        Ok(doc) => match damage(&doc, bytes.clone(), password) {
+            None => return Ok((doc, false)),
+            Some(reason) => reason,
+        },
+        Err(e) if encrypted => return Err(e),
+        Err(e) => match rebuild(bytes.clone()) {
+            Ok(doc) => return Ok((note_repaired(path, doc), true)),
+            Err(_) => return Err(e),
+        },
+    };
+    let rebuilt = if encrypted {
+        Err(anyhow!("it is encrypted as well"))
+    } else {
+        rebuild(bytes)
+    };
+    match rebuilt {
+        Ok(doc) => Ok((note_repaired(path, doc), true)),
+        Err(why) => bail!(
+            "{} is damaged ({reason}) and could not be rebuilt ({why}). It can be read but not rewritten safely; repair it first, e.g. with `qpdf in.pdf repaired.pdf`",
             path.display()
-        );
+        ),
     }
-    Ok(doc)
+}
+
+/// Files that had to be rebuilt on loading, in this process.
+static REPAIRED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn note_repaired(path: &Path, doc: Document) -> Document {
+    let mut repaired = REPAIRED.lock().unwrap_or_else(|e| e.into_inner());
+    if !repaired.iter().any(|p| p == path) {
+        repaired.push(path.to_path_buf());
+    }
+    doc
+}
+
+/// The files loaded for rewriting that were damaged and had to be rebuilt.
+pub fn repaired_inputs() -> Vec<PathBuf> {
+    REPAIRED.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Loads a PDF for looking at, without insisting that it could be written back.
 ///
 /// Returns the file's bytes as well, for callers that go on to check it.
-pub fn read(path: &Path, password: Option<&str>) -> Result<(Document, std::sync::Arc<Vec<u8>>)> {
-    let bytes = std::sync::Arc::new(
-        std::fs::read(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?,
-    );
+pub fn read(path: &Path, password: Option<&str>) -> Result<(Document, Arc<Vec<u8>>)> {
+    let bytes =
+        Arc::new(std::fs::read(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?);
+    Ok((parse(&bytes, path, password)?, bytes))
+}
+
+/// Parses a file's bytes with the strict reader.
+fn parse(bytes: &[u8], path: &Path, password: Option<&str>) -> Result<Document> {
     let doc = match password {
-        Some(p) => Document::load_mem_with_options(&bytes, lopdf::LoadOptions::with_password(p)),
-        None => Document::load_mem(&bytes),
+        Some(p) => Document::load_mem_with_options(bytes, lopdf::LoadOptions::with_password(p)),
+        None => Document::load_mem(bytes),
     }
     .map_err(|e| anyhow!("cannot open {}: {e}", path.display()))?;
     if doc.is_encrypted() {
@@ -46,7 +97,169 @@ pub fn read(path: &Path, password: Option<&str>) -> Result<(Document, std::sync:
             }
         );
     }
-    Ok((doc, bytes))
+    Ok(doc)
+}
+
+/// One object as the repairing reader has it, in the writing model's terms.
+///
+/// References met on the way are added to `open`, to be fetched in turn.
+fn convert(object: &LazyObject<'_>, open: &mut Vec<ObjectId>, depth: u32) -> Result<Object> {
+    if depth > 200 {
+        bail!("objects are nested too deeply");
+    }
+    let item = |item: MaybeRef<LazyObject<'_>>, open: &mut Vec<ObjectId>| match item {
+        MaybeRef::Ref(r) => {
+            // Numbers out of range cannot name an object; such a reference reads as null.
+            match (u32::try_from(r.obj_number), u16::try_from(r.gen_number)) {
+                (Ok(number), Ok(generation)) if number > 0 => {
+                    open.push((number, generation));
+                    Ok(Object::Reference((number, generation)))
+                }
+                _ => Ok(Object::Null),
+            }
+        }
+        MaybeRef::NotRef(inner) => convert(&inner, open, depth + 1),
+    };
+    let dictionary = |dict: &Dict<'_>, open: &mut Vec<ObjectId>| -> Result<Dictionary> {
+        let mut out = Dictionary::new();
+        for (key, value) in dict.entries() {
+            out.set(key.to_vec(), item(value, open)?);
+        }
+        Ok(out)
+    };
+    Ok(match object {
+        LazyObject::Null(_) => Object::Null,
+        LazyObject::Boolean(b) => Object::Boolean(*b),
+        LazyObject::Number(n) => {
+            let value = n.as_f64();
+            if value.fract() == 0.0 && value.abs() < 9.0e15 {
+                Object::Integer(value as i64)
+            } else {
+                Object::Real(value as f32)
+            }
+        }
+        LazyObject::String(s) => Object::String(s.to_vec(), lopdf::StringFormat::Literal),
+        LazyObject::Name(n) => Object::Name(n.to_vec()),
+        LazyObject::Dict(dict) => Object::Dictionary(dictionary(dict, open)?),
+        LazyObject::Array(array) => Object::Array(
+            array
+                .raw_iter()
+                .map(|i| item(i, open))
+                .collect::<Result<_>>()?,
+        ),
+        LazyObject::Stream(stream) => {
+            let dict = dictionary(stream.dict(), open)?;
+            // The data stays as stored; its length is stated anew from what was found.
+            Object::Stream(lopdf::Stream::new(dict, stream.raw_data().into_owned()))
+        }
+    })
+}
+
+/// Builds a document from what the repairing reader sees of a damaged file.
+///
+/// Everything the catalog and the pages reach is carried over as it is read; the
+/// page tree is laid out afresh from the pages in the order that reader gives
+/// them. What it cannot read is absent, exactly as it is for `text` and `render`.
+fn rebuild(bytes: Arc<Vec<u8>>) -> Result<Document> {
+    let pdf = Pdf::new(bytes.clone()).map_err(|_| anyhow!("it has no readable structure"))?;
+    let xref = pdf.xref();
+    let key = |id: ObjectIdentifier| -> Option<ObjectId> {
+        let number = u32::try_from(id.obj_number).ok().filter(|n| *n > 0)?;
+        Some((number, u16::try_from(id.gen_number).ok()?))
+    };
+    let pages: Vec<ObjectId> = pdf
+        .pages()
+        .iter()
+        .map(|page| page.raw().obj_id().and_then(key))
+        .collect::<Option<_>>()
+        .ok_or_else(|| anyhow!("a page is not an object of its own"))?;
+    if pages.is_empty() {
+        bail!("no page could be read");
+    }
+    let root = key(xref.root_id()).ok_or_else(|| anyhow!("it has no catalog"))?;
+    let info = info_reference(&bytes);
+
+    let mut doc = Document::with_version("1.7");
+    let mut open: Vec<ObjectId> = pages.clone();
+    open.push(root);
+    open.extend(info);
+    while let Some(id) = open.pop() {
+        if doc.objects.contains_key(&id) {
+            continue;
+        }
+        if doc.objects.len() > 5_000_000 {
+            bail!("it has too many objects");
+        }
+        // A reference to nothing reads as null, which is what leaving it out gives.
+        let lazy = xref.get::<LazyObject<'_>>(ObjectIdentifier::new(id.0 as i32, id.1 as i32));
+        if let Some(lazy) = lazy {
+            let object = convert(&lazy, &mut open, 0)?;
+            doc.objects.insert(id, object);
+        }
+    }
+    if doc.get_dictionary(root).is_err() {
+        bail!("its catalog cannot be read");
+    }
+    doc.max_id = doc.objects.keys().map(|id| id.0).max().unwrap_or(0);
+
+    // What a page inherits is written onto the page before its ancestors are let go.
+    let mut own: Vec<Vec<(&[u8], Object)>> = Vec::with_capacity(pages.len());
+    for &page in &pages {
+        if doc.get_dictionary(page).is_err() {
+            bail!("a page cannot be read");
+        }
+        own.push(
+            INHERITABLE
+                .iter()
+                .filter_map(|key| Some((*key, inherited(&doc, page, key)?.clone())))
+                .collect(),
+        );
+    }
+    let tree = doc.new_object_id();
+    for (&page, attributes) in pages.iter().zip(own) {
+        let dict = doc.get_dictionary_mut(page)?;
+        for (key, value) in attributes {
+            dict.set(key, value);
+        }
+        dict.set("Type", Object::Name(b"Page".to_vec()));
+        dict.set("Parent", tree);
+    }
+    let mut node = Dictionary::new();
+    node.set("Type", Object::Name(b"Pages".to_vec()));
+    node.set("Count", pages.len() as i64);
+    node.set(
+        "Kids",
+        pages
+            .iter()
+            .map(|&id| Object::Reference(id))
+            .collect::<Vec<_>>(),
+    );
+    doc.objects.insert(tree, Object::Dictionary(node));
+    let catalog = doc.get_dictionary_mut(root)?;
+    catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+    catalog.set("Pages", tree);
+    doc.trailer.set("Root", root);
+    if let Some(info) = info.filter(|id| doc.get_dictionary(*id).is_ok()) {
+        doc.trailer.set("Info", info);
+    }
+    // The old tree's nodes, and whatever only they held on to.
+    crate::ops::edit::prune(&mut doc);
+    if doc.get_pages().len() != pages.len() {
+        bail!("its pages cannot be laid out again");
+    }
+    Ok(doc)
+}
+
+/// The information dictionary the newest trailer names, read from the bytes.
+fn info_reference(bytes: &[u8]) -> Option<ObjectId> {
+    let pattern = regex::bytes::Regex::new(r"(?-u)/Info\s+(\d{1,10})\s+(\d{1,5})\s+R")
+        .expect("the pattern is valid");
+    let found = pattern.captures_iter(bytes).last()?;
+    let number = |i: usize| std::str::from_utf8(&found[i]).ok()?.parse::<u32>().ok();
+    Some((
+        number(1).filter(|n| *n > 0)?,
+        u16::try_from(number(2)?).ok()?,
+    ))
 }
 
 /// Why this document must not be written back, if it was not read in full.

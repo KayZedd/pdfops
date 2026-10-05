@@ -6,12 +6,17 @@
 //! fails with an ordinary error when it hits one.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static USED: AtomicUsize = AtomicUsize::new(0);
 /// Zero means no cap.
 static CAP: AtomicUsize = AtomicUsize::new(0);
+/// The time limit in seconds, zero for none, and when it started to run.
+static TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static STARTED: OnceLock<Instant> = OnceLock::new();
 
 /// Writes `message` to standard error and ends the process with status 1, at once.
 ///
@@ -122,6 +127,18 @@ pub fn set_max_memory(mebibytes: usize) {
     CAP.store(mebibytes.saturating_mul(1024 * 1024), Ordering::Relaxed);
 }
 
+/// The memory cap in mebibytes; zero when there is none.
+pub fn max_memory() -> usize {
+    CAP.load(Ordering::Relaxed) / (1024 * 1024)
+}
+
+/// Seconds until the time limit ends the process, if one is set.
+pub fn seconds_left() -> Option<u64> {
+    let limit = TIMEOUT.load(Ordering::Relaxed);
+    let started = STARTED.get()?;
+    (limit > 0).then(|| limit.saturating_sub(started.elapsed().as_secs()))
+}
+
 /// Ends the process with an error once `seconds` have passed. Zero disables it.
 ///
 /// A watchdog thread is the only way to stop a computation that never returns.
@@ -129,6 +146,8 @@ pub fn set_timeout(seconds: u64) {
     if seconds == 0 {
         return;
     }
+    TIMEOUT.store(seconds, Ordering::Relaxed);
+    STARTED.get_or_init(Instant::now);
     // Built now: by the time it is needed, allocating may no longer be possible.
     let message = format!(
         "{{\"error\":\"time limit of {seconds} s exceeded while processing this file; raise it with --timeout if the file is trusted\"}}\n"

@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::ops::{
-    annotate, assemble, create, edit, forms, layout, ocr, read, redact, render, sign,
+    annotate, assemble, create, edit, forms, layout, ocr, read, redact, render, scan, sign,
 };
 
 pub struct Tool {
@@ -48,6 +48,7 @@ pub const TOOLS: &[Tool] = &[
         annotate::AnnotationsArgs,
         annotate::annotations
     ),
+    tool!("scan", scan::ScanArgs, scan::scan),
     tool!("render", render::RenderArgs, render::render),
     tool!("images", render::ImagesArgs, render::images),
     tool!("create", create::CreateArgs, create::create),
@@ -59,6 +60,7 @@ pub const TOOLS: &[Tool] = &[
     tool!("annotate", annotate::AnnotateArgs, annotate::annotate),
     tool!("redact", redact::RedactArgs, redact::redact),
     tool!("replace", redact::ReplaceArgs, redact::replace),
+    tool!("sanitize", scan::SanitizeArgs, scan::sanitize),
     tool!("set-meta", edit::SetMetaArgs, edit::set_meta),
     tool!("compress", edit::CompressArgs, edit::compress),
     tool!("encrypt", edit::EncryptArgs, edit::encrypt),
@@ -93,5 +95,34 @@ pub fn call(name: &str, args: Value) -> Result<Value> {
         .find(|t| tool_name(t) == name)
         .ok_or_else(|| anyhow::anyhow!("unknown tool '{name}'"))?;
     crate::sandbox::check_args(&args)?;
-    (tool.call)(args)
+    // The inputs are noted first: the call consumes its arguments.
+    let inputs: Vec<std::path::PathBuf> = args
+        .get("input")
+        .into_iter()
+        .chain(
+            args.get("inputs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+        .filter_map(|p| p.as_str().map(Into::into))
+        .collect();
+    let mut result = (tool.call)(args)?;
+    note_repairs(&mut result, |path| inputs.iter().any(|i| i == path));
+    Ok(result)
+}
+
+/// Adds `repaired_inputs` to a result when a damaged input had to be rebuilt to produce it.
+///
+/// A caller should know: what could not be read from such a file is missing from the output.
+pub fn note_repairs(result: &mut Value, mine: impl Fn(&std::path::Path) -> bool) {
+    let repaired: Vec<std::path::PathBuf> = crate::doc::repaired_inputs()
+        .into_iter()
+        .filter(|path| mine(path))
+        .collect();
+    if !repaired.is_empty()
+        && let Some(map) = result.as_object_mut()
+    {
+        map.insert("repaired_inputs".into(), json!(repaired));
+    }
 }

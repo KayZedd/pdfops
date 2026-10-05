@@ -629,52 +629,130 @@ fn forms_lists_and_fills_fields() {
     assert!(e.contains("no form fields"), "{e}");
 }
 
-#[test]
-fn damaged_files_are_read_but_not_rewritten() {
-    let dir = tempfile::tempdir().unwrap();
-    // A valid file, except that its content stream does not state its length.
+/// A one page file whose parts are given as numbered objects, with a correct
+/// cross-reference table unless `shift` moves the table's offsets off their objects.
+fn handmade(path: &std::path::Path, objects: &[&str], shift: usize) {
     let mut body = String::from("%PDF-1.4\n");
     let mut offsets = Vec::new();
-    for object in [
-        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
-        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>\nendobj\n",
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
-        "4 0 obj\n<< >>\nstream\nBT /F1 18 Tf 72 720 Td (Fragile text) Tj ET\nendstream\nendobj\n",
-        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
-    ] {
+    for object in objects {
         offsets.push(body.len());
         body.push_str(object);
     }
     let xref = body.len();
-    body.push_str("xref\n0 6\n0000000000 65535 f \n");
+    body.push_str(&format!(
+        "xref\n0 {}\n0000000000 65535 f \n",
+        objects.len() + 1
+    ));
     for offset in offsets {
-        body.push_str(&format!("{offset:010} 00000 n \n"));
+        body.push_str(&format!("{:010} 00000 n \n", offset + shift));
     }
     body.push_str(&format!(
-        "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        "trailer\n<< /Size {} /Root 1 0 R /Info 6 0 R >>\nstartxref\n{}\n%%EOF\n",
+        objects.len() + 1,
+        xref + shift
     ));
-    let pdf = dir.path().join("fragile.pdf");
-    std::fs::write(&pdf, body).unwrap();
+    std::fs::write(path, body).unwrap();
+}
 
-    // Reading goes through the repairing parser and works.
-    assert!(texts(&pdf)[0].contains("Fragile text"));
-    // Writing would save the page without its content, so it is refused, with the way out named.
+const CATALOG: &str = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+const TREE: &str =
+    "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>\nendobj\n";
+const PAGE: &str = "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n";
+const CONTENT: &str = "4 0 obj\n<< /Length 43 >>\nstream\nBT /F1 18 Tf 72 720 Td (Fragile text) Tj ET\nendstream\nendobj\n";
+const FONT: &str = "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n";
+const INFO: &str = "6 0 obj\n<< /Title (Kept title) >>\nendobj\n";
+
+#[test]
+fn damaged_files_are_rebuilt_for_writing() {
+    let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out.pdf");
-    for (tool, args) in [
+    // The same document damaged in three ways: a content stream that does not state its
+    // length, a cross-reference table pointing beside every object, and a catalog naming a
+    // page tree that is not there, so that the page is only found by looking for it.
+    let unsized_stream = CONTENT.replace("/Length 43", "");
+    let lost_tree = "1 0 obj\n<< /Type /Catalog /Pages 9 0 R >>\nendobj\n";
+    let own_box = PAGE.replace("/Contents", "/MediaBox [0 0 612 792] /Contents");
+    let cases: [(&str, Vec<&str>, usize); 3] = [
         (
+            "unsized.pdf",
+            vec![CATALOG, TREE, PAGE, &unsized_stream, FONT, INFO],
+            0,
+        ),
+        (
+            "shifted.pdf",
+            vec![CATALOG, TREE, PAGE, CONTENT, FONT, INFO],
+            7,
+        ),
+        (
+            "treeless.pdf",
+            vec![lost_tree, TREE, &own_box, CONTENT, FONT, INFO],
+            0,
+        ),
+    ];
+    for (name, objects, shift) in cases {
+        let pdf = dir.path().join(name);
+        handmade(&pdf, &objects, shift);
+        // Reading goes through the repairing parser and works.
+        assert!(texts(&pdf)[0].contains("Fragile text"), "{name}");
+
+        // Writing rebuilds the document from that same view, and says that it did.
+        let v = call(
             "pdf_rotate",
             json!({"input": pdf, "output": out, "angle": 90}),
-        ),
-        ("pdf_merge", json!({"inputs": [pdf, pdf], "output": out})),
-        ("pdf_compress", json!({"input": pdf, "output": out})),
-    ] {
-        let e = call_err(tool, args);
+        );
+        assert_eq!(v["repaired_inputs"], json!([pdf]), "{name}: {v}");
+        // The output is sound: the strict reader takes it, and nothing in it is damaged.
+        let written = lopdf::Document::load(&out).unwrap();
+        assert_eq!(written.get_pages().len(), 1, "{name}");
+        assert!(texts(&out)[0].contains("Fragile text"), "{name}");
+        let info = call("pdf_info", json!({"input": out}));
+        assert_eq!(
+            (
+                &info["pages"],
+                &info["page_size_pt"]["width"],
+                &info["metadata"]["title"]
+            ),
+            (&json!(1), &json!(792.0), &json!("Kept title")),
+            "{name}: {info}"
+        );
+        let again = call(
+            "pdf_rotate",
+            json!({"input": out, "output": out, "angle": 90}),
+        );
+        assert!(again.get("repaired_inputs").is_none(), "{name}: {again}");
+
+        let v = call("pdf_merge", json!({"inputs": [pdf, pdf], "output": out}));
+        assert_eq!(v["repaired_inputs"], json!([pdf]), "{name}");
+        assert_eq!(texts(&out).len(), 2, "{name}");
+        call("pdf_compress", json!({"input": pdf, "output": out}));
+        assert!(texts(&out)[0].contains("Fragile text"), "{name}");
+        // Text is found and removed in a rebuilt document like in any other.
+        call(
+            "pdf_redact",
+            json!({"input": pdf, "output": out, "texts": ["Fragile"]}),
+        );
         assert!(
-            e.contains("is damaged") && e.contains("qpdf"),
-            "{tool}: {e}"
+            !texts(&out)[0].contains("Fragile") && texts(&out)[0].contains("text"),
+            "{name}"
         );
     }
-    assert!(!out.exists());
+    // A sound file is not touched by any of this.
+    let sound = dir.path().join("sound.pdf");
+    handmade(&sound, &[CATALOG, TREE, PAGE, CONTENT, FONT, INFO], 0);
+    let v = call(
+        "pdf_rotate",
+        json!({"input": sound, "output": out, "angle": 90}),
+    );
+    assert!(v.get("repaired_inputs").is_none(), "{v}");
+
+    // What cannot be rebuilt is still refused, with the reason.
+    let junk = dir.path().join("junk.pdf");
+    std::fs::write(&junk, b"%PDF-1.4\nnothing of use\n%%EOF\n").unwrap();
+    let e = call_err(
+        "pdf_rotate",
+        json!({"input": junk, "output": out, "angle": 90}),
+    );
+    assert!(e.contains("cannot open"), "{e}");
 }
 
 #[test]

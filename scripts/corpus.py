@@ -67,6 +67,8 @@ def examine(pdfops, path, scratch):
         "annotations": ["annotations", path],
         "signatures": ["signatures", path],
         "forms": ["forms", path],
+        "scan": ["scan", path],
+        "sanitize": ["sanitize", path, "-o", out],
         "render": ["render", path, "-p", "1", "--dpi", "50", "-o", work],
         "images": ["images", path, "-p", "1", "-o", work],
         "pages": ["pages", path, "-k", "1", "-o", out],
@@ -84,7 +86,7 @@ def examine(pdfops, path, scratch):
     if IDENTITY:
         commands["sign"] = ["sign", path, "--cert", IDENTITY[0], "--key", IDENTITY[1], "-o", out]
     writes = {"pages", "merge", "rotate", "stamp", "set-meta", "compress", "encrypt", "annotate", "redact",
-              "replace", "sign"}
+              "replace", "sign", "sanitize"}
     input_sound = None
     findings = []
     for name, args in commands.items():
