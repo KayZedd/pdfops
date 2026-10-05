@@ -246,7 +246,8 @@ pub fn collect(d: &Document) -> Vec<Field> {
 }
 
 pub fn forms(a: FormsArgs) -> Result<Value> {
-    let d = doc::load(&a.input, a.password.as_deref())?;
+    // Listing does not write, so a file too damaged to rewrite is still worth reading.
+    let (d, _) = doc::read(&a.input, a.password.as_deref())?;
     let mut widget_page = HashMap::new();
     for (n, id) in d.get_pages() {
         let annots = d

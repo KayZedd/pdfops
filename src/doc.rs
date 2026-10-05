@@ -13,6 +13,20 @@ pub const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Ro
 
 /// Loads a PDF, decrypting it when it is encrypted.
 pub fn load(path: &Path, password: Option<&str>) -> Result<Document> {
+    let (doc, bytes) = read(path, password)?;
+    if let Some(reason) = damage(&doc, bytes, password) {
+        bail!(
+            "{} is damaged ({reason}). It can be read but not rewritten safely; repair it first, e.g. with `qpdf in.pdf repaired.pdf`",
+            path.display()
+        );
+    }
+    Ok(doc)
+}
+
+/// Loads a PDF for looking at, without insisting that it could be written back.
+///
+/// Returns the file's bytes as well, for callers that go on to check it.
+pub fn read(path: &Path, password: Option<&str>) -> Result<(Document, std::sync::Arc<Vec<u8>>)> {
     let bytes = std::sync::Arc::new(
         std::fs::read(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?,
     );
@@ -32,13 +46,7 @@ pub fn load(path: &Path, password: Option<&str>) -> Result<Document> {
             }
         );
     }
-    if let Some(reason) = damage(&doc, bytes, password) {
-        bail!(
-            "{} is damaged ({reason}). It can be read but not rewritten safely; repair it first, e.g. with `qpdf in.pdf repaired.pdf`",
-            path.display()
-        );
-    }
-    Ok(doc)
+    Ok((doc, bytes))
 }
 
 /// Why this document must not be written back, if it was not read in full.

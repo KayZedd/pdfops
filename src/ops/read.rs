@@ -378,7 +378,8 @@ fn ceil_boundary(s: &str, mut i: usize) -> usize {
 }
 
 pub fn outline(a: OutlineArgs) -> Result<Value> {
-    let d = doc::load(&a.input, a.password.as_deref())?;
+    // Listing does not write, so a file too damaged to rewrite is still worth reading.
+    let (d, _) = doc::read(&a.input, a.password.as_deref())?;
     let numbers: HashMap<lopdf::ObjectId, u32> =
         d.get_pages().into_iter().map(|(n, id)| (id, n)).collect();
     let entries: Vec<Value> = doc::outline(&d)
