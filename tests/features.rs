@@ -1472,3 +1472,100 @@ fn create_draws_scripts_that_no_single_font_has() {
     assert_eq!(bases.len(), fonts.len(), "{bases:?}");
     eprintln!("{} fonts drew the paragraph", fonts.len());
 }
+
+#[test]
+fn redact_takes_the_text_out_of_metadata_and_bookmarks_too() {
+    use lopdf::{Object, Stream};
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 2);
+    let mut doc = lopdf::Document::load(&pdf).unwrap();
+    // The words on page 1 also stand in the title, in the metadata stream, in a
+    // bookmark and in an attached file.
+    let info = doc.add_object(dictionary! {
+        "Title" => Object::string_literal("Minutes, Keyword alpha-1 and more"),
+        "Author" => Object::string_literal("Somebody Else"),
+    });
+    doc.trailer.set("Info", info);
+    let xmp = doc.add_object(Stream::new(
+        dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+        b"<x:xmpmeta><dc:title>Minutes, Keyword alpha-1 and more</dc:title></x:xmpmeta>".to_vec(),
+    ));
+    let attached = doc.add_object(Stream::new(
+        dictionary! { "Type" => "EmbeddedFile" },
+        b"notes: keyword ALPHA-1 was discussed".to_vec(),
+    ));
+    let file = doc.add_object(dictionary! {
+        "Type" => "Filespec", "F" => Object::string_literal("notes.txt"),
+        "EF" => dictionary! { "F" => attached },
+    });
+    let catalog = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+    let outlines = doc
+        .get_dictionary(catalog)
+        .unwrap()
+        .get(b"Outlines")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let item = doc
+        .get_dictionary(outlines)
+        .unwrap()
+        .get(b"First")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    doc.get_dictionary_mut(item)
+        .unwrap()
+        .set("Title", Object::string_literal("About alpha-1"));
+    let catalog = doc.get_dictionary_mut(catalog).unwrap();
+    catalog.set("Metadata", xmp);
+    catalog.set(
+        "Names",
+        dictionary! { "EmbeddedFiles" => dictionary! {
+            "Names" => vec![Object::string_literal("notes.txt"), Object::Reference(file)],
+        } },
+    );
+    doc.save(&pdf).unwrap();
+
+    let out = dir.path().join("out.pdf");
+    let v = call(
+        "pdf_redact",
+        json!({"input": pdf, "output": out, "texts": ["alpha-1"]}),
+    );
+    assert_eq!(
+        v["beside_pages"],
+        json!({
+            "metadata_fields_cleaned": ["Title"],
+            "xmp_metadata_removed": true,
+            "bookmarks_cleaned": 1,
+            "attachments_holding_the_text": ["notes.txt"],
+        }),
+        "{v}"
+    );
+    let info = call("pdf_info", json!({"input": out}));
+    assert_eq!(info["metadata"]["title"], "Minutes, Keyword  and more");
+    assert_eq!(info["metadata"]["author"], "Somebody Else");
+    let outline = call("pdf_outline", json!({"input": out}));
+    assert_eq!(outline["entries"][0]["title"], "About ");
+    // The metadata stream is gone with what it repeated. The attached file is named
+    // in the result and left for the caller to decide about.
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(!bytes.windows(9).any(|w| w == b"<dc:title"));
+    assert!(!texts(&out)[0].contains("alpha-1"));
+
+    // A text that stands nowhere on the pages is still taken out of the title.
+    let v = call(
+        "pdf_redact",
+        json!({"input": pdf, "output": out, "texts": ["Minutes"]}),
+    );
+    assert_eq!(v["text_matches"], 0, "{v}");
+    assert_eq!(
+        v["beside_pages"]["metadata_fields_cleaned"],
+        json!(["Title"])
+    );
+    // Areas alone say nothing about texts, so nothing beside the pages is touched.
+    let v = call(
+        "pdf_redact",
+        json!({"input": pdf, "output": out, "rects": ["1:50,50,300,300"]}),
+    );
+    assert!(v.get("beside_pages").is_none(), "{v}");
+}

@@ -335,8 +335,10 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
   Text around it does not move. The result is read back by a second, independent interpreter, and
   nothing is written unless every area is empty. Where an image cannot be decoded, or text is
   drawn in a way that cannot be taken apart with certainty, the command fails instead of guessing.
-  It does not rewrite document metadata, bookmarks or attached
-  files, and it removes the accessibility structure tree, which can repeat page text.
+  A text to redact is also taken out of the document information, the bookmark titles and the
+  metadata stream, which goes as a whole if it holds the text; `beside_pages` in the result says
+  what was done. Attached files that hold the text are named there and left alone: `sanitize`
+  removes attachments. The accessibility structure tree, which can repeat page text, is removed.
 - **Replace** writes the new text with the codes the document's own font already uses for those
   characters on that page, so style is kept exactly. If the font (usually a subset) lacks a needed
   glyph, another font writes just those words, at the same size, position and colour, and the result

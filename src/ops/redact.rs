@@ -1656,6 +1656,145 @@ fn drop_annotations(d: &mut Document, page: ObjectId, user_areas: &[Area]) -> Re
     Ok(removed)
 }
 
+/// What was done about the texts to redact where a document speaks of itself outside
+/// its pages.
+#[derive(Default)]
+struct Beside {
+    /// Entries of the document information that held one of the texts.
+    fields: Vec<String>,
+    /// The metadata stream held one, and went: it repeats the document information.
+    xmp: bool,
+    bookmarks: usize,
+    /// Attached files that hold one of the texts. They are reported, not opened up.
+    attachments: Vec<String>,
+}
+
+/// `text` without what the patterns match.
+fn struck(text: &str, patterns: &[regex::Regex]) -> String {
+    patterns.iter().fold(text.to_string(), |text, pattern| {
+        pattern.replace_all(&text, "").into_owned()
+    })
+}
+
+/// Takes the texts out of the document information, the metadata stream and the
+/// bookmark titles, and notes the attached files that hold them.
+fn clean_beside_pages(d: &mut Document, patterns: &[regex::Regex]) -> Beside {
+    let mut done = Beside::default();
+    let info = d
+        .trailer
+        .get(b"Info")
+        .ok()
+        .and_then(|i| i.as_reference().ok());
+    if let Some(info) = info.and_then(|id| d.get_dictionary_mut(id).ok()) {
+        for (key, value) in info.iter_mut() {
+            let Some(text) = doc::text(value).filter(|_| matches!(value, Object::String(..)))
+            else {
+                continue;
+            };
+            let cleaned = struck(&text, patterns);
+            if cleaned != text {
+                *value = lopdf::text_string(&cleaned);
+                done.fields.push(String::from_utf8_lossy(key).into_owned());
+            }
+        }
+    }
+    let holds = |bytes: &[u8]| {
+        // Text is looked for as UTF-8 and, as PDF strings and office files often have
+        // it, as UTF-16 in either byte order.
+        let wide = |big: bool| -> String {
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|pair| {
+                    if big {
+                        u16::from_be_bytes([pair[0], pair[1]])
+                    } else {
+                        u16::from_le_bytes([pair[0], pair[1]])
+                    }
+                })
+                .collect();
+            String::from_utf16_lossy(&units)
+        };
+        [
+            String::from_utf8_lossy(bytes).into_owned(),
+            wide(true),
+            wide(false),
+        ]
+        .iter()
+        .any(|text| patterns.iter().any(|pattern| pattern.is_match(text)))
+    };
+    let content = |d: &Document, object: &Object| {
+        doc::resolve(d, object)
+            .as_stream()
+            .ok()
+            .and_then(|stream| stream_bytes(stream).ok())
+    };
+    let catalog = d.catalog().ok().cloned().unwrap_or_default();
+    if catalog
+        .get(b"Metadata")
+        .ok()
+        .and_then(|metadata| content(d, metadata))
+        .is_some_and(|xmp| holds(&xmp))
+        && let Ok(catalog) = d.catalog_mut()
+    {
+        catalog.remove(b"Metadata");
+        done.xmp = true;
+    }
+    // Bookmarks: every entry reached from the root, each once.
+    let link =
+        |dict: &Dictionary, key: &[u8]| dict.get(key).ok().and_then(|o| o.as_reference().ok());
+    let mut open: Vec<ObjectId> = catalog
+        .get(b"Outlines")
+        .ok()
+        .and_then(|root| doc::resolve(d, root).as_dict().ok())
+        .and_then(|root| link(root, b"First"))
+        .into_iter()
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = open.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Ok(item) = d.get_dictionary_mut(id) else {
+            continue;
+        };
+        open.extend(link(item, b"Next"));
+        open.extend(link(item, b"First"));
+        if let Some(title) = item.get(b"Title").ok().and_then(doc::text) {
+            let cleaned = struck(&title, patterns);
+            if cleaned != title {
+                item.set("Title", lopdf::text_string(&cleaned));
+                done.bookmarks += 1;
+            }
+        }
+    }
+    for object in d.objects.values() {
+        let Ok(file) = object.as_dict() else {
+            continue;
+        };
+        let Some(embedded) = file
+            .get(b"EF")
+            .ok()
+            .and_then(|ef| doc::resolve(d, ef).as_dict().ok())
+        else {
+            continue;
+        };
+        let name = [b"UF".as_slice(), b"F"]
+            .iter()
+            .find_map(|key| doc::text(doc::resolve(d, file.get(key).ok()?)))
+            .unwrap_or_default();
+        let inside = embedded
+            .iter()
+            .filter_map(|(_, data)| content(d, data))
+            .any(|bytes| holds(&bytes));
+        if inside || patterns.iter().any(|pattern| pattern.is_match(&name)) {
+            done.attachments.push(name);
+        }
+    }
+    done.attachments.sort();
+    done.attachments.dedup();
+    done
+}
+
 pub fn redact(a: RedactArgs) -> Result<Value> {
     if a.rects.is_empty() && a.texts.is_empty() {
         bail!("nothing to redact: give rects (page:x0,y0,x1,y1) or texts to find");
@@ -1672,8 +1811,8 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
         found_by.entry(page).or_default().push(None);
     }
     let mut matches = 0;
+    let patterns = compile(&a.texts, a.regex, a.case_sensitive)?;
     if !a.texts.is_empty() {
-        let patterns = compile(&a.texts, a.regex, a.case_sensitive)?;
         for n in pagespec::parse_or_all(a.pages.as_deref(), total)? {
             let found = text_areas(&layout::scan(&pdf.pages()[n as usize - 1]), &patterns);
             matches += found.len();
@@ -1683,11 +1822,11 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
             }
         }
     }
-    if areas.is_empty() {
+    let mut d = doc::load(&a.input, a.password.as_deref())?;
+    let beside = clean_beside_pages(&mut d, &patterns);
+    if areas.is_empty() && beside.fields.is_empty() && !beside.xmp && beside.bookmarks == 0 {
         bail!("none of the texts were found; nothing was written");
     }
-
-    let mut d = doc::load(&a.input, a.password.as_deref())?;
     let ids = doc::page_ids(&d);
     let open = d.add_object(Stream::new(Dictionary::new(), b"q\n".to_vec()));
     let mut pages: Vec<u32> = areas.keys().copied().collect();
@@ -1820,14 +1959,23 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
     if !a.dry_run {
         doc::write_atomic(&a.output, &bytes)?;
     }
-    Ok(json!({
+    let mut result = json!({
         "output": a.output,
         "dry_run": a.dry_run,
         "text_matches": matches,
         "pages": report,
         "verified": true,
         "size_bytes": bytes.len(),
-    }))
+    });
+    if !patterns.is_empty() {
+        result["beside_pages"] = json!({
+            "metadata_fields_cleaned": beside.fields,
+            "xmp_metadata_removed": beside.xmp,
+            "bookmarks_cleaned": beside.bookmarks,
+            "attachments_holding_the_text": beside.attachments,
+        });
+    }
+    Ok(result)
 }
 
 /// The matches on one page.
