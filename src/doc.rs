@@ -215,11 +215,54 @@ fn rebuild(bytes: Arc<Vec<u8>>) -> Result<Document> {
                 .collect(),
         );
     }
+    // Content that is not a stream cannot be drawn; a page found by searching may name anything.
+    let streams: std::collections::HashSet<ObjectId> = doc
+        .objects
+        .iter()
+        .filter(|(_, object)| object.as_stream().is_ok())
+        .map(|(id, _)| *id)
+        .collect();
+    let drawable = |object: &Object| object.as_reference().is_ok_and(|id| streams.contains(&id));
+    // The parts may also be listed in an object of their own.
+    let lists: HashMap<ObjectId, Vec<Object>> = doc
+        .objects
+        .iter()
+        .filter_map(|(id, object)| Some((*id, object.as_array().ok()?.clone())))
+        .collect();
     let tree = doc.new_object_id();
     for (&page, attributes) in pages.iter().zip(own) {
         let dict = doc.get_dictionary_mut(page)?;
         for (key, value) in attributes {
             dict.set(key, value);
+        }
+        // A page must say how large it is; the format's own default is US Letter.
+        if !dict.has(b"MediaBox") {
+            dict.set(
+                "MediaBox",
+                vec![0.into(), 0.into(), 612.into(), 792.into()] as Vec<Object>,
+            );
+        }
+        let listed = |object: &Object| lists.get(&object.as_reference().ok()?);
+        let contents = match dict.get(b"Contents").ok() {
+            Some(one) if listed(one).is_some() => Some(Object::Array(
+                listed(one)
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| drawable(p))
+                    .cloned()
+                    .collect(),
+            )),
+            Some(Object::Array(parts)) => Some(Object::Array(
+                parts.iter().filter(|p| drawable(p)).cloned().collect(),
+            )),
+            Some(one) if drawable(one) => Some(one.clone()),
+            _ => None,
+        };
+        match contents {
+            Some(contents) => dict.set("Contents", contents),
+            None => {
+                dict.remove(b"Contents");
+            }
         }
         dict.set("Type", Object::Name(b"Page".to_vec()));
         dict.set("Parent", tree);

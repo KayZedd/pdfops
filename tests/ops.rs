@@ -668,10 +668,10 @@ fn damaged_files_are_rebuilt_for_writing() {
     let out = dir.path().join("out.pdf");
     // The same document damaged in three ways: a content stream that does not state its
     // length, a cross-reference table pointing beside every object, and a catalog naming a
-    // page tree that is not there, so that the page is only found by looking for it.
+    // page tree that is not there, so that the page is only found by looking for it and has
+    // nothing to inherit its size from.
     let unsized_stream = CONTENT.replace("/Length 43", "");
     let lost_tree = "1 0 obj\n<< /Type /Catalog /Pages 9 0 R >>\nendobj\n";
-    let own_box = PAGE.replace("/Contents", "/MediaBox [0 0 612 792] /Contents");
     let cases: [(&str, Vec<&str>, usize); 3] = [
         (
             "unsized.pdf",
@@ -685,7 +685,7 @@ fn damaged_files_are_rebuilt_for_writing() {
         ),
         (
             "treeless.pdf",
-            vec![lost_tree, TREE, &own_box, CONTENT, FONT, INFO],
+            vec![lost_tree, TREE, PAGE, CONTENT, FONT, INFO],
             0,
         ),
     ];
