@@ -936,6 +936,8 @@ impl Rewriter<'_> {
                     let spacing = pass.state.char_spacing * text.chars().count() as f64
                         + pass.state.word_spacing * spaces as f64;
                     let units = font.width(text, 1000.0) + spacing * 1000.0 / pass.state.font_size;
+                    let mut shown = font.elements(text);
+                    shown.push(Object::Real(units as f32));
                     if !rebuilt.is_empty() {
                         pass.out.push(Operation::new(
                             "TJ",
@@ -947,13 +949,8 @@ impl Rewriter<'_> {
                         "Tf",
                         vec![Object::Name(key.into_bytes()), size.clone()],
                     ));
-                    pass.out.push(Operation::new(
-                        "TJ",
-                        vec![Object::Array(vec![
-                            font.operand(text),
-                            Object::Real(units as f32),
-                        ])],
-                    ));
+                    pass.out
+                        .push(Operation::new("TJ", vec![Object::Array(shown)]));
                     pass.out
                         .push(Operation::new("Tf", vec![Object::Name(original), size]));
                 }

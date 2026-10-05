@@ -305,8 +305,12 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
 
 - **Text outside Latin-1.** `stamp`, `fill`, `replace` and `create` embed a subset of a font that
   has the glyphs: the one given with `stamp --font`, otherwise one found on the system. Latin-1 text uses the built-in
-  Helvetica and embeds nothing. Text is placed glyph by glyph: scripts that need shaping or
-  right-to-left layout (Arabic, Hebrew, Indic) will not come out right.
+  Helvetica and embeds nothing. Embedded text is shaped: Arabic is joined, Hebrew and Arabic run
+  from the right, Indic and Thai clusters are formed and their marks placed, and Latin gets its
+  ligatures and kerning. Three limits: one font must cover all the text of a style, `create` lays
+  out word by word, so punctuation next to a right-to-left word may land on its other side and such
+  lines keep their left edge, and reading the text back gives it in drawing order, right-to-left
+  words reversed and some Indic and Thai clusters with their characters regrouped.
 - **Redaction** deletes what is under the areas from the page content: glyphs, image pixels
   (including scanned pages), drawings lying wholly inside an area, and annotations with the form
   values they show. Text around it does not move. The result is read back by a second, independent

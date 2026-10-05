@@ -400,10 +400,7 @@ fn text_appearance(
             (h - size) / 2.0 + size * 0.22,
         )
     };
-    let shown: Vec<String> = lines
-        .iter()
-        .map(|line| format!("{} Tj", font.encode(line)))
-        .collect();
+    let shown: Vec<String> = lines.iter().map(|line| font.show(line, size)).collect();
     let content = format!(
         "/Tx BMC\nq\n1 1 {:.2} {:.2} re W n\nBT\n/{font_name} {size:.2} Tf\n{color}\n{leading:.2} TL\n2 {baseline:.2} Td\n{}\nET\nQ\nEMC\n",
         (w - 2.0).max(0.0),

@@ -346,14 +346,68 @@ impl Writer {
             x += w;
         }
         lines.retain(|l| !l.is_empty());
+        for line in &mut lines {
+            self.reorder(line, size);
+        }
         lines
+    }
+
+    /// Puts the words of a line holding right-to-left text where they are read: a run
+    /// of such words is laid out from its right end. The line keeps its left edge.
+    fn reorder(&self, line: &mut Vec<(f64, Token)>, size: f64) {
+        use unicode_bidi::BidiClass::{AL, R};
+        let right_to_left = |c: char| matches!(unicode_bidi::bidi_class(c), R | AL);
+        if !line.iter().any(|(_, t)| t.text.chars().any(right_to_left)) {
+            return;
+        }
+        // The line as one string, with where each word starts in it.
+        let mut text = String::new();
+        let mut starts = Vec::with_capacity(line.len());
+        for (i, (_, token)) in line.iter().enumerate() {
+            if i > 0 {
+                text.push(' ');
+            }
+            starts.push(text.len());
+            text.push_str(&token.text);
+        }
+        let bidi = unicode_bidi::BidiInfo::new(&text, None);
+        let Some(paragraph) = bidi.paragraphs.first() else {
+            return;
+        };
+        let (levels, runs) = bidi.visual_runs(paragraph, paragraph.range.clone());
+        let mut order: Vec<usize> = Vec::with_capacity(line.len());
+        for run in runs {
+            let mut words: Vec<usize> = (0..line.len())
+                .filter(|&i| run.contains(&starts[i]))
+                .collect();
+            if levels[run.start].is_rtl() {
+                words.reverse();
+            }
+            order.extend(words);
+        }
+        if order.len() != line.len() {
+            return;
+        }
+        let mut x = line[0].0;
+        let mut placed = Vec::with_capacity(line.len());
+        for (n, &i) in order.iter().enumerate() {
+            let token = line[i].1.clone();
+            // Neighbours on the page are apart if the later of the two had a space before it.
+            if n > 0 && line[i.max(order[n - 1])].1.spaced {
+                x += self.font(token.style).0.width(" ", size);
+            }
+            let width = self.measure(&token, size);
+            placed.push((x, token));
+            x += width;
+        }
+        *line = placed;
     }
 
     fn draw_line(&mut self, line: &[(f64, Token)], x0: f64, baseline: f64, size: f64) {
         for (offset, token) in line {
             let (font, name) = self.font(token.style);
             let (text, width, name) = (
-                font.encode(&token.text),
+                font.show(&token.text, size),
                 font.width(&token.text, size),
                 name.clone(),
             );
@@ -364,7 +418,7 @@ impl Writer {
                 "0 g"
             };
             let op = format!(
-                "BT\n/{name} {size:.2} Tf\n{color}\n1 0 0 1 {x:.2} {baseline:.2} Tm\n{text} Tj\nET\n"
+                "BT\n/{name} {size:.2} Tf\n{color}\n1 0 0 1 {x:.2} {baseline:.2} Tm\n{text}\nET\n"
             );
             let link = token.link.clone();
             let page = self.page();
@@ -438,9 +492,9 @@ impl Writer {
                 for line in &lines {
                     self.need(line_height);
                     let (top, name) = (self.y, self.font(style).1.clone());
-                    let text = self.font(style).0.encode(line);
+                    let text = self.font(style).0.show(line, size);
                     self.page().ops += &format!(
-                        "0.95 g\n{x0:.2} {:.2} {width:.2} {line_height:.2} re\nf\nBT\n/{name} {size:.2} Tf\n0 g\n1 0 0 1 {:.2} {:.2} Tm\n{text} Tj\nET\n",
+                        "0.95 g\n{x0:.2} {:.2} {width:.2} {line_height:.2} re\nf\nBT\n/{name} {size:.2} Tf\n0 g\n1 0 0 1 {:.2} {:.2} Tm\n{text}\nET\n",
                         top - line_height,
                         x0 + 6.0,
                         top - size

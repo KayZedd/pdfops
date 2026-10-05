@@ -1029,3 +1029,57 @@ fn dry_run_reports_the_plan_and_writes_nothing() {
     assert_eq!(v["dry_run"], false);
     assert!(out.exists());
 }
+
+#[test]
+fn right_to_left_text_is_shaped_and_laid_out_from_the_right() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pdf");
+    // "shalom olam" in a footer, and an Arabic paragraph whose letters join.
+    let stamped = pdfops::tools::call(
+        "pdf_stamp",
+        json!({"input": sample(dir.path(), "a.pdf", 1), "output": out, "text": "\u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{5e2}\u{5d5}\u{5dc}\u{5dd}", "position": "footer"}),
+    );
+    if let Err(e) = &stamped {
+        assert!(e.to_string().contains("no installed font"), "{e:#}");
+        eprintln!("skipped: {e}");
+        return;
+    }
+    // Glyphs are drawn left to right, so the last letter of the last word comes first.
+    let text = &texts(&out)[0];
+    assert!(
+        text.contains("\u{5dd}\u{5dc}\u{5d5}\u{5e2} \u{5dd}\u{5d5}\u{5dc}\u{5e9}"),
+        "{text}"
+    );
+    let footer = words(&out, 1);
+    let (olam, shalom) = (&footer[footer.len() - 2], &footer[footer.len() - 1]);
+    assert!(
+        olam.0.starts_with('\u{5dd}') && olam.1[2] < shalom.1[0],
+        "{footer:?}"
+    );
+
+    let made = pdfops::tools::call(
+        "pdf_create",
+        json!({"markdown": "\u{627}\u{644}\u{633}\u{644}\u{627}\u{645} \u{639}\u{644}\u{64a}\u{643}\u{645}", "output": out}),
+    );
+    if made.is_err() {
+        return;
+    }
+    // Every letter is there, the lam-alef pairs as ligatures that read as both letters.
+    let text = &texts(&out)[0];
+    for letter in "\u{627}\u{644}\u{633}\u{645}\u{639}\u{64a}\u{643}".chars() {
+        assert!(text.contains(letter), "{letter} missing from {text}");
+    }
+    assert_eq!(
+        text.chars().filter(|c| !c.is_whitespace()).count(),
+        11,
+        "{text}"
+    );
+    // The first word of the sentence stands on the right.
+    let line = words(&out, 1);
+    assert_eq!(line.len(), 2, "{line:?}");
+    assert!(
+        line.iter().any(|w| w.0.contains('\u{633}')
+            && w.1[0] > line.iter().map(|o| o.1[0]).fold(f64::MAX, f64::min)),
+        "{line:?}"
+    );
+}

@@ -705,8 +705,8 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
                     size
                 };
                 ops += &format!(
-                    "/{font_name} {size:.2} Tf\n{r:.3} {g:.3} {b:.3} rg\n{} Tj\nET\n",
-                    font.encode(&text)
+                    "/{font_name} {size:.2} Tf\n{r:.3} {g:.3} {b:.3} rg\n{}\nET\n",
+                    font.show(&text, size)
                 );
             }
         }
