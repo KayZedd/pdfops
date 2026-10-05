@@ -165,6 +165,7 @@ pdfops stamp in.pdf --qr "https://example.com/doc/42" --anchor bottom-right -o o
 pdfops redact in.pdf --text "Jan Kowalski" --text "\d{11}" --regex -o redacted.pdf
 pdfops redact in.pdf --rect "2:100,200,300,220" -o redacted.pdf
 pdfops replace in.pdf --find "2025" --with "2026" -o out.pdf
+pdfops replace in.pdf --find "2025" --with "2026" --dry-run -o out.pdf   # the plan, nothing written
 pdfops compress in.pdf --max-image-edge 1600 --image-quality 70 -o small.pdf
 ```
 
@@ -301,6 +302,11 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
   glyph, another font writes just those words, at the same size, position and colour, and the result
   says so. Lines are not re-flowed: a longer replacement runs into what follows, and `overflow_pt`
   reports by how much. Text inside form fields and annotations is not edited.
+- **Dry run.** `redact`, `replace`, `annotate` and `stamp` take `--dry-run` (`dry_run` over MCP):
+  the command does all of its work, including the check after redaction, reports what it would
+  change and writes nothing. `redact` lists every area with the text that matched and the counts of
+  glyphs, images, drawings and annotations that would go; `replace` lists every match with its box,
+  the old and new text, which font would write it and by how much it would overflow.
 - **Tables** drawn with ruling lines are read cell by cell and are reliable. Tables without lines
   are inferred from column alignment (`detected_by: alignment`) and deserve a look before trusting.
 - **Create** understands headings, emphasis, links, nested lists, quotes, code blocks, tables, rules

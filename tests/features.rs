@@ -944,3 +944,88 @@ fn sign_accepts_rsa_keys_and_pkcs12_files() {
     );
     assert!(e.contains("wrong password"), "{e}");
 }
+
+#[test]
+fn dry_run_reports_the_plan_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 2);
+    let out = dir.path().join("out.pdf");
+    let w = words(&pdf, 1);
+
+    let v = call(
+        "pdf_redact",
+        json!({"input": pdf, "output": out, "texts": ["alpha-1"], "rects": ["2:10,10,20,20"], "dry_run": true}),
+    );
+    assert_eq!(
+        (&v["dry_run"], &v["verified"]),
+        (&json!(true), &json!(true))
+    );
+    assert_eq!(v["pages"][0]["glyphs_removed"], 7);
+    let target = &v["pages"][0]["targets"][0];
+    assert_eq!(target["text"], "alpha-1");
+    // The box is that of the matched glyphs, as layout reports the word minus its full stop.
+    let b = w[6].1;
+    assert!(
+        (target["bbox"][0].as_f64().unwrap() - b[0]).abs() < 0.1
+            && target["bbox"][2].as_f64().unwrap() < b[2],
+        "{target} {b:?}"
+    );
+    assert_eq!(
+        v["pages"][1]["targets"],
+        json!([{"bbox": [10.0, 10.0, 20.0, 20.0]}])
+    );
+    assert!(!out.exists());
+
+    let v = call(
+        "pdf_replace",
+        json!({"input": pdf, "output": out, "find": "sample", "with": "template for all", "pages": "1", "dry_run": true}),
+    );
+    assert_eq!(
+        (&v["dry_run"], &v["replacements"]),
+        (&json!(true), &json!(1))
+    );
+    let m = &v["pages"][0]["matches"][0];
+    assert_eq!(
+        (&m["old"], &m["new"], &m["font"]),
+        (
+            &json!("sample"),
+            &json!("template for all"),
+            &json!("original")
+        )
+    );
+    // "template for all" is 3335 thousandths wider than "sample": 60 points at 18 point Helvetica.
+    assert!(
+        (m["overflow_pt"].as_f64().unwrap() - 60.0).abs() < 0.2,
+        "{m}"
+    );
+    assert!(!out.exists());
+
+    let v = call(
+        "pdf_annotate",
+        json!({"input": pdf, "output": out, "texts": ["keyword"], "dry_run": true}),
+    );
+    assert_eq!((&v["dry_run"], &v["added"]), (&json!(true), &json!(2)));
+    assert_eq!(
+        (&v["targets"][1]["page"], &v["targets"][1]["text"]),
+        (&json!(2), &json!("Keyword"))
+    );
+    assert!(!out.exists());
+
+    let v = call(
+        "pdf_stamp",
+        json!({"input": pdf, "output": out, "text": "DRAFT", "dry_run": true}),
+    );
+    assert_eq!(
+        (&v["dry_run"], &v["stamped_pages"]),
+        (&json!(true), &json!([1, 2]))
+    );
+    assert!(v["size_bytes"].as_u64().unwrap() > 0 && !out.exists());
+
+    // Without the flag the same call writes, and says so.
+    let v = call(
+        "pdf_stamp",
+        json!({"input": pdf, "output": out, "text": "DRAFT"}),
+    );
+    assert_eq!(v["dry_run"], false);
+    assert!(out.exists());
+}

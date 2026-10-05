@@ -120,6 +120,17 @@ pub fn save(doc: &mut Document, path: &Path) -> Result<u64> {
     Ok(std::fs::metadata(path)?.len())
 }
 
+/// Like `save`, but a dry run only measures: the document is serialised and nothing is written.
+pub fn save_unless(dry_run: bool, doc: &mut Document, path: &Path) -> Result<u64> {
+    if !dry_run {
+        return save(doc, path);
+    }
+    seal(doc)?;
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes)?;
+    Ok(bytes.len() as u64)
+}
+
 /// Makes a document ready to be serialised. Returns whether it is encrypted.
 ///
 /// Every path that writes a document goes through here, so that numbering,

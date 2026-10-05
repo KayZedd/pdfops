@@ -62,6 +62,10 @@ pub struct RedactArgs {
     /// Password, if the file is encrypted
     #[arg(long)]
     pub password: Option<String>,
+    /// Report what would change without writing the output file
+    #[arg(long)]
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
@@ -92,6 +96,10 @@ pub struct ReplaceArgs {
     /// Password, if the file is encrypted
     #[arg(long)]
     pub password: Option<String>,
+    /// Report what would change without writing the output file
+    #[arg(long)]
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 pub(crate) type Matrix = [f64; 6];
@@ -139,6 +147,11 @@ pub(crate) fn bounds(points: impl IntoIterator<Item = (f64, f64)>) -> Area {
         ],
         |b, (x, y)| [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)],
     )
+}
+
+/// A box as reported to callers: tenths of a point.
+pub(crate) fn round_box(area: &Area) -> [f64; 4] {
+    area.map(|v| (v * 10.0).round() / 10.0)
 }
 
 fn intersects(a: &Area, b: &Area) -> bool {
@@ -1177,9 +1190,12 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
     let total = pdf.pages().len() as u32;
 
     let mut areas: HashMap<u32, Vec<Area>> = HashMap::new();
+    // The text each area was found by, for the plan a dry run reports.
+    let mut found_by: HashMap<u32, Vec<Option<String>>> = HashMap::new();
     for spec in &a.rects {
         let (page, area) = parse_rect(spec, total)?;
         areas.entry(page).or_default().push(area);
+        found_by.entry(page).or_default().push(None);
     }
     let mut matches = 0;
     if !a.texts.is_empty() {
@@ -1187,11 +1203,9 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
         for n in pagespec::parse_or_all(a.pages.as_deref(), total)? {
             let found = text_areas(&layout::scan(&pdf.pages()[n as usize - 1]), &patterns);
             matches += found.len();
-            if !found.is_empty() {
-                areas
-                    .entry(n)
-                    .or_default()
-                    .extend(found.into_iter().map(|(area, ..)| area));
+            for (area, text, _) in found {
+                areas.entry(n).or_default().push(area);
+                found_by.entry(n).or_default().push(Some(text));
             }
         }
     }
@@ -1275,14 +1289,28 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
             format!("q\n0 0 0 rg\n{boxes}f\nQ\n"),
             resources,
         )?;
-        report.push(json!({
+        let mut entry = json!({
             "page": n,
             "areas": page_areas.len(),
             "glyphs_removed": stats.glyphs,
             "paths_removed": stats.paths,
             "images_blanked": stats.images,
             "annotations_removed": stats.annotations,
-        }));
+        });
+        if a.dry_run {
+            entry["targets"] = page_areas
+                .iter()
+                .zip(&found_by[&n])
+                .map(|(area, text)| {
+                    let mut target = json!({"bbox": round_box(area)});
+                    if let Some(text) = text {
+                        target["text"] = json!(text);
+                    }
+                    target
+                })
+                .collect();
+        }
+        report.push(entry);
     }
 
     // The structure tree can repeat page text as alternative descriptions, and nothing
@@ -1312,9 +1340,12 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
             );
         }
     }
-    doc::write_atomic(&a.output, &bytes)?;
+    if !a.dry_run {
+        doc::write_atomic(&a.output, &bytes)?;
+    }
     Ok(json!({
         "output": a.output,
+        "dry_run": a.dry_run,
         "text_matches": matches,
         "pages": report,
         "verified": true,
@@ -1331,7 +1362,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
     let total = pdf.pages().len() as u32;
 
     // Per page: where each match is and what replaces it.
-    let mut found: Vec<(u32, Vec<Area>, Vec<String>)> = Vec::new();
+    let mut found: Vec<(u32, Vec<Area>, Vec<String>, Vec<String>)> = Vec::new();
     for n in pagespec::parse_or_all(a.pages.as_deref(), total)? {
         let matches = text_areas(&layout::scan(&pdf.pages()[n as usize - 1]), &patterns);
         if matches.is_empty() {
@@ -1347,7 +1378,8 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
                 }
             })
             .collect();
-        found.push((n, matches.into_iter().map(|m| m.0).collect(), texts));
+        let (areas, olds) = matches.into_iter().map(|m| (m.0, m.1)).unzip();
+        found.push((n, areas, texts, olds));
     }
     if found.is_empty() {
         bail!("'{}' was not found; nothing was written", a.find);
@@ -1357,7 +1389,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
     let ids = doc::page_ids(&d);
     let mut report = Vec::new();
     let mut total = 0;
-    for (n, areas, texts) in &found {
+    for (n, areas, texts, olds) in &found {
         let id = *ids
             .get(*n as usize - 1)
             .with_context(|| format!("page {n} is missing"))?;
@@ -1414,14 +1446,34 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
         // A match the page content does not draw itself sits in an annotation,
         // such as a form field's value; those are left alone and counted.
         total += original + substituted;
-        report.push(json!({
+        let tenths = |v: f64| (v * 10.0).round() / 10.0;
+        let mut entry = json!({
             "page": n,
             "replaced": original + substituted,
             "not_replaced_in_annotations": areas.len() - original - substituted,
             "in_original_font": original,
             "in_substitute_font": substituted,
-            "overflow_pt": (overflow.max(0.0) * 10.0).round() / 10.0,
-        }));
+            "overflow_pt": tenths(overflow.max(0.0)),
+        });
+        if a.dry_run {
+            entry["matches"] = (0..areas.len())
+                .map(|i| {
+                    let mut m =
+                        json!({"bbox": round_box(&areas[i]), "old": olds[i], "new": texts[i]});
+                    match rewriter.placed[i] {
+                        Outcome::Original { new, old } => {
+                            m["font"] = json!("original");
+                            m["overflow_pt"] = json!(tenths((new - old).max(0.0)));
+                        }
+                        Outcome::Substitute => m["font"] = json!("substitute"),
+                        // Drawn by an annotation or form field, which replace leaves alone.
+                        Outcome::Pending => m["font"] = Value::Null,
+                    }
+                    m
+                })
+                .collect();
+        }
+        report.push(entry);
     }
     if total == 0 {
         bail!(
@@ -1430,9 +1482,10 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
         );
     }
     prune(&mut d);
-    let size = doc::save(&mut d, &a.output)?;
+    let size = doc::save_unless(a.dry_run, &mut d, &a.output)?;
     Ok(json!({
         "output": a.output,
+        "dry_run": a.dry_run,
         "replacements": total,
         "pages": report,
         "size_bytes": size,

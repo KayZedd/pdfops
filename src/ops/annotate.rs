@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::ops::edit::visual_space;
 use crate::ops::layout;
-use crate::ops::redact::{Area, apply, bounds, compile, invert, parse_rect, text_areas};
+use crate::ops::redact::{Area, apply, bounds, compile, invert, parse_rect, round_box, text_areas};
 use crate::{doc, pagespec};
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
@@ -91,6 +91,10 @@ pub struct AnnotateArgs {
     /// Password, if the file is encrypted
     #[arg(long)]
     pub password: Option<String>,
+    /// Report what would change without writing the output file
+    #[arg(long)]
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 fn numbers(doc: &Document, object: &Object) -> Vec<f64> {
@@ -267,15 +271,20 @@ pub fn annotate(a: AnnotateArgs) -> Result<Value> {
 
     let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
     let total = pdf.pages().len() as u32;
-    let mut areas: Vec<(u32, Area)> = Vec::new();
+    let mut areas: Vec<(u32, Area, Option<String>)> = Vec::new();
     for spec in &a.rects {
-        areas.push(parse_rect(spec, total)?);
+        let (page, area) = parse_rect(spec, total)?;
+        areas.push((page, area, None));
     }
     if !a.texts.is_empty() {
         let patterns = compile(&a.texts, a.regex, a.case_sensitive)?;
         for n in pagespec::parse_or_all(a.pages.as_deref(), total)? {
             let found = text_areas(&layout::scan(&pdf.pages()[n as usize - 1]), &patterns);
-            areas.extend(found.into_iter().map(|(area, ..)| (n, area)));
+            areas.extend(
+                found
+                    .into_iter()
+                    .map(|(area, text, _)| (n, area, Some(text))),
+            );
         }
     }
     if areas.is_empty() {
@@ -285,7 +294,7 @@ pub fn annotate(a: AnnotateArgs) -> Result<Value> {
     let mut d = doc::load(&a.input, a.password.as_deref())?;
     let ids = doc::page_ids(&d);
     let mut added: HashMap<u32, usize> = HashMap::new();
-    for (n, area) in &areas {
+    for (n, area, _) in &areas {
         let page = *ids
             .get(*n as usize - 1)
             .with_context(|| format!("page {n} is missing"))?;
@@ -361,13 +370,27 @@ pub fn annotate(a: AnnotateArgs) -> Result<Value> {
         d.get_dictionary_mut(page)?.set("Annots", list);
         *added.entry(*n).or_default() += 1;
     }
-    let size = doc::save(&mut d, &a.output)?;
+    let size = doc::save_unless(a.dry_run, &mut d, &a.output)?;
     let mut pages: Vec<(u32, usize)> = added.into_iter().collect();
     pages.sort_unstable();
-    Ok(json!({
+    let mut result = json!({
         "output": a.output,
+        "dry_run": a.dry_run,
         "added": areas.len(),
         "pages": pages.iter().map(|(page, count)| json!({"page": page, "added": count})).collect::<Vec<_>>(),
         "size_bytes": size,
-    }))
+    });
+    if a.dry_run {
+        result["targets"] = areas
+            .iter()
+            .map(|(page, area, text)| {
+                let mut target = json!({"page": page, "bbox": round_box(area)});
+                if let Some(text) = text {
+                    target["text"] = json!(text);
+                }
+                target
+            })
+            .collect();
+    }
+    Ok(result)
 }

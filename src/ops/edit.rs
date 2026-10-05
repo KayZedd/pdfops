@@ -210,6 +210,10 @@ pub struct StampArgs {
     /// Password, if the file is encrypted
     #[arg(long)]
     pub password: Option<String>,
+    /// Report what would change without writing the output file
+    #[arg(long)]
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 pub fn rotate(a: RotateArgs) -> Result<Value> {
@@ -708,6 +712,11 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
         }
         append_content(&mut d, id, open_id, ops + "Q\n", res)?;
     }
-    let size = doc::save(&mut d, &a.output)?;
-    Ok(json!({"output": a.output, "stamped_pages": unique, "size_bytes": size}))
+    let size = doc::save_unless(a.dry_run, &mut d, &a.output)?;
+    Ok(json!({
+        "output": a.output,
+        "dry_run": a.dry_run,
+        "stamped_pages": unique,
+        "size_bytes": size,
+    }))
 }
