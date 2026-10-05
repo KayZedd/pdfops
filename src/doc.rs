@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
-use hayro::hayro_syntax::object::{Dict, MaybeRef, Object as LazyObject, ObjectIdentifier};
-use hayro::hayro_syntax::{LoadPdfError, Pdf};
+use hayro::hayro_syntax::object::{
+    Dict, MaybeRef, Object as LazyObject, ObjectIdentifier, Stream as LazyStream,
+};
+use hayro::hayro_syntax::{Filter, LoadPdfError, Pdf};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 /// Attributes a page may inherit from its ancestors in the page tree.
@@ -193,7 +195,42 @@ fn rebuild(bytes: Arc<Vec<u8>>) -> Result<Document> {
         // A reference to nothing reads as null, which is what leaving it out gives.
         let lazy = xref.get::<LazyObject<'_>>(ObjectIdentifier::new(id.0 as i32, id.1 as i32));
         if let Some(lazy) = lazy {
-            let object = convert(&lazy, &mut open, 0)?;
+            let mut object = convert(&lazy, &mut open, 0)?;
+            // Packed data that does not unpack is of no use to any reader, and a strict
+            // one rejects the whole file over it. The stream stays, empty.
+            if let (LazyObject::Stream(source), Object::Stream(stream)) = (&lazy, &mut object) {
+                let packed = source.filters().iter().all(|f| {
+                    matches!(
+                        f,
+                        Filter::FlateDecode
+                            | Filter::LzwDecode
+                            | Filter::AsciiHexDecode
+                            | Filter::Ascii85Decode
+                            | Filter::RunLengthDecode
+                    )
+                });
+                // The reader here forgives a deflate stream its header and checksum;
+                // others do not, so such data is unpacked and packed again.
+                let strict = || {
+                    use std::io::Read;
+                    let mut sink = Vec::new();
+                    flate2::read::ZlibDecoder::new(&stream.content[..])
+                        .read_to_end(&mut sink)
+                        .is_ok()
+                };
+                let unsound = match source.filters().as_slice() {
+                    [] => false,
+                    [Filter::FlateDecode] => !strict(),
+                    _ => packed && source.decoded().is_err(),
+                };
+                if unsound {
+                    let data = source.decoded().map(|d| d.into_owned()).unwrap_or_default();
+                    stream.dict.remove(b"Filter");
+                    stream.dict.remove(b"DecodeParms");
+                    stream.set_content(data);
+                    let _ = stream.compress();
+                }
+            }
             doc.objects.insert(id, object);
         }
     }
@@ -215,14 +252,15 @@ fn rebuild(bytes: Arc<Vec<u8>>) -> Result<Document> {
                 .collect(),
         );
     }
-    // Content that is not a stream cannot be drawn; a page found by searching may name anything.
-    let streams: std::collections::HashSet<ObjectId> = doc
-        .objects
-        .iter()
-        .filter(|(_, object)| object.as_stream().is_ok())
-        .map(|(id, _)| *id)
-        .collect();
-    let drawable = |object: &Object| object.as_reference().is_ok_and(|id| streams.contains(&id));
+    // Content that is not a stream, or whose data does not decode, cannot be drawn: a
+    // page found by searching may name anything. The reader this mirrors shows nothing
+    // for it, and a strict one would reject the file over it.
+    let drawable = |object: &Object| {
+        object.as_reference().is_ok_and(|id| {
+            xref.get::<LazyStream<'_>>(ObjectIdentifier::new(id.0 as i32, id.1 as i32))
+                .is_some_and(|stream| stream.decoded().is_ok())
+        })
+    };
     // The parts may also be listed in an object of their own.
     let lists: HashMap<ObjectId, Vec<Object>> = doc
         .objects
