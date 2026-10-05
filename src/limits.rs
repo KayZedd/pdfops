@@ -6,13 +6,70 @@
 //! fails with an ordinary error when it hits one.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 static USED: AtomicUsize = AtomicUsize::new(0);
 /// Zero means no cap.
 static CAP: AtomicUsize = AtomicUsize::new(0);
+
+/// Writes `message` to standard error and ends the process with status 1, at once.
+///
+/// This runs inside the allocator and beside threads that may be stuck, so it must
+/// not allocate, take a lock or run exit handlers: `std::process::exit` does all
+/// three, and from here it crashed on macOS and hung on Windows. The operating
+/// system is asked directly instead.
+#[cfg(unix)]
+fn stop(message: &[u8]) -> ! {
+    unsafe extern "C" {
+        fn write(fd: i32, buffer: *const std::ffi::c_void, count: usize) -> isize;
+        fn _exit(status: i32) -> !;
+    }
+    // SAFETY: `write` reads `message.len()` bytes from a live slice; `_exit` takes no pointers.
+    unsafe {
+        write(2, message.as_ptr().cast(), message.len());
+        _exit(1)
+    }
+}
+
+#[cfg(windows)]
+fn stop(message: &[u8]) -> ! {
+    use std::ffi::c_void;
+    unsafe extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn WriteFile(
+            file: *mut c_void,
+            buffer: *const u8,
+            count: u32,
+            written: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn TerminateProcess(process: *mut c_void, status: u32) -> i32;
+    }
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    let mut written = 0u32;
+    // SAFETY: `WriteFile` reads `message.len()` bytes from a live slice and writes one
+    // `u32`; `TerminateProcess` on the current process does not return.
+    unsafe {
+        WriteFile(
+            GetStdHandle(STD_ERROR_HANDLE),
+            message.as_ptr(),
+            message.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        );
+        TerminateProcess(GetCurrentProcess(), 1);
+    }
+    loop {
+        std::hint::spin_loop();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stop(_: &[u8]) -> ! {
+    std::process::abort()
+}
 
 /// The system allocator with a running total, which ends the process at the cap.
 ///
@@ -25,11 +82,9 @@ impl Capped {
         let used = USED.fetch_add(size, Ordering::Relaxed) + size;
         let cap = CAP.load(Ordering::Relaxed);
         if cap != 0 && used > cap {
-            // No allocation is possible here, so the message is fixed and written raw.
-            let _ = std::io::stderr().write_all(
+            stop(
                 b"{\"error\":\"memory limit exceeded while processing this file; raise it with --max-memory if the file is trusted\"}\n",
             );
-            std::process::exit(1);
         }
     }
 }
@@ -74,11 +129,12 @@ pub fn set_timeout(seconds: u64) {
     if seconds == 0 {
         return;
     }
+    // Built now: by the time it is needed, allocating may no longer be possible.
+    let message = format!(
+        "{{\"error\":\"time limit of {seconds} s exceeded while processing this file; raise it with --timeout if the file is trusted\"}}\n"
+    );
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(seconds));
-        eprintln!(
-            "{{\"error\":\"time limit of {seconds} s exceeded while processing this file; raise it with --timeout if the file is trusted\"}}"
-        );
-        std::process::exit(1);
+        stop(message.as_bytes());
     });
 }
