@@ -3,7 +3,9 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::ops::{assemble, create, edit, forms, layout, ocr, read, redact, render};
+use crate::ops::{
+    annotate, assemble, create, edit, forms, layout, ocr, read, redact, render, sign,
+};
 
 pub struct Tool {
     /// CLI subcommand name, e.g. `set-meta`.
@@ -41,6 +43,11 @@ pub const TOOLS: &[Tool] = &[
     tool!("ocr-langs", ocr::OcrLangsArgs, ocr::ocr_langs),
     tool!("ocr-install", ocr::OcrInstallArgs, ocr::ocr_install),
     tool!("outline", read::OutlineArgs, read::outline),
+    tool!(
+        "annotations",
+        annotate::AnnotationsArgs,
+        annotate::annotations
+    ),
     tool!("render", render::RenderArgs, render::render),
     tool!("images", render::ImagesArgs, render::images),
     tool!("create", create::CreateArgs, create::create),
@@ -49,12 +56,15 @@ pub const TOOLS: &[Tool] = &[
     tool!("split", assemble::SplitArgs, assemble::split),
     tool!("rotate", edit::RotateArgs, edit::rotate),
     tool!("stamp", edit::StampArgs, edit::stamp),
+    tool!("annotate", annotate::AnnotateArgs, annotate::annotate),
     tool!("redact", redact::RedactArgs, redact::redact),
     tool!("replace", redact::ReplaceArgs, redact::replace),
     tool!("set-meta", edit::SetMetaArgs, edit::set_meta),
     tool!("compress", edit::CompressArgs, edit::compress),
     tool!("encrypt", edit::EncryptArgs, edit::encrypt),
     tool!("decrypt", edit::DecryptArgs, edit::decrypt),
+    tool!("sign", sign::SignArgs, sign::sign),
+    tool!("signatures", sign::SignaturesArgs, sign::signatures),
     tool!("forms", forms::FormsArgs, forms::forms),
     tool!("fill", forms::FillArgs, forms::fill),
 ];

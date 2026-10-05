@@ -632,3 +632,315 @@ fn create_embeds_fonts_for_text_outside_latin1() {
         "{text}"
     );
 }
+
+#[test]
+fn annotate_marks_text_and_lists_it_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 2);
+    let out = dir.path().join("out.pdf");
+    let word = words(&pdf, 1)
+        .into_iter()
+        .find(|w| w.0 == "alpha-1.")
+        .unwrap()
+        .1;
+
+    let v = call(
+        "pdf_annotate",
+        json!({"input": pdf, "output": out, "texts": ["alpha-1"], "comment": "check this", "author": "Ada", "pages": "1"}),
+    );
+    assert_eq!(v["added"], 1);
+    let listed = call("pdf_annotations", json!({"input": out}));
+    let a = &listed["annotations"][0];
+    assert_eq!(
+        (
+            a["page"].as_u64(),
+            a["type"].as_str(),
+            a["comment"].as_str(),
+            a["author"].as_str()
+        ),
+        (Some(1), Some("highlight"), Some("check this"), Some("Ada"))
+    );
+    // The mark sits on the matched characters: the word without its full stop.
+    let r: Vec<f64> = a["rect"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    assert!(
+        (r[0] - word[0]).abs() < 0.2
+            && r[2] < word[2]
+            && r[2] > word[2] - 8.0
+            && (r[1] - word[1]).abs() < 0.2,
+        "{r:?} {word:?}"
+    );
+    // The page text is untouched.
+    assert!(texts(&out)[0].contains("Keyword alpha-1."));
+
+    // A dark underline shows up where the word is when the page is rendered.
+    call(
+        "pdf_annotate",
+        json!({"input": pdf, "output": out, "kind": "underline", "texts": ["the"], "color": "000080"}),
+    );
+    let s = words(&pdf, 1).into_iter().find(|w| w.0 == "the").unwrap().1;
+    // "the" has no descenders, so the strip under its baseline starts out empty.
+    let below = [
+        s[0] as usize + 2,
+        792 - s[3] as usize,
+        s[2] as usize - 2,
+        792 - s[3] as usize + 3,
+    ];
+    assert_eq!(ink(&pdf, dir.path(), [below])[0], 0);
+    assert!(ink(&out, dir.path(), [below])[0] > 20);
+    assert_eq!(
+        call("pdf_annotations", json!({"input": out}))["annotations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "one on each page"
+    );
+
+    // The other kinds, and what each requires.
+    call(
+        "pdf_annotate",
+        json!({"input": pdf, "output": out, "kind": "link", "rects": ["1:72,50,200,80"], "url": "https://example.com/x"}),
+    );
+    call(
+        "pdf_annotate",
+        json!({"input": out, "output": out, "kind": "note", "rects": ["2:100,100,120,120"], "comment": "remember"}),
+    );
+    call(
+        "pdf_annotate",
+        json!({"input": out, "output": out, "kind": "box", "rects": ["2:50,50,150,90"]}),
+    );
+    let listed = call("pdf_annotations", json!({"input": out}));
+    let kinds: Vec<(u64, &str)> = listed["annotations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| (a["page"].as_u64().unwrap(), a["type"].as_str().unwrap()))
+        .collect();
+    assert_eq!(kinds, [(1, "link"), (2, "text"), (2, "square")]);
+    assert_eq!(listed["annotations"][0]["url"], "https://example.com/x");
+    assert_eq!(
+        listed["annotations"][0]["rect"],
+        json!([72.0, 50.0, 200.0, 80.0])
+    );
+    assert_eq!(listed["annotations"][1]["comment"], "remember");
+
+    assert!(
+        call_err(
+            "pdf_annotate",
+            json!({"input": pdf, "output": out, "kind": "link", "texts": ["sample"]})
+        )
+        .contains("needs a url")
+    );
+    assert!(
+        call_err(
+            "pdf_annotate",
+            json!({"input": pdf, "output": out, "kind": "note", "texts": ["sample"]})
+        )
+        .contains("needs a comment")
+    );
+    assert!(
+        call_err(
+            "pdf_annotate",
+            json!({"input": pdf, "output": out, "texts": ["absent"]})
+        )
+        .contains("nothing was written")
+    );
+    assert!(
+        call_err("pdf_annotate", json!({"input": pdf, "output": out})).contains("nothing to mark")
+    );
+}
+
+#[test]
+fn annotations_report_links_between_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 3);
+    let mut doc = lopdf::Document::load(&pdf).unwrap();
+    let pages: Vec<_> = doc.get_pages().into_values().collect();
+    use lopdf::dictionary;
+    let link = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Link", "Rect" => vec![72.into(), 700.into(), 172.into(), 720.into()],
+        "Dest" => vec![lopdf::Object::Reference(pages[2]), "Fit".into()],
+    });
+    doc.get_dictionary_mut(pages[0])
+        .unwrap()
+        .set("Annots", vec![lopdf::Object::Reference(link)]);
+    doc.save(&pdf).unwrap();
+    let v = call("pdf_annotations", json!({"input": pdf}));
+    assert_eq!(
+        v["annotations"],
+        json!([{"page": 1, "type": "link", "rect": [72.0, 72.0, 172.0, 92.0], "target_page": 3}])
+    );
+}
+
+#[test]
+fn sign_and_verify_including_tampering_and_countersigning() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 2);
+    let (cert, key) = common::identity(dir.path(), "Ada Signer");
+    let signed = dir.path().join("signed.pdf");
+
+    assert_eq!(
+        call("pdf_signatures", json!({"input": pdf}))["signatures"],
+        0
+    );
+    let v = call(
+        "pdf_sign",
+        json!({"input": pdf, "output": signed, "cert": cert, "key": key, "reason": "Approval", "location": "Kraków"}),
+    );
+    assert_eq!(
+        (v["signer"].as_str(), v["earlier_signatures"].as_u64()),
+        (Some("Ada Signer"), Some(0))
+    );
+    // The original bytes are still there, untouched, at the start of the signed file.
+    let (before, after) = (
+        std::fs::read(&pdf).unwrap(),
+        std::fs::read(&signed).unwrap(),
+    );
+    assert_eq!(&after[..before.len()], &before[..]);
+
+    let v = call("pdf_signatures", json!({"input": signed}));
+    assert_eq!(
+        (v["signatures"].as_u64(), v["valid"].as_u64()),
+        (Some(1), Some(1))
+    );
+    let s = &v["details"][0];
+    for (key, expected) in [
+        ("valid", json!(true)),
+        ("document_unchanged", json!(true)),
+        ("signature_genuine", json!(true)),
+        ("covers_whole_document", json!(true)),
+        ("signer", json!("Ada Signer")),
+        ("reason", json!("Approval")),
+        ("location", json!("Kraków")),
+        ("field", json!("Signature1")),
+    ] {
+        assert_eq!(s[key], expected, "{key}: {s}");
+    }
+    assert_eq!(s["certificate"]["self_signed"], true);
+    assert!(texts(&signed)[1].contains("alpha-2"));
+
+    // One changed character in the signed content is enough.
+    let mut forged = after.clone();
+    let at = forged.windows(7).position(|w| w == b"alpha-1").unwrap();
+    forged[at + 6] = b'7';
+    let forged_path = dir.path().join("forged.pdf");
+    std::fs::write(&forged_path, forged).unwrap();
+    let v = call("pdf_signatures", json!({"input": forged_path}));
+    let s = &v["details"][0];
+    assert_eq!(
+        (
+            v["valid"].as_u64(),
+            s["document_unchanged"].as_bool(),
+            s["signature_genuine"].as_bool()
+        ),
+        (Some(0), Some(false), Some(true))
+    );
+
+    // A second signer appends; the first signature stays valid for the part it covers.
+    let (cert2, key2) = common::identity(dir.path(), "Bob Countersigner");
+    let twice = dir.path().join("twice.pdf");
+    let v = call(
+        "pdf_sign",
+        json!({"input": signed, "output": twice, "cert": cert2, "key": key2}),
+    );
+    assert_eq!(
+        (
+            v["earlier_signatures"].as_u64(),
+            v["earlier_signatures_kept"].as_bool()
+        ),
+        (Some(1), Some(true))
+    );
+    let v = call("pdf_signatures", json!({"input": twice}));
+    assert_eq!(
+        (v["signatures"].as_u64(), v["valid"].as_u64()),
+        (Some(2), Some(2))
+    );
+    let summary: Vec<(&str, bool)> = v["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["signer"].as_str().unwrap(),
+                s["covers_whole_document"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [("Ada Signer", false), ("Bob Countersigner", true)]
+    );
+
+    // The key must belong to the certificate, and one identity must be given.
+    let e = call_err(
+        "pdf_sign",
+        json!({"input": pdf, "output": signed, "cert": cert, "key": key2}),
+    );
+    assert!(
+        e.contains("none of the certificates belongs to the private key"),
+        "{e}"
+    );
+    assert!(
+        call_err("pdf_sign", json!({"input": pdf, "output": signed}))
+            .contains("either a PKCS #12 file")
+    );
+}
+
+#[test]
+fn sign_accepts_rsa_keys_and_pkcs12_files() {
+    use rsa::pkcs8::EncodePrivateKey;
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 1);
+    // An RSA identity, as certificate authorities commonly issue them.
+    let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+    let pair = rcgen::KeyPair::from_pkcs8_pem_and_sign_algo(&pem, &rcgen::PKCS_RSA_SHA256).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Rsa Signer");
+    let cert = params.self_signed(&pair).unwrap();
+    let (cert_path, key_path) = (dir.path().join("rsa.crt"), dir.path().join("rsa.key"));
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, pem.as_bytes()).unwrap();
+
+    let out = dir.path().join("rsa.pdf");
+    let v = call(
+        "pdf_sign",
+        json!({"input": pdf, "output": out, "cert": cert_path, "key": key_path}),
+    );
+    assert_eq!(v["algorithm"], "RSA with SHA-256");
+    let v = call("pdf_signatures", json!({"input": out}));
+    assert_eq!(
+        (v["valid"].as_u64(), v["details"][0]["signer"].as_str()),
+        (Some(1), Some("Rsa Signer"))
+    );
+
+    // The same identity packed into a password-protected PKCS #12 file.
+    let chain = p12_keystore::PrivateKeyChain::new(
+        [7u8; 20].to_vec(),
+        p12_keystore::PrivateKey::from_der(private.to_pkcs8_der().unwrap().as_bytes()).unwrap(),
+        [p12_keystore::Certificate::from_der(cert.der()).unwrap()],
+    );
+    let mut store = p12_keystore::KeyStore::new();
+    store.add_entry("id", p12_keystore::KeyStoreEntry::PrivateKeyChain(chain));
+    let p12 = dir.path().join("id.p12");
+    std::fs::write(&p12, store.writer("s3cret").write().unwrap()).unwrap();
+
+    let v = call(
+        "pdf_sign",
+        json!({"input": pdf, "output": out, "p12": p12, "p12_password": "s3cret"}),
+    );
+    assert_eq!(v["signer"], "Rsa Signer");
+    assert_eq!(call("pdf_signatures", json!({"input": out}))["valid"], 1);
+    let e = call_err(
+        "pdf_sign",
+        json!({"input": pdf, "output": out, "p12": p12, "p12_password": "wrong"}),
+    );
+    assert!(e.contains("wrong password"), "{e}");
+}

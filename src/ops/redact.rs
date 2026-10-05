@@ -94,8 +94,8 @@ pub struct ReplaceArgs {
     pub password: Option<String>,
 }
 
-type Matrix = [f64; 6];
-type Area = [f64; 4];
+pub(crate) type Matrix = [f64; 6];
+pub(crate) type Area = [f64; 4];
 
 const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
@@ -111,11 +111,11 @@ fn concat(first: Matrix, second: Matrix) -> Matrix {
     ]
 }
 
-fn apply(m: Matrix, x: f64, y: f64) -> (f64, f64) {
+pub(crate) fn apply(m: Matrix, x: f64, y: f64) -> (f64, f64) {
     (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
 }
 
-fn invert(m: Matrix) -> Option<Matrix> {
+pub(crate) fn invert(m: Matrix) -> Option<Matrix> {
     let det = m[0] * m[3] - m[1] * m[2];
     (det.abs() > 1e-12).then(|| {
         [
@@ -129,7 +129,7 @@ fn invert(m: Matrix) -> Option<Matrix> {
     })
 }
 
-fn bounds(points: impl IntoIterator<Item = (f64, f64)>) -> Area {
+pub(crate) fn bounds(points: impl IntoIterator<Item = (f64, f64)>) -> Area {
     points.into_iter().fold(
         [
             f64::INFINITY,
@@ -1046,7 +1046,7 @@ fn out_of_step() -> anyhow::Error {
 }
 
 /// Parses "page:x0,y0,x1,y1".
-fn parse_rect(spec: &str, total: u32) -> Result<(u32, Area)> {
+pub(crate) fn parse_rect(spec: &str, total: u32) -> Result<(u32, Area)> {
     let bad =
         || anyhow!("invalid rect '{spec}'; expected page:x0,y0,x1,y1, e.g. 2:100,200,300,220");
     let (page, coords) = spec.split_once(':').ok_or_else(bad)?;
@@ -1073,7 +1073,10 @@ fn parse_rect(spec: &str, total: u32) -> Result<(u32, Area)> {
 ///
 /// Areas follow the matched glyphs exactly, so a match inside a longer word
 /// covers only its own characters.
-fn text_areas(page: &layout::PageLayout, patterns: &[regex::Regex]) -> Vec<(Area, String, usize)> {
+pub(crate) fn text_areas(
+    page: &layout::PageLayout,
+    patterns: &[regex::Regex],
+) -> Vec<(Area, String, usize)> {
     let mut areas = Vec::new();
     for line in layout::lines(&page.words) {
         // The line as one string, with each glyph's byte range and box.
@@ -1105,7 +1108,11 @@ fn text_areas(page: &layout::PageLayout, patterns: &[regex::Regex]) -> Vec<(Area
     areas
 }
 
-fn compile(texts: &[String], regex: bool, case_sensitive: bool) -> Result<Vec<regex::Regex>> {
+pub(crate) fn compile(
+    texts: &[String],
+    regex: bool,
+    case_sensitive: bool,
+) -> Result<Vec<regex::Regex>> {
     texts
         .iter()
         .filter(|t| !t.is_empty())

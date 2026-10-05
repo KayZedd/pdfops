@@ -7,7 +7,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
-use crate::ops::{assemble, create, edit, forms, layout, ocr, read, redact, render};
+use crate::ops::{
+    annotate, assemble, create, edit, forms, layout, ocr, read, redact, render, sign,
+};
 use crate::{mcp, tools};
 
 #[derive(Parser)]
@@ -50,6 +52,8 @@ enum Command {
     OcrInstall(ocr::OcrInstallArgs),
     /// List the outline (bookmarks / table of contents) with target pages
     Outline(read::OutlineArgs),
+    /// List annotations: highlights, comments, links and other markup, with their positions
+    Annotations(annotate::AnnotationsArgs),
     /// Render pages to PNG files, e.g. to look at scans, charts or layout
     Render(render::RenderArgs),
     /// Extract the images drawn on pages to files (JPEG and JPEG 2000 as stored, the rest as PNG)
@@ -66,6 +70,8 @@ enum Command {
     Rotate(edit::RotateArgs),
     /// Draw text (watermark, header, footer, page numbers), an image such as a signature, or a QR code
     Stamp(edit::StampArgs),
+    /// Add a highlight, underline, strike-out, box, note or link, on found text or on an area
+    Annotate(annotate::AnnotateArgs),
     /// Permanently remove text, images and drawings in given areas or matching given text, then verify
     Redact(redact::RedactArgs),
     /// Replace text in place, written in the document's own font where it has the glyphs
@@ -78,6 +84,10 @@ enum Command {
     Encrypt(edit::EncryptArgs),
     /// Remove password protection, given the password
     Decrypt(edit::DecryptArgs),
+    /// Sign a PDF digitally with a certificate and its private key
+    Sign(sign::SignArgs),
+    /// Check the digital signatures of a PDF: who signed, and whether it changed since
+    Signatures(sign::SignaturesArgs),
     /// List form fields with their types, current values and options
     Forms(forms::FormsArgs),
     /// Fill form fields by name
@@ -119,6 +129,7 @@ fn run(command: Command, limits: (usize, u64)) -> Result<Option<Value>> {
         Command::OcrLangs(a) => ocr::ocr_langs(a)?,
         Command::OcrInstall(a) => ocr::ocr_install(a)?,
         Command::Outline(a) => read::outline(a)?,
+        Command::Annotations(a) => annotate::annotations(a)?,
         Command::Render(a) => render::render(a)?,
         Command::Images(a) => render::images(a)?,
         Command::Create(a) => create::create(a)?,
@@ -127,12 +138,15 @@ fn run(command: Command, limits: (usize, u64)) -> Result<Option<Value>> {
         Command::Split(a) => assemble::split(a)?,
         Command::Rotate(a) => edit::rotate(a)?,
         Command::Stamp(a) => edit::stamp(a)?,
+        Command::Annotate(a) => annotate::annotate(a)?,
         Command::Redact(a) => redact::redact(a)?,
         Command::Replace(a) => redact::replace(a)?,
         Command::SetMeta(a) => edit::set_meta(a)?,
         Command::Compress(a) => edit::compress(a)?,
         Command::Encrypt(a) => edit::encrypt(a)?,
         Command::Decrypt(a) => edit::decrypt(a)?,
+        Command::Sign(a) => sign::sign(a)?,
+        Command::Signatures(a) => sign::signatures(a)?,
         Command::Forms(a) => forms::forms(a)?,
         Command::Fill(a) => forms::fill(a)?,
         Command::Mcp { root } => {

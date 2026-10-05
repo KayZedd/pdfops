@@ -23,26 +23,34 @@ pkg-fmt = "zip"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+cms = { version = "0.2.3", features = ["builder"] }
+der = "0.7"
 fontdb = "0.24.0"
 getrandom = "0.4"
 hayro = "0.8.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 lopdf = "0.45"
+p12-keystore = "0.3.2"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 png = "0.18"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 qrcode = { version = "0.14.1", default-features = false }
 rayon = "1.12.0"
 regex = "1.13.1"
+rsa = { version = "0.9.10", features = ["sha2"] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.10"
 subsetter = "0.2.6"
 ttf-parser = "0.25"
 ureq = "3.4.2"
+x509-cert = "0.2"
 
 [dev-dependencies]
 lopdf = "0.45"
 png = "0.18"
+rcgen = "0.14.10"
 tempfile = "3.27.0"
 
 [profile.release]

@@ -386,3 +386,21 @@ pub fn words(path: &Path, page: u32) -> Vec<(String, [f64; 4])> {
         })
         .collect()
 }
+
+/// A self-signed P-256 signing identity as PEM files: (certificate, private key).
+pub fn identity(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, name);
+    let cert = params.self_signed(&key).unwrap();
+    let stem = name.replace(' ', "-");
+    let (cert_path, key_path) = (
+        dir.join(format!("{stem}.crt")),
+        dir.join(format!("{stem}.key")),
+    );
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    (cert_path, key_path)
+}
