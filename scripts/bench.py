@@ -86,6 +86,14 @@ def main():
         out.write("# Report\n\n" + "".join(
             f"## Section {i}\n\nSome **bold** text, a [link](https://example.com) and `code`.\n\n"
             f"| Item | Qty |\n| --- | --- |\n| Bolt {i} | {i * 3} |\n\n- one\n- two\n\n" for i in range(1, 101)))
+    # A throwaway signing identity, and a signed copy of the document to verify.
+    key, cert, signed = (os.path.join(work, n) for n in ("key.pem", "cert.pem", "signed.pdf"))
+    can_sign = shutil.which("openssl") is not None and subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+         "-days", "2", "-subj", "/CN=Benchmark"], capture_output=True).returncode == 0
+    if can_sign:
+        subprocess.run([B, "sign", F, "--cert", cert, "--key", key, "-o", signed], check=True, stdout=subprocess.DEVNULL)
+    pyhanko = os.path.join(os.path.dirname(args.python), "pyhanko") if args.python else "pyhanko"
     tessdata = os.path.expanduser("~/.local/share/pdfops/tessdata")
     tesseract = ["tesseract", page_png, "stdout", "-l", args.ocr_lang]
     if os.path.exists(os.path.join(tessdata, args.ocr_lang + ".traineddata")):
@@ -136,6 +144,12 @@ def main():
          py(mu + "[p.insert_text((72, 72), 'CONFIDENTIAL', fontsize=40) for p in d]; d.save(%r)" % o), None, None),
         ("`stamp`, QR code on every page", [B, "stamp", F, "--qr", "https://example.com/doc/42", "-o", o],
          None, None, None, None),
+        ("`annotations`, list", [B, "annotations", F], None,
+         py(mu + "[[a.type for a in p.annots()] + p.get_links() for p in d]"), None,
+         py(pl + "[p.annots for p in d.pages]")),
+        ("`annotate`, highlight a word on every page", [B, "annotate", F, "--text", W, "-o", o], None,
+         py(mu + "\nfor p in d:\n [p.add_highlight_annot(q) for q in p.search_for(%r)]\nd.save(%r)" % (W, o)),
+         None, None),
         ("`redact`, a word on every page", [B, "redact", F, "--text", W, "-o", o], None,
          py(mu + "\nfor p in d:\n [p.add_redact_annot(q) for q in p.search_for(%r)]; p.apply_redactions()\nd.save(%r)" % (W, o)),
          None, None),
@@ -156,6 +170,13 @@ def main():
          py("from pypdf import PdfReader, PdfWriter; r = PdfReader(%r); r.decrypt('u'); "
             "w = PdfWriter(clone_from=r); w.write(%r)" % (locked, o)), None),
     ]
+    if can_sign:
+        rows += [
+            ("`sign`, RSA-2048", [B, "sign", F, "--cert", cert, "--key", key, "-o", o],
+             [pyhanko, "sign", "addsig", "--field", "Sig1", "pemder", "--key", key, "--cert", cert, "--no-pass", F, o],
+             None, None, None),
+            ("`signatures`, verify", [B, "signatures", signed], ["pdfsig", signed], None, None, None),
+        ]
     if IMG:
         rows.insert(8, ("`images`, all embedded images", [B, "images", IMG, "-o", T],
                         ["pdfimages", "-png", IMG, os.path.join(T, "i")],

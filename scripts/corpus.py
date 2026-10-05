@@ -29,6 +29,10 @@ TIMEOUT = 60
 MEMORY_LIMIT = 2 * 1024**3
 
 
+# Certificate and key for the `sign` command, made once per run when openssl is at hand.
+IDENTITY = None
+
+
 def limit_memory():
     import resource
 
@@ -60,6 +64,8 @@ def examine(pdfops, path, scratch):
         "layout": ["layout", path, "-p", "1"],
         "tables": ["tables", path, "-p", "1"],
         "outline": ["outline", path],
+        "annotations": ["annotations", path],
+        "signatures": ["signatures", path],
         "forms": ["forms", path],
         "render": ["render", path, "-p", "1", "--dpi", "50", "-o", work],
         "images": ["images", path, "-p", "1", "-o", work],
@@ -71,10 +77,14 @@ def examine(pdfops, path, scratch):
         "set-meta": ["set-meta", path, "--title", "Corpus", "-o", out],
         "compress": ["compress", path, "-o", out],
         "encrypt": ["encrypt", path, "--owner-password", "o", "-o", out],
+        "annotate": ["annotate", path, "--rect", "1:50,50,300,300", "-o", out],
         "redact": ["redact", path, "--rect", "1:50,50,300,300", "-o", out],
         "replace": ["replace", path, "--find", "the", "--with", "THE", "-p", "1", "-o", out],
     }
-    writes = {"pages", "merge", "rotate", "stamp", "set-meta", "compress", "encrypt", "redact", "replace"}
+    if IDENTITY:
+        commands["sign"] = ["sign", path, "--cert", IDENTITY[0], "--key", IDENTITY[1], "-o", out]
+    writes = {"pages", "merge", "rotate", "stamp", "set-meta", "compress", "encrypt", "annotate", "redact",
+              "replace", "sign"}
     input_sound = None
     findings = []
     for name, args in commands.items():
@@ -117,6 +127,12 @@ def main():
     files = sorted(os.path.join(args.directory, f) for f in os.listdir(args.directory) if f.lower().endswith(".pdf"))
     files = files[: args.limit] if args.limit else files
     scratch = tempfile.mkdtemp(prefix="pdfops-corpus-")
+    global IDENTITY
+    cert, key = os.path.join(scratch, "cert.pem"), os.path.join(scratch, "key.pem")
+    made = shutil.which("openssl") and subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+         "-days", "2", "-subj", "/CN=Corpus"], capture_output=True).returncode == 0
+    IDENTITY = (cert, key) if made else None
     tally = collections.defaultdict(collections.Counter)
     defects = []
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
@@ -129,9 +145,9 @@ def main():
 
     kinds = ["ok", "refused", "crash", "timeout", "invalid"]
     print(f"{len(files)} files")
-    print("command".ljust(10) + "".join(k.rjust(9) for k in kinds))
+    print("command".ljust(12) + "".join(k.rjust(9) for k in kinds))
     for command, counts in tally.items():
-        print(command.ljust(10) + "".join(str(counts[k]).rjust(9) for k in kinds))
+        print(command.ljust(12) + "".join(str(counts[k]).rjust(9) for k in kinds))
     for defect in defects[:60]:
         print(f"{defect['kind'].upper()} {defect['command']} {defect['file']}: {defect['message']}")
     if args.report:

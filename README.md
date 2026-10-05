@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>Fast PDF tools for AI agents.</b><br>
-  One binary, 25 tools, JSON in and out. Works as a CLI, an MCP server and a Rust library.
+  One binary, 29 tools, JSON in and out. Works as a CLI, an MCP server and a Rust library.
 </p>
 
 <p align="center">
@@ -25,13 +25,16 @@ $ pdfops stamp offer.pdf --image signature.png --x 380 --y 690 -o signed.pdf
 - **Built for agents.** Every command returns one JSON document, errors say what to do next, and
   text can be read under a character budget with a resume point.
 - **Everything in one place.** Reading, layout, tables, OCR, rendering, page surgery, stamping,
-  redaction, forms, encryption and creation: 25 tools behind one schema.
+  redaction, annotations, signatures, forms, encryption and creation: 29 tools behind one schema.
 - **Nothing to set up.** A single binary with no PDF libraries, no Python and no runtime. Only OCR
   needs an extra program, and pdfops can fetch the language data itself.
 - **Fast.** Files open in milliseconds whatever their size, and page work runs on all cores. See the
   [benchmarks](#benchmarks).
 - **Redaction you can trust.** Content is deleted from the page, not covered, and the result is
   checked by a second interpreter before anything is written.
+- **Safe on files you did not write.** Every command runs under a memory cap and a time limit, the
+  MCP server runs each call in a process of its own and can be confined to one directory, and
+  every command is exercised against a corpus of 988 hostile and malformed PDFs in CI.
 
 ## Quick start
 
@@ -50,6 +53,13 @@ For Claude Code: `claude mcp add pdfops -- npx -y pdfops-cli mcp`.
 Tools are named `pdf_info`, `pdf_text`, `pdf_redact` and so on, and take the same arguments as the
 CLI. Relative paths resolve against the server's working directory.
 
+To keep an agent inside one folder, add `--root`: every path outside it is refused, including paths
+that arrive inside a document, and relative paths resolve against it.
+
+```json
+{ "command": "npx", "args": ["-y", "pdfops-cli", "mcp", "--root", "/home/me/documents"] }
+```
+
 ### Install
 
 | Method | Command | Needs |
@@ -57,11 +67,14 @@ CLI. Relative paths resolve against the server's working directory.
 | npm | `npm install -g pdfops-cli` or `npx pdfops-cli` | Node 18+ |
 | Prebuilt, via cargo | `cargo binstall pdfops` | [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) |
 | From source | `cargo install pdfops` | Rust 1.92+ |
+| Docker | `docker run --rm -i -v "$PWD:/work" ghcr.io/kayzedd/pdfops mcp --root /work` | Docker |
 | Manual | [download an archive](https://github.com/KayZedd/pdfops/releases/latest) and put `pdfops` on your `PATH` | nothing |
 
-The npm package is called `pdfops-cli` and installs the `pdfops` command. It is a small launcher: on first run it downloads the binary for your platform from
-the GitHub release, checks it against the published SHA-256 sum and caches it. Prebuilt binaries
-cover Linux and macOS on x86-64 and ARM64, and Windows on x86-64.
+The npm package is called `pdfops-cli` and installs the `pdfops` command. It is a small launcher:
+on first run it downloads the binary for your platform from the GitHub release, checks it against
+the published SHA-256 sum and caches it. Prebuilt binaries cover Linux (glibc and musl) and macOS
+on x86-64 and ARM64, and Windows on x86-64. The Docker image is Alpine with pdfops and tesseract
+with English; add `-v` for the folder to work in.
 
 OCR additionally needs the `tesseract` program; nothing else does. Language data is fetched on
 request, without administrator rights:
@@ -82,6 +95,8 @@ pdfops ocr-install --engine          # install tesseract itself where that needs
 | | `layout` | Bounding box, font and size of every line or word |
 | | `tables` | Tables as rows of cells, Markdown or CSV |
 | | `outline` | Bookmarks with target pages |
+| | `annotations` | Highlights, comments, links and other markup, with positions |
+| | `signatures` | Digital signatures: who signed, and whether the document changed since |
 | | `render` | Pages to PNG, to look at charts, scans and layout |
 | | `images` | The images drawn on pages, as files |
 | | `ocr` | Recognised text of scanned pages |
@@ -91,6 +106,7 @@ pdfops ocr-install --engine          # install tesseract itself where that needs
 | | `split` | Split by page count or by ranges |
 | **Edit** | `rotate` | Rotate pages by multiples of 90 degrees |
 | | `stamp` | Watermark, header, footer, page numbers, an image such as a signature, or a QR code |
+| | `annotate` | Add a highlight, underline, strike-out, box, note or link |
 | | `replace` | Replace text in place, in the document's own font where possible |
 | | `redact` | Remove text, images and drawings in areas or matching text, then verify |
 | | `set-meta` | Title, author, subject, keywords, creator |
@@ -99,6 +115,7 @@ pdfops ocr-install --engine          # install tesseract itself where that needs
 | | `fill` | Fill fields by name |
 | **Protect** | `encrypt` | AES-256 passwords and permissions |
 | | `decrypt` | Remove password protection |
+| | `sign` | Sign digitally with a certificate, keeping earlier signatures valid |
 | **Setup** | `ocr-langs` | Whether tesseract is installed and which languages are usable |
 | | `ocr-install` | Download OCR language data, optionally install tesseract |
 
@@ -157,6 +174,16 @@ Forms and protection:
 pdfops forms form.pdf
 pdfops fill form.pdf --set name="Ada Lovelace" --set agree=true -o filled.pdf
 pdfops encrypt in.pdf --owner-password secret --deny-copy -o locked.pdf
+pdfops sign in.pdf --p12 identity.p12 --p12-password secret --reason "Approved" -o signed.pdf
+pdfops signatures signed.pdf                            # valid, unchanged, who and when
+```
+
+Markup:
+
+```sh
+pdfops annotate in.pdf --text "liability" --comment "check with legal" -o marked.pdf
+pdfops annotate in.pdf --kind link --rect "1:72,50,300,70" --url https://example.com -o out.pdf
+pdfops annotations marked.pdf
 ```
 
 ### Conventions
@@ -187,6 +214,10 @@ pdfops encrypt in.pdf --owner-password secret --deny-copy -o locked.pdf
 | Replace text in place | ✓ | – | – | – | – | – |
 | Fill forms | ✓ | ✓ | ✓ | – | – | – |
 | Encrypt and decrypt | ✓ | ✓ | ✓ | – | ✓ | – |
+| Add and list annotations | ✓ | ✓ | ✓ | list | – | – |
+| Sign digitally | ✓ | – | – | – | – | – |
+| Verify signatures | ✓ | – | – | – | – | ✓ |
+| Memory and time limits per call | ✓ | – | – | – | – | – |
 | Create from Markdown | ✓ | from HTML | – | – | – | – |
 | Built-in MCP server and tool schemas | ✓ | – | – | – | – | – |
 | JSON from every command | ✓ | library | library | library | partly | – |
@@ -202,7 +233,7 @@ binary whose tools an agent can call directly.
 Best of 3 whole-process runs, start-up included, since that is what one tool call costs an agent.
 Document: a 357 page, 1.4 MB manual; `images` on a 4.6 MB manual with pictures; forms on a one page
 form. Machine: 4 core Intel i5-4460. Versions: poppler 26.08, qpdf 12.4, PyMuPDF 1.28, pypdf 6.19,
-pdfplumber 0.11, tesseract 5.5. The fastest entry of each row is bold.
+pdfplumber 0.11, pyHanko 0.5 (CLI), tesseract 5.5. The fastest entry of each row is bold.
 
 | Task | pdfops | command line tool | PyMuPDF | pypdf | pdfplumber |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -290,7 +321,25 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
   models) and is kept in `~/.local/share/pdfops/tessdata`, or `PDFOPS_TESSDATA` if set. Installing
   tesseract itself uses the system package manager; where that needs a password, the command to
   run is returned instead.
-- **Signatures.** Any change to a signed PDF invalidates its digital signatures.
+- **Limits.** A command may hold 4 GiB and run for 300 seconds by default; `--max-memory` (MiB) and
+  `--timeout` (seconds), or `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`, change that, and 0 lifts a
+  limit. Hitting one is an ordinary error. Rasters are capped at 64 megapixels.
+- **Damaged files** are read by a parser that repairs them, so `text`, `tables`, `render` and the
+  other reading commands work. Commands that write refuse such a file rather than save it with
+  parts missing, and say how to repair it first.
+- **Protected files stay protected.** Editing an encrypted file writes it back encrypted with the
+  same passwords and permissions. Only `decrypt` removes protection.
+- **Signing** appends to the file, so signatures already present stay valid. The signature is
+  invisible; combine it with `stamp --image` for a visible mark, stamping first. Keys are RSA or
+  ECDSA P-256, from PEM files or a PKCS #12 file. There is no timestamp authority and no long-term
+  validation data.
+- **Verifying** establishes two things: the signed bytes are unchanged, and the signature was made
+  by the embedded certificate's key. It does not decide whether that certificate is trustworthy;
+  pdfops has no list of certificate authorities. `covers_whole_document` is false when content was
+  appended after signing, as a later signature legitimately does.
+- **Any other change to a signed PDF invalidates its signatures**, as it must.
+- **Annotations** carry their own appearance, so they show in every viewer and in `render`.
+  `annotations` lists markup and links; form fields are listed by `forms`.
 
 ## Development
 
