@@ -9,11 +9,24 @@ Fast PDF operations for AI agents. A single Rust binary with no native PDF libra
 
 ## Install
 
+Download a prebuilt binary from the [latest release](https://github.com/KayZedd/pdfops/releases/latest)
+and put `pdfops` on your `PATH`. Archives are named by platform:
+
+| Platform | Archive |
+| --- | --- |
+| Linux x86-64 | `pdfops-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `pdfops-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple silicon | `pdfops-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `pdfops-<version>-x86_64-apple-darwin.tar.gz` |
+| Windows x86-64 | `pdfops-<version>-x86_64-pc-windows-msvc.zip` |
+
+Or build from source with Rust 1.92 or newer:
+
 ```sh
 cargo install --git https://github.com/KayZedd/pdfops
 ```
 
-Requires Rust 1.92 or newer. OCR additionally needs the `tesseract` program; nothing else does.
+OCR additionally needs the `tesseract` program; nothing else does.
 Language data is fetched on request, without administrator rights:
 
 ```sh
