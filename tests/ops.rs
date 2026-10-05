@@ -479,6 +479,76 @@ fn encrypt_and_decrypt_round_trip() {
 }
 
 #[test]
+fn editing_a_protected_file_keeps_it_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = sample(dir.path(), "a.pdf", 3);
+    let locked = dir.path().join("locked.pdf");
+    call(
+        "pdf_encrypt",
+        json!({"input": plain, "output": locked, "user_password": "open", "owner_password": "own"}),
+    );
+    let out = dir.path().join("out.pdf");
+    let still_locked = |path: &std::path::Path, expect: &str| {
+        assert!(
+            call_err("pdf_info", json!({"input": path})).contains("encrypted"),
+            "opens without a password"
+        );
+        let v = call("pdf_text", json!({"input": path, "password": "open"}));
+        let text: String = v["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["text"].as_str().unwrap())
+            .collect();
+        assert!(text.contains(expect), "{text}");
+        let raw = std::fs::read(path).unwrap();
+        assert!(
+            !raw.windows(6).any(|w| w == b"alpha-"),
+            "content is readable in the file"
+        );
+    };
+
+    call(
+        "pdf_rotate",
+        json!({"input": locked, "output": out, "angle": 90, "password": "open"}),
+    );
+    still_locked(&out, "alpha-3");
+    call(
+        "pdf_pages",
+        json!({"input": locked, "output": out, "keep": "2", "password": "open"}),
+    );
+    still_locked(&out, "alpha-2");
+    call(
+        "pdf_stamp",
+        json!({"input": locked, "output": out, "text": "MARK", "position": "footer", "password": "open"}),
+    );
+    still_locked(&out, "MARK");
+    call(
+        "pdf_compress",
+        json!({"input": locked, "output": out, "password": "open"}),
+    );
+    still_locked(&out, "alpha-1");
+    call(
+        "pdf_redact",
+        json!({"input": locked, "output": out, "texts": ["alpha-1"], "password": "open"}),
+    );
+    still_locked(&out, "alpha-2");
+    // Mixing in an unprotected file must not strip the protection from the rest.
+    call(
+        "pdf_merge",
+        json!({"inputs": [plain, locked], "output": out, "password": "open"}),
+    );
+    still_locked(&out, "alpha-3");
+
+    // Removing protection stays an explicit act.
+    call(
+        "pdf_decrypt",
+        json!({"input": locked, "output": out, "password": "open"}),
+    );
+    assert_eq!(call("pdf_info", json!({"input": out}))["encrypted"], false);
+}
+
+#[test]
 fn owner_only_encryption_opens_without_a_password() {
     let dir = tempfile::tempdir().unwrap();
     let locked = dir.path().join("locked.pdf");

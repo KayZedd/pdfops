@@ -82,5 +82,6 @@ pub fn call(name: &str, args: Value) -> Result<Value> {
         .iter()
         .find(|t| tool_name(t) == name)
         .ok_or_else(|| anyhow::anyhow!("unknown tool '{name}'"))?;
+    crate::sandbox::check_args(&args)?;
     (tool.call)(args)
 }

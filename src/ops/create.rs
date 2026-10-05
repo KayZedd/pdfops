@@ -764,6 +764,8 @@ pub fn create(a: CreateArgs) -> Result<Value> {
         if source.contains("://") {
             bail!("image '{source}' is remote; only local image files can be embedded");
         }
+        // An image path comes from the document text, not from the caller's arguments.
+        crate::sandbox::check(&folder.join(&source))?;
         let (id, ratio) = embed_image(&mut d, &folder.join(&source))?;
         let pixels = d
             .get_object(id)?

@@ -1180,9 +1180,7 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
             seen: HashMap::new(),
             collect_only: false,
         };
-        let content = d
-            .get_page_content(id)
-            .map_err(|e| anyhow!("cannot read the content of page {n}: {e}"))?;
+        let content = d.get_page_content(id);
         let resources = own_resources(&d, id);
         let rewritten = rewriter
             .content(&mut d, &content, &resources, IDENTITY, 0)
@@ -1240,12 +1238,13 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
         catalog.remove(b"MarkInfo");
     }
     prune(&mut d);
+    doc::protect_again(&mut d)?;
     let mut bytes = Vec::new();
     d.max_id = d.objects.keys().map(|id| id.0).max().unwrap_or(0);
     d.save_to(&mut bytes)?;
 
     // Proof before delivery: read the result back and look inside every area.
-    let check = Pdf::new(bytes.clone())
+    let check = Pdf::new_with_password(bytes.clone(), a.password.as_deref().unwrap_or(""))
         .map_err(|_| anyhow!("the redacted file does not read back; nothing was written"))?;
     for &n in &pages {
         let left = glyph_runs(&check.pages()[n as usize - 1], true)
@@ -1309,9 +1308,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
             .get(*n as usize - 1)
             .with_context(|| format!("page {n} is missing"))?;
         let runs = glyph_runs(&pdf.pages()[*n as usize - 1], false);
-        let content = d
-            .get_page_content(id)
-            .map_err(|e| anyhow!("cannot read the content of page {n}: {e}"))?;
+        let content = d.get_page_content(id);
         let resources = own_resources(&d, id);
         let mut rewriter = Rewriter {
             pdf: &pdf,

@@ -91,7 +91,8 @@ pub struct Word {
     pub italic: bool,
     /// Each glyph's byte offset into `text` and its box, for marking part of a word.
     pub(crate) parts: Vec<(usize, [f64; 4])>,
-    /// Where the next glyph would start, to decide whether it continues the word.
+    /// Where the first glyph starts and where the next one would, on the baseline.
+    start: Point,
     end: Point,
 }
 
@@ -236,9 +237,15 @@ impl<'a> Device<'a> for Collector {
                     .map(|p| p.y)
                     .fold(f64::NEG_INFINITY, f64::max),
             ];
+            // The gap is judged along the baseline; across it there is more room, so that a
+            // raised or lowered glyph (an asterisk, an exponent) stays in its word.
+            let along = (end - origin) / (end - origin).hypot().max(1e-9);
             let continues = self.open
                 && self.words.last().is_some_and(|w| {
-                    (w.end - origin).hypot() < 0.15 * size && (w.size - size).abs() < 0.1 * size
+                    let gap = origin - w.end;
+                    (gap.x * along.x + gap.y * along.y).abs() < 0.15 * size
+                        && (gap.x * along.y - gap.y * along.x).abs() < 0.4 * size
+                        && (w.size - size).abs() < 0.1 * size
                 });
             if continues {
                 let word = self.words.last_mut().expect("checked above");
@@ -275,6 +282,7 @@ impl<'a> Device<'a> for Collector {
                     bold,
                     italic,
                     parts: vec![(0, bbox)],
+                    start: origin,
                     end,
                 });
                 self.open = true;
@@ -325,6 +333,35 @@ pub fn lines(words: &[Word]) -> Vec<Vec<&Word>> {
         line.sort_by(|a, b| a.bbox[0].total_cmp(&b.bbox[0]));
     }
     lines
+}
+
+/// The words as running text, in the order the page draws them.
+///
+/// Drawing order is the author's reading order far more often than any geometric
+/// guess is: it keeps columns, sidebars and captions together.
+pub fn plain_text(words: &[Word]) -> String {
+    let mut out = String::new();
+    let mut previous: Option<&Word> = None;
+    for word in words {
+        if let Some(before) = previous {
+            let drop = word.center().1 - before.center().1;
+            let size = before.size.min(word.size);
+            // On the same line: level with the word before, or, for text that is not
+            // horizontal, starting about where that word ended.
+            if drop.abs() < 0.5 * size || (word.start - before.end).hypot() < 1.2 * size {
+                out.push(' ');
+            } else {
+                out.push('\n');
+                // More than a line's worth of space separates paragraphs.
+                if drop.abs() > 1.7 * before.size.max(word.size) {
+                    out.push('\n');
+                }
+            }
+        }
+        out.push_str(&word.text);
+        previous = Some(word);
+    }
+    out
 }
 
 fn round(v: f64) -> f64 {

@@ -319,6 +319,9 @@ pub fn ocr_install(a: OcrInstallArgs) -> Result<Value> {
     if langs.is_empty() && !a.engine {
         bail!("nothing to install: give languages, e.g. lang \"pol+eng\", or ask for the engine");
     }
+    if a.engine && crate::sandbox::active() {
+        bail!("installing programs is not available to a server confined to a directory");
+    }
     let mut engine_installed = false;
     if a.engine && Engine::probe().version.is_none() {
         let (cmd, needs_root) = engine_command(on_path).ok_or_else(|| {

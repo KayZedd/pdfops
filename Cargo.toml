@@ -27,9 +27,7 @@ fontdb = "0.24.0"
 getrandom = "0.4"
 hayro = "0.8.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
-# Must match the lopdf version pdf-extract depends on: both sides share `lopdf::Document`.
-lopdf = "0.42"
-pdf-extract = "0.12.1"
+lopdf = "0.45"
 png = "0.18"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 qrcode = { version = "0.14.1", default-features = false }
@@ -43,7 +41,7 @@ ttf-parser = "0.25"
 ureq = "3.4.2"
 
 [dev-dependencies]
-lopdf = "0.42"
+lopdf = "0.45"
 png = "0.18"
 tempfile = "3.27.0"
 

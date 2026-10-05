@@ -268,3 +268,88 @@ fn engine_install_command_follows_the_package_manager() {
     );
     assert!(engine_command(|_| false).is_none());
 }
+
+/// Sends tool calls to a server confined to `root` and returns each result.
+fn confined(root: &std::path::Path, calls: &[Value]) -> Vec<Value> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pdfops"))
+        .args(["mcp", "--root"])
+        .arg(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for (i, params) in calls.iter().enumerate() {
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": params})
+            )
+            .unwrap();
+        }
+    }
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["result"].clone())
+        .collect()
+}
+
+#[test]
+fn mcp_root_confines_every_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("work");
+    std::fs::create_dir(&root).unwrap();
+    common::sample(&root, "in.pdf", 2);
+    let outside = common::sample(dir.path(), "secret.pdf", 1);
+    std::fs::write(
+        root.join("notes.md"),
+        format!("![x]({})", dir.path().join("pic.png").display()),
+    )
+    .unwrap();
+
+    let results = confined(
+        &root,
+        &[
+            // Inside, by relative path: resolved against the root, not the server's start directory.
+            json!({"name": "pdf_info", "arguments": {"input": "in.pdf"}}),
+            json!({"name": "pdf_rotate", "arguments": {"input": "in.pdf", "output": "sub/out.pdf", "angle": 90}}),
+            // Outside: reading, writing, by absolute path and by climbing.
+            json!({"name": "pdf_info", "arguments": {"input": outside}}),
+            json!({"name": "pdf_info", "arguments": {"input": "../secret.pdf"}}),
+            json!({"name": "pdf_rotate", "arguments": {"input": "in.pdf", "output": "../out.pdf", "angle": 90}}),
+            json!({"name": "pdf_merge", "arguments": {"inputs": ["in.pdf", outside], "output": "m.pdf"}}),
+            json!({"name": "pdf_split", "arguments": {"input": "in.pdf", "out_dir": dir.path().join("parts")}}),
+            // A path that arrives inside a document rather than as an argument.
+            json!({"name": "pdf_create", "arguments": {"input": "notes.md", "output": "notes.pdf"}}),
+            json!({"name": "pdf_ocr_install", "arguments": {"engine": true}}),
+        ],
+    );
+    assert_eq!(results.len(), 9);
+    assert_eq!(results[0]["isError"], false, "{}", results[0]);
+    assert_eq!(results[0]["structuredContent"]["pages"], 2);
+    assert_eq!(results[1]["isError"], false, "{}", results[1]);
+    assert!(root.join("sub/out.pdf").is_file());
+    for (i, result) in results.iter().enumerate().skip(2) {
+        assert_eq!(
+            result["isError"], true,
+            "call {i} should be refused: {result}"
+        );
+    }
+    for result in &results[2..8] {
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("outside the allowed directory"),
+            "{result}"
+        );
+    }
+    assert!(
+        !dir.path().join("out.pdf").exists()
+            && !dir.path().join("parts").exists()
+            && !root.join("m.pdf").exists()
+    );
+}

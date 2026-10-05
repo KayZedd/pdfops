@@ -163,6 +163,14 @@ impl Copier<'_> {
 /// Document info comes from the first source; form fields and bookmarks from all of them.
 pub fn assemble(sources: &[Source]) -> Result<Document> {
     let mut out = Document::with_version("1.7");
+    // The output is protected like the first protected source. Older ciphers derive
+    // their key from the file identifier, so that travels with the encryption.
+    if let Some(protected) = sources.iter().find(|s| s.doc.encryption_state.is_some()) {
+        out.encryption_state = protected.doc.encryption_state.clone();
+        if let Ok(id) = protected.doc.trailer.get(b"ID") {
+            out.trailer.set("ID", id.clone());
+        }
+    }
     let pages_id = out.new_object_id();
     let mut kids = Vec::new();
     let mut form: Option<Dictionary> = None;

@@ -43,6 +43,7 @@ pub fn save(doc: &mut Document, path: &Path) -> Result<u64> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".tmp{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
+    protect_again(doc)?;
     // lopdf derives the trailer /Size from `max_id`, which goes stale when objects are removed.
     doc.max_id = doc.objects.keys().map(|id| id.0).max().unwrap_or(0);
     let written = (|| -> Result<()> {
@@ -56,6 +57,18 @@ pub fn save(doc: &mut Document, path: &Path) -> Result<u64> {
         return Err(e.context(format!("cannot write {}", path.display())));
     }
     Ok(std::fs::metadata(path)?.len())
+}
+
+/// Encrypts the document again with the passwords and permissions it was opened with.
+///
+/// Loading decrypts in memory; without this, editing a protected file would
+/// silently hand back an unprotected one. Returns whether it is encrypted now.
+pub fn protect_again(doc: &mut Document) -> Result<bool> {
+    if let Some(state) = doc.encryption_state.clone().filter(|_| !doc.is_encrypted()) {
+        doc.encrypt(&state)
+            .map_err(|e| anyhow!("cannot keep the document's encryption: {e}"))?;
+    }
+    Ok(doc.is_encrypted())
 }
 
 /// Writes finished bytes to `path` through a temp file, so `path` may be the input file.

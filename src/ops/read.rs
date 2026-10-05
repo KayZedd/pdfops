@@ -6,14 +6,15 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::Args;
+use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::object::{Array, Dict};
-use lopdf::{Document, Object, StringFormat};
+use lopdf::{Object, StringFormat};
 use rayon::prelude::*;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::ops::ocr;
+use crate::ops::{layout, ocr};
 use crate::{doc, pagespec};
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
@@ -223,35 +224,35 @@ pub fn tidy(text: &str) -> String {
 
 /// Extracts text for each requested page, in parallel.
 ///
-/// A page that cannot be decoded yields `Err` instead of failing the whole call,
+/// A page that cannot be read yields `Err` instead of failing the whole call,
 /// because one malformed content stream should not hide the rest of the document.
-pub fn page_texts(d: &Document, pages: &[u32]) -> Vec<(u32, Result<String, String>)> {
+pub fn page_texts(pdf: &Pdf, pages: &[u32]) -> Vec<(u32, Result<String, String>)> {
+    let all = pdf.pages();
     pages
         .par_iter()
         .map(|&n| {
-            // pdf-extract panics on some malformed fonts; contain it to the page.
+            // Malformed fonts and streams are the renderer's to survive; a panic stays on its page.
             let res = catch_unwind(AssertUnwindSafe(|| {
-                let mut s = String::new();
-                pdf_extract::output_doc_page(d, &mut pdf_extract::PlainTextOutput::new(&mut s), n)
-                    .map_err(|e| e.to_string())?;
-                Ok(tidy(&s))
+                tidy(&layout::plain_text(
+                    &layout::scan(&all[n as usize - 1]).words,
+                ))
             }))
-            .unwrap_or_else(|_| Err("text extraction failed on this page".to_string()));
+            .map_err(|_| "text extraction failed on this page".to_string());
             (n, res)
         })
         .collect()
 }
 
 pub fn text(a: TextArgs) -> Result<Value> {
-    let d = doc::load(&a.input, a.password.as_deref())?;
-    let total = doc::page_ids(&d).len() as u32;
+    let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
+    let total = pdf.pages().len() as u32;
     let pages = pagespec::parse_or_all(a.pages.as_deref(), total)?;
 
     let mut budget = a.max_chars.unwrap_or(usize::MAX);
     let mut out = Vec::new();
     let mut resume = None;
     let mut chars_total = 0usize;
-    let mut texts = page_texts(&d, &pages);
+    let mut texts = page_texts(&pdf, &pages);
     let mut recognised = HashSet::new();
     let blank: Vec<u32> = texts
         .iter()
@@ -259,7 +260,6 @@ pub fn text(a: TextArgs) -> Result<Value> {
         .map(|p| p.0)
         .collect();
     if a.ocr && !blank.is_empty() {
-        let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
         let read = ocr::recognise(&pdf, &blank, a.ocr_lang.as_deref().unwrap_or("eng"), 300.0)?;
         for (n, text) in read {
             recognised.insert(n);
@@ -330,15 +330,15 @@ pub fn search(a: SearchArgs) -> Result<Value> {
     let re = regex::RegexBuilder::new(&pattern)
         .case_insensitive(!a.case_sensitive)
         .build()?;
-    let d = doc::load(&a.input, a.password.as_deref())?;
-    let total = doc::page_ids(&d).len() as u32;
+    let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
+    let total = pdf.pages().len() as u32;
     let pages = pagespec::parse_or_all(a.pages.as_deref(), total)?;
     let (context, limit) = (a.context.unwrap_or(80), a.max_results.unwrap_or(50));
 
     let mut matches = Vec::new();
     let mut count = 0usize;
     let mut failed = Vec::new();
-    for (n, res) in page_texts(&d, &pages) {
+    for (n, res) in page_texts(&pdf, &pages) {
         let Ok(raw) = res else {
             failed.push(n);
             continue;

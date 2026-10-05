@@ -365,7 +365,12 @@ pub fn compress(a: CompressArgs) -> Result<Value> {
     };
     d.compress();
     let mut buf = Vec::new();
-    d.save_modern(&mut buf)?;
+    // Object streams would wrap already encrypted objects, so a protected file keeps the classic layout.
+    if doc::protect_again(&mut d)? {
+        d.save_to(&mut buf)?;
+    } else {
+        d.save_modern(&mut buf)?;
+    }
     // Never hand back a larger file than the one we were given.
     let smaller = (buf.len() as u64) < before;
     if smaller {

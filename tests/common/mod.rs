@@ -359,7 +359,7 @@ pub fn custom(dir: &Path, name: &str, contents: &[&str]) -> PathBuf {
 pub fn content_of(path: &Path, page: u32) -> String {
     let doc = Document::load(path).unwrap();
     let id = doc.get_pages()[&page];
-    String::from_utf8_lossy(&doc.get_page_content(id).unwrap()).into_owned()
+    String::from_utf8_lossy(&doc.get_page_content(id)).into_owned()
 }
 
 /// Words of a page with their boxes, as `layout` reports them.

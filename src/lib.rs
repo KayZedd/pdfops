@@ -9,4 +9,5 @@ pub mod font;
 pub mod mcp;
 pub mod ops;
 pub mod pagespec;
+pub mod sandbox;
 pub mod tools;

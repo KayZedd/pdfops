@@ -77,7 +77,11 @@ enum Command {
     /// Fill form fields by name
     Fill(forms::FillArgs),
     /// Run a Model Context Protocol server on stdio exposing every command as a tool
-    Mcp,
+    Mcp {
+        /// Confine all file access to this directory; relative paths resolve against it
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
     /// Print JSON tool definitions (name, description, input schema) for function calling
     Tools,
 }
@@ -117,7 +121,10 @@ fn run(command: Command) -> Result<Option<Value>> {
         Command::Decrypt(a) => edit::decrypt(a)?,
         Command::Forms(a) => forms::forms(a)?,
         Command::Fill(a) => forms::fill(a)?,
-        Command::Mcp => {
+        Command::Mcp { root } => {
+            if let Some(root) = root {
+                crate::sandbox::set_root(&root)?;
+            }
             mcp::serve()?;
             return Ok(None);
         }
