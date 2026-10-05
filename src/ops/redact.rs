@@ -331,6 +331,23 @@ struct Rewriter<'a> {
     collect_only: bool,
 }
 
+/// What one walk over a content stream carries along and builds up.
+struct Pass {
+    /// The rewritten operations.
+    out: Vec<Operation>,
+    /// The stream's resources, extended when fonts or replaced objects are added.
+    resources: Dictionary,
+    changed: bool,
+    state: State,
+    saved: Vec<State>,
+    /// Font names seen in `Tf`, which `State::font` indexes.
+    fonts: Vec<Vec<u8>>,
+    /// The path under construction: where it starts in `out`, its extent, and whether it clips.
+    path: Option<(usize, Area, bool)>,
+    /// Open marked-content sections, as positions in `out` (None when they carry no properties).
+    marked: Vec<Option<usize>>,
+}
+
 /// How a replacement was written.
 #[derive(Clone, Copy, PartialEq)]
 enum Outcome {
@@ -479,55 +496,58 @@ impl Rewriter<'_> {
         let operations = Content::decode(content)
             .map_err(|e| anyhow!("cannot parse page content: {e}"))?
             .operations;
-        let mut out: Vec<Operation> = Vec::with_capacity(operations.len());
-        let mut resources = resources.clone();
-        let mut changed = false;
-
-        let mut state = State {
-            ctm: base,
-            char_spacing: 0.0,
-            word_spacing: 0.0,
-            font_size: 0.0,
-            render_mode: 0,
-            font: None,
+        let mut pass = Pass {
+            out: Vec::with_capacity(operations.len()),
+            resources: resources.clone(),
+            changed: false,
+            state: State {
+                ctm: base,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                font_size: 0.0,
+                render_mode: 0,
+                font: None,
+            },
+            saved: Vec::new(),
+            fonts: Vec::new(),
+            path: None,
+            marked: Vec::new(),
         };
-        let mut saved: Vec<State> = Vec::new();
-        let mut fonts_seen: Vec<Vec<u8>> = Vec::new();
-        // The path under construction: where it starts in `out`, its extent, and whether it clips.
-        let mut path: Option<(usize, Area, bool)> = None;
-        // Open marked-content sections, as positions in `out` (None when they carry no properties).
-        let mut marked: Vec<Option<usize>> = Vec::new();
 
         for op in operations {
             let name = op.operator.as_str();
             match name {
-                "q" => saved.push(state),
-                "Q" => state = saved.pop().unwrap_or(state),
+                "q" => pass.saved.push(pass.state),
+                "Q" => pass.state = pass.saved.pop().unwrap_or(pass.state),
                 "cm" => {
                     if let Some(m) = numbers::<6>(&op.operands) {
-                        state.ctm = concat(m, state.ctm);
+                        pass.state.ctm = concat(m, pass.state.ctm);
                     }
                 }
-                "Tc" => state.char_spacing = op.operands.first().and_then(number).unwrap_or(0.0),
-                "Tw" => state.word_spacing = op.operands.first().and_then(number).unwrap_or(0.0),
+                "Tc" => {
+                    pass.state.char_spacing = op.operands.first().and_then(number).unwrap_or(0.0)
+                }
+                "Tw" => {
+                    pass.state.word_spacing = op.operands.first().and_then(number).unwrap_or(0.0)
+                }
                 "Tr" => {
-                    state.render_mode = op
+                    pass.state.render_mode = op
                         .operands
                         .first()
                         .and_then(|o| o.as_i64().ok())
                         .unwrap_or(0)
                 }
                 "Tf" => {
-                    state.font_size = op.operands.get(1).and_then(number).unwrap_or(0.0);
+                    pass.state.font_size = op.operands.get(1).and_then(number).unwrap_or(0.0);
                     if let Some(font) = op.operands.first().and_then(|n| n.as_name().ok()) {
-                        fonts_seen.push(font.to_vec());
-                        state.font = Some(fonts_seen.len() - 1);
+                        pass.fonts.push(font.to_vec());
+                        pass.state.font = Some(pass.fonts.len() - 1);
                     }
                 }
-                "BMC" => marked.push(None),
-                "BDC" => marked.push(Some(out.len())),
+                "BMC" => pass.marked.push(None),
+                "BDC" => pass.marked.push(Some(pass.out.len())),
                 "EMC" => {
-                    marked.pop();
+                    pass.marked.pop();
                 }
                 "BI" => bail!(
                     "the page has an inline image, which cannot be redacted safely; nothing was written"
@@ -548,9 +568,11 @@ impl Rewriter<'_> {
                     } else {
                         n.as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).collect()
                     };
-                    let extent = bounds(points.into_iter().map(|(x, y)| apply(state.ctm, x, y)));
-                    let (start, so_far, clips) = path.unwrap_or((out.len(), extent, false));
-                    path = Some((
+                    let extent =
+                        bounds(points.into_iter().map(|(x, y)| apply(pass.state.ctm, x, y)));
+                    let (start, so_far, clips) =
+                        pass.path.unwrap_or((pass.out.len(), extent, false));
+                    pass.path = Some((
                         start,
                         bounds([
                             (so_far[0], so_far[1]),
@@ -560,436 +582,462 @@ impl Rewriter<'_> {
                         ]),
                         clips,
                     ));
-                    out.push(op);
+                    pass.out.push(op);
                 }
                 "W" | "W*" => {
-                    if let Some(p) = &mut path {
+                    if let Some(p) = &mut pass.path {
                         p.2 = true;
                     }
-                    out.push(op);
+                    pass.out.push(op);
                 }
                 "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" | "n" => {
                     // A drawing that lies wholly inside an area goes, with its coordinates.
                     // One that only crosses an area stays: it also draws what is outside.
-                    let inside = path.is_some_and(|(_, extent, clips)| {
+                    let inside = pass.path.is_some_and(|(_, extent, clips)| {
                         name != "n"
                             && !clips
                             && self.user_areas.iter().any(|a| contains(a, &extent))
                     }) && self.replacements.is_empty()
                         && !self.collect_only;
-                    match path.take() {
+                    match pass.path.take() {
                         Some((start, ..)) if inside => {
-                            out.truncate(start);
+                            pass.out.truncate(start);
                             self.stats.paths += 1;
-                            changed = true;
+                            pass.changed = true;
                         }
-                        _ => out.push(op),
+                        _ => pass.out.push(op),
                     }
                 }
-                "Tj" | "'" | "\"" | "TJ" => {
-                    let strings: usize = match name {
-                        "TJ" => {
-                            op.operands
-                                .first()
-                                .and_then(|a| a.as_array().ok())
-                                .map_or(0, |a| {
-                                    a.iter()
-                                        .filter_map(|o| o.as_str().ok())
-                                        .map(<[u8]>::len)
-                                        .sum()
-                                })
-                        }
-                        _ => op
-                            .operands
-                            .last()
-                            .and_then(|s| s.as_str().ok())
-                            .map_or(0, <[u8]>::len),
-                    };
-                    if name == "\""
-                        && let Some([word, character]) =
-                            numbers::<2>(&op.operands[..op.operands.len().saturating_sub(1)])
-                    {
-                        state.word_spacing = word;
-                        state.char_spacing = character;
-                    }
-                    // Empty strings and clip-only text draw nothing, so the renderer reports no run.
-                    if strings == 0 || state.render_mode == 7 {
-                        out.push(op);
-                        continue;
-                    }
-                    let run = self.runs.get(self.next_run).ok_or_else(out_of_step)?;
-                    self.next_run += 1;
-                    if self.collect_only {
-                        if !run.is_empty() && strings.is_multiple_of(run.len()) {
-                            let codes = match name {
-                                "TJ" => op
-                                    .operands
-                                    .first()
-                                    .and_then(|a| a.as_array().ok())
-                                    .cloned()
-                                    .unwrap_or_default(),
-                                _ => op.operands.last().cloned().into_iter().collect(),
-                            };
-                            let bytes: Vec<u8> = codes
-                                .iter()
-                                .filter_map(|o| o.as_str().ok())
-                                .flatten()
-                                .copied()
-                                .collect();
-                            for (code, glyph) in bytes.chunks(strings / run.len()).zip(run) {
-                                if let (Some(font), Some(text), Some(advance)) =
-                                    (glyph.font, &glyph.text, glyph.advance)
-                                {
-                                    self.seen
-                                        .entry((font, text.clone()))
-                                        .or_insert_with(|| (code.to_vec(), advance));
-                                }
-                            }
-                        }
-                        out.push(op);
-                        continue;
-                    }
-                    let hits: Vec<Option<usize>> = run.iter().map(|g| g.hit(self.areas)).collect();
-                    let remove: Vec<bool> = hits.iter().map(Option::is_some).collect();
-                    if !remove.contains(&true) {
-                        out.push(op);
-                        continue;
-                    }
-                    if run.is_empty()
-                        || !strings.is_multiple_of(run.len())
-                        || state.font_size == 0.0
-                    {
-                        bail!(
-                            "text in the area uses an encoding that cannot be redacted safely; nothing was written"
-                        );
-                    }
-                    let code_len = strings / run.len();
+                "Tj" | "'" | "\"" | "TJ" => self.show_text(d, op, &mut pass)?,
+                "Do" => self.draw_object(d, op, &mut pass, depth)?,
+                _ => pass.out.push(op),
+            }
+        }
+        if !pass.changed {
+            return Ok(None);
+        }
+        let encoded = Content {
+            operations: pass.out,
+        }
+        .encode()
+        .map_err(|e| anyhow!("cannot write page content: {e}"))?;
+        Ok(Some((encoded, pass.resources)))
+    }
 
-                    // The operator becomes a TJ in which every removed glyph is replaced by
-                    // the same amount of movement, so the text around it stays where it was.
-                    let elements: Vec<Object> = match name {
-                        "TJ" => op
-                            .operands
-                            .first()
-                            .and_then(|a| a.as_array().ok())
-                            .cloned()
-                            .unwrap_or_default(),
-                        _ => op.operands.last().cloned().into_iter().collect(),
-                    };
-                    // Flattened to single character codes and the movements between them.
-                    let mut pieces: Vec<Result<(Vec<u8>, lopdf::StringFormat), Object>> =
-                        Vec::new();
-                    for element in elements {
-                        match element {
-                            Object::String(bytes, format) => {
-                                pieces.extend(
-                                    bytes
-                                        .chunks(code_len)
-                                        .map(|code| Ok((code.to_vec(), format))),
-                                );
-                            }
-                            other => pieces.push(Err(other)),
-                        }
+    /// Handles one text-showing operator: passes it on, or rewrites it without the glyphs in an area.
+    fn show_text(&mut self, d: &mut Document, op: Operation, pass: &mut Pass) -> Result<()> {
+        let name = op.operator.as_str();
+        let strings: usize = match name {
+            "TJ" => op
+                .operands
+                .first()
+                .and_then(|a| a.as_array().ok())
+                .map_or(0, |a| {
+                    a.iter()
+                        .filter_map(|o| o.as_str().ok())
+                        .map(<[u8]>::len)
+                        .sum()
+                }),
+            _ => op
+                .operands
+                .last()
+                .and_then(|s| s.as_str().ok())
+                .map_or(0, <[u8]>::len),
+        };
+        if name == "\""
+            && let Some([word, character]) =
+                numbers::<2>(&op.operands[..op.operands.len().saturating_sub(1)])
+        {
+            pass.state.word_spacing = word;
+            pass.state.char_spacing = character;
+        }
+        // Empty strings and clip-only text draw nothing, so the renderer reports no run.
+        if strings == 0 || pass.state.render_mode == 7 {
+            pass.out.push(op);
+            return Ok(());
+        }
+        let run = self.runs.get(self.next_run).ok_or_else(out_of_step)?;
+        self.next_run += 1;
+        if self.collect_only {
+            if !run.is_empty() && strings.is_multiple_of(run.len()) {
+                let codes = match name {
+                    "TJ" => op
+                        .operands
+                        .first()
+                        .and_then(|a| a.as_array().ok())
+                        .cloned()
+                        .unwrap_or_default(),
+                    _ => op.operands.last().cloned().into_iter().collect(),
+                };
+                let bytes: Vec<u8> = codes
+                    .iter()
+                    .filter_map(|o| o.as_str().ok())
+                    .flatten()
+                    .copied()
+                    .collect();
+                for (code, glyph) in bytes.chunks(strings / run.len()).zip(run) {
+                    if let (Some(font), Some(text), Some(advance)) =
+                        (glyph.font, &glyph.text, glyph.advance)
+                    {
+                        self.seen
+                            .entry((font, text.clone()))
+                            .or_insert_with(|| (code.to_vec(), advance));
                     }
-                    // ' and " start a new line first; that part is kept as separate operators.
-                    if name == "\"" {
-                        out.push(Operation::new(
-                            "Tw",
-                            vec![Object::Real(state.word_spacing as f32)],
-                        ));
-                        out.push(Operation::new(
-                            "Tc",
-                            vec![Object::Real(state.char_spacing as f32)],
-                        ));
-                    }
-                    if name != "Tj" && name != "TJ" {
-                        out.push(Operation::new("T*", vec![]));
-                    }
-                    let mut rebuilt: Vec<Object> = Vec::new();
-                    let mut kept: Option<(Vec<u8>, lopdf::StringFormat)> = None;
-                    let mut index = 0;
-                    for (at, piece) in pieces.iter().enumerate() {
-                        let (code, format) = match piece {
-                            Ok(code) => code,
-                            Err(movement) => {
-                                rebuilt.extend(
-                                    kept.take()
-                                        .map(|(bytes, format)| Object::String(bytes, format)),
-                                );
-                                rebuilt.push(movement.clone());
-                                continue;
-                            }
-                        };
-                        if !remove[index] {
-                            kept.get_or_insert_with(|| (Vec::new(), *format))
-                                .0
-                                .extend_from_slice(code);
-                            index += 1;
-                            continue;
-                        }
-                        rebuilt.extend(
-                            kept.take()
-                                .map(|(bytes, format)| Object::String(bytes, format)),
-                        );
-                        let glyph = &run[index];
-                        let area = hits[index].expect("removed glyphs have an area");
-                        if self.placed.get(area) == Some(&Outcome::Pending) {
-                            // The replacement goes where the first removed glyph was. It is written
-                            // with the codes this font uses for the same characters elsewhere, then
-                            // the pen is moved back, so everything after keeps its position.
-                            let size = (glyph.em.0.hypot(glyph.em.1)).max(0.001);
-                            let written: Option<Vec<&(Vec<u8>, f32)>> =
-                                glyph.font.and_then(|font| {
-                                    self.replacements[area]
-                                        .chars()
-                                        .map(|c| self.seen.get(&(font, c.to_string())))
-                                        .collect()
-                                });
-                            self.placed[area] = match written {
-                                Some(codes) => {
-                                    let units: f64 = codes
-                                        .iter()
-                                        .map(|(code, advance)| {
-                                            let space = if code == &[32] {
-                                                state.word_spacing
-                                            } else {
-                                                0.0
-                                            };
-                                            *advance as f64
-                                                + (state.char_spacing + space) * 1000.0
-                                                    / state.font_size
-                                        })
-                                        .sum();
-                                    if !codes.is_empty() {
-                                        let bytes: Vec<u8> = codes
-                                            .iter()
-                                            .flat_map(|(code, _)| code.clone())
-                                            .collect();
-                                        rebuilt.push(Object::String(bytes, *format));
-                                        rebuilt.push(Object::Real(units as f32));
-                                    }
-                                    Outcome::Original {
-                                        new: units * size / 1000.0,
-                                        old: 0.0,
-                                    }
-                                }
-                                None => {
-                                    // The font cannot write it. Another font takes over for
-                                    // these characters only, in the same text object, so size,
-                                    // colour, position and reading order all carry over.
-                                    let text = &self.replacements[area];
-                                    let original = state.font.and_then(|i| fonts_seen.get(i)).cloned().ok_or_else(|| {
-                                        anyhow!("text is shown without a font being set; nothing was written")
-                                    })?;
-                                    if !text.is_empty() {
-                                        let font = TextFont::new(d, text, None)?;
-                                        let mut fonts = resources
-                                            .get(b"Font")
-                                            .ok()
-                                            .and_then(|f| doc::resolve(d, f).as_dict().ok())
-                                            .cloned()
-                                            .unwrap_or_default();
-                                        let key = (1..)
-                                            .map(|i| format!("PdfopsR{i}"))
-                                            .find(|k| !fonts.has(k.as_bytes()))
-                                            .expect("an unbounded range always yields a free name");
-                                        fonts.set(key.as_str(), font.id);
-                                        resources.set("Font", fonts);
-                                        // Word spacing applies to single-byte spaces only, which an embedded font has none of.
-                                        let spaces = if font.is_embedded() {
-                                            0
-                                        } else {
-                                            text.matches(' ').count()
-                                        };
-                                        let spacing = state.char_spacing
-                                            * text.chars().count() as f64
-                                            + state.word_spacing * spaces as f64;
-                                        let units = font.width(text, 1000.0)
-                                            + spacing * 1000.0 / state.font_size;
-                                        if !rebuilt.is_empty() {
-                                            out.push(Operation::new(
-                                                "TJ",
-                                                vec![Object::Array(std::mem::take(&mut rebuilt))],
-                                            ));
-                                        }
-                                        let size = Object::Real(state.font_size as f32);
-                                        out.push(Operation::new(
-                                            "Tf",
-                                            vec![Object::Name(key.into_bytes()), size.clone()],
-                                        ));
-                                        out.push(Operation::new(
-                                            "TJ",
-                                            vec![Object::Array(vec![
-                                                font.operand(text),
-                                                Object::Real(units as f32),
-                                            ])],
-                                        ));
-                                        out.push(Operation::new(
-                                            "Tf",
-                                            vec![Object::Name(original), size],
-                                        ));
-                                    }
-                                    Outcome::Substitute
-                                }
-                            };
-                        }
-                        // The renderer's own positions say how far the glyph moved the pen:
-                        // the distance to the next glyph, less any explicit movement in between.
-                        let shift = match run.get(index + 1) {
-                            Some(next) => {
-                                let between: f64 = pieces[at + 1..]
-                                    .iter()
-                                    .map_while(|p| p.as_ref().err())
-                                    .filter_map(number)
-                                    .sum();
-                                glyph.units_to(next.origin) + between
-                            }
-                            // Nothing follows in this operator. The stated width is used when there
-                            // is one; otherwise the next operator shows where the pen ended up,
-                            // provided it carries on along the same line.
-                            None => match glyph.advance {
-                                Some(advance) => {
-                                    let space = if code == &[32] {
-                                        state.word_spacing
-                                    } else {
-                                        0.0
-                                    };
-                                    advance as f64
-                                        + (state.char_spacing + space) * 1000.0 / state.font_size
-                                }
-                                None => self
-                                    .runs
-                                    .get(self.next_run)
-                                    .and_then(|run| run.first())
-                                    .map(|next| glyph.units_to(next.origin))
-                                    .filter(|units| (0.0..3000.0).contains(units))
-                                    .unwrap_or(500.0),
-                            },
-                        };
-                        if !shift.is_finite() || shift.abs() > 100_000.0 {
-                            bail!(
-                                "text in the area is laid out in a way that cannot be redacted safely; nothing was written"
-                            );
-                        }
-                        rebuilt.push(Object::Real(-shift as f32));
-                        if let Some(Outcome::Original { old, .. }) = self.placed.get_mut(area) {
-                            *old += shift * glyph.em.0.hypot(glyph.em.1) / 1000.0;
-                        }
-                        self.stats.glyphs += 1;
-                        index += 1;
-                    }
+                }
+            }
+            pass.out.push(op);
+            return Ok(());
+        }
+        let hits: Vec<Option<usize>> = run.iter().map(|g| g.hit(self.areas)).collect();
+        let remove: Vec<bool> = hits.iter().map(Option::is_some).collect();
+        if !remove.contains(&true) {
+            pass.out.push(op);
+            return Ok(());
+        }
+        if run.is_empty() || !strings.is_multiple_of(run.len()) || pass.state.font_size == 0.0 {
+            bail!(
+                "text in the area uses an encoding that cannot be redacted safely; nothing was written"
+            );
+        }
+        let code_len = strings / run.len();
+
+        // The operator becomes a TJ in which every removed glyph is replaced by
+        // the same amount of movement, so the text around it stays where it was.
+        let elements: Vec<Object> = match name {
+            "TJ" => op
+                .operands
+                .first()
+                .and_then(|a| a.as_array().ok())
+                .cloned()
+                .unwrap_or_default(),
+            _ => op.operands.last().cloned().into_iter().collect(),
+        };
+        // Flattened to single character codes and the movements between them.
+        let mut pieces: Vec<Result<(Vec<u8>, lopdf::StringFormat), Object>> = Vec::new();
+        for element in elements {
+            match element {
+                Object::String(bytes, format) => {
+                    pieces.extend(
+                        bytes
+                            .chunks(code_len)
+                            .map(|code| Ok((code.to_vec(), format))),
+                    );
+                }
+                other => pieces.push(Err(other)),
+            }
+        }
+        // ' and " start a new line first; that part is kept as separate operators.
+        if name == "\"" {
+            pass.out.push(Operation::new(
+                "Tw",
+                vec![Object::Real(pass.state.word_spacing as f32)],
+            ));
+            pass.out.push(Operation::new(
+                "Tc",
+                vec![Object::Real(pass.state.char_spacing as f32)],
+            ));
+        }
+        if name != "Tj" && name != "TJ" {
+            pass.out.push(Operation::new("T*", vec![]));
+        }
+        let mut rebuilt: Vec<Object> = Vec::new();
+        let mut kept: Option<(Vec<u8>, lopdf::StringFormat)> = None;
+        let mut index = 0;
+        for (at, piece) in pieces.iter().enumerate() {
+            let (code, format) = match piece {
+                Ok(code) => code,
+                Err(movement) => {
                     rebuilt.extend(
                         kept.take()
                             .map(|(bytes, format)| Object::String(bytes, format)),
                     );
-                    if !rebuilt.is_empty() {
-                        out.push(Operation::new("TJ", vec![Object::Array(rebuilt)]));
-                    }
-                    // Marked content may repeat the removed text as /ActualText or /Alt.
-                    for section in marked.iter().flatten() {
-                        let tag = out[*section]
-                            .operands
-                            .first()
-                            .cloned()
-                            .into_iter()
-                            .collect();
-                        out[*section] = Operation::new("BMC", tag);
-                    }
-                    changed = true;
+                    rebuilt.push(movement.clone());
+                    continue;
                 }
-                "Do" => {
-                    let target = op
-                        .operands
-                        .first()
-                        .and_then(|n| n.as_name().ok())
-                        .and_then(|n| {
-                            let xobjects = doc::resolve(d, resources.get(b"XObject").ok()?)
-                                .as_dict()
-                                .ok()?;
-                            Some((n.to_vec(), xobjects.get(n).ok()?.as_reference().ok()?))
-                        });
-                    if let Some((key, id)) = target {
-                        let stream = d
-                            .get_object(id)
-                            .ok()
-                            .and_then(|o| o.as_stream().ok())
-                            .cloned();
-                        let subtype = stream.as_ref().and_then(|s| {
-                            s.dict
-                                .get(b"Subtype")
-                                .ok()?
-                                .as_name()
-                                .ok()
-                                .map(<[u8]>::to_vec)
-                        });
-                        let replacement = match (subtype.as_deref(), stream) {
-                            (Some(b"Image"), _)
-                                if self.replacements.is_empty() && !self.collect_only =>
-                            {
-                                self.image(d, id, state.ctm)?
-                            }
-                            (Some(b"Form"), Some(form)) => {
-                                let matrix = form
-                                    .dict
-                                    .get(b"Matrix")
-                                    .ok()
-                                    .and_then(|m| doc::resolve(d, m).as_array().ok())
-                                    .and_then(|m| numbers::<6>(m))
-                                    .unwrap_or(IDENTITY);
-                                let inner = form
-                                    .dict
-                                    .get(b"Resources")
-                                    .ok()
-                                    .and_then(|r| doc::resolve(d, r).as_dict().ok())
-                                    .cloned()
-                                    .unwrap_or_else(|| resources.clone());
-                                let body = stream_bytes(&form)?;
-                                // A changed form becomes a copy, so other pages drawing it keep theirs.
-                                match self.content(
-                                    d,
-                                    &body,
-                                    &inner,
-                                    concat(matrix, state.ctm),
-                                    depth + 1,
-                                )? {
-                                    Some((body, inner)) => {
-                                        let mut dict = form.dict.clone();
-                                        dict.remove(b"Filter");
-                                        dict.remove(b"DecodeParms");
-                                        dict.set("Resources", inner);
-                                        let mut copy = Stream::new(dict, body);
-                                        let _ = copy.compress();
-                                        Some(d.add_object(copy))
-                                    }
-                                    None => None,
-                                }
-                            }
-                            _ => None,
+            };
+            if !remove[index] {
+                kept.get_or_insert_with(|| (Vec::new(), *format))
+                    .0
+                    .extend_from_slice(code);
+                index += 1;
+                continue;
+            }
+            rebuilt.extend(
+                kept.take()
+                    .map(|(bytes, format)| Object::String(bytes, format)),
+            );
+            let glyph = &run[index];
+            let area = hits[index].expect("removed glyphs have an area");
+            if self.placed.get(area) == Some(&Outcome::Pending) {
+                self.place_replacement(d, glyph, area, *format, pass, &mut rebuilt)?;
+            }
+            // The renderer's own positions say how far the glyph moved the pen:
+            // the distance to the next glyph, less any explicit movement in between.
+            let shift = match run.get(index + 1) {
+                Some(next) => {
+                    let between: f64 = pieces[at + 1..]
+                        .iter()
+                        .map_while(|p| p.as_ref().err())
+                        .filter_map(number)
+                        .sum();
+                    glyph.units_to(next.origin) + between
+                }
+                // Nothing follows in this operator. The stated width is used when there
+                // is one; otherwise the next operator shows where the pen ended up,
+                // provided it carries on along the same line.
+                None => match glyph.advance {
+                    Some(advance) => {
+                        let space = if code == &[32] {
+                            pass.state.word_spacing
+                        } else {
+                            0.0
                         };
-                        if let Some(new) = replacement {
-                            let mut xobjects = resources
-                                .get(b"XObject")
-                                .ok()
-                                .and_then(|x| doc::resolve(d, x).as_dict().ok())
-                                .cloned()
-                                .unwrap_or_default();
-                            xobjects.set(key, new);
-                            resources.set("XObject", xobjects);
-                            changed = true;
-                        }
+                        advance as f64
+                            + (pass.state.char_spacing + space) * 1000.0 / pass.state.font_size
                     }
-                    out.push(op);
+                    None => self
+                        .runs
+                        .get(self.next_run)
+                        .and_then(|run| run.first())
+                        .map(|next| glyph.units_to(next.origin))
+                        .filter(|units| (0.0..3000.0).contains(units))
+                        .unwrap_or(500.0),
+                },
+            };
+            if !shift.is_finite() || shift.abs() > 100_000.0 {
+                bail!(
+                    "text in the area is laid out in a way that cannot be redacted safely; nothing was written"
+                );
+            }
+            rebuilt.push(Object::Real(-shift as f32));
+            if let Some(Outcome::Original { old, .. }) = self.placed.get_mut(area) {
+                *old += shift * glyph.em.0.hypot(glyph.em.1) / 1000.0;
+            }
+            self.stats.glyphs += 1;
+            index += 1;
+        }
+        rebuilt.extend(
+            kept.take()
+                .map(|(bytes, format)| Object::String(bytes, format)),
+        );
+        if !rebuilt.is_empty() {
+            pass.out
+                .push(Operation::new("TJ", vec![Object::Array(rebuilt)]));
+        }
+        // Marked content may repeat the removed text as /ActualText or /Alt.
+        for section in pass.marked.iter().flatten() {
+            let tag = pass.out[*section]
+                .operands
+                .first()
+                .cloned()
+                .into_iter()
+                .collect();
+            pass.out[*section] = Operation::new("BMC", tag);
+        }
+        pass.changed = true;
+        Ok(())
+    }
+
+    /// Writes an area's replacement text where its first removed glyph was.
+    ///
+    /// The text goes into `rebuilt`, followed by a movement back over its own
+    /// width, so that whatever comes after keeps its position.
+    fn place_replacement(
+        &mut self,
+        d: &mut Document,
+        glyph: &Placed,
+        area: usize,
+        format: lopdf::StringFormat,
+        pass: &mut Pass,
+        rebuilt: &mut Vec<Object>,
+    ) -> Result<()> {
+        // The replacement goes where the first removed glyph was. It is written
+        // with the codes this font uses for the same characters elsewhere, then
+        // the pen is moved back, so everything after keeps its position.
+        let size = (glyph.em.0.hypot(glyph.em.1)).max(0.001);
+        let written: Option<Vec<&(Vec<u8>, f32)>> = glyph.font.and_then(|font| {
+            self.replacements[area]
+                .chars()
+                .map(|c| self.seen.get(&(font, c.to_string())))
+                .collect()
+        });
+        self.placed[area] = match written {
+            Some(codes) => {
+                let units: f64 = codes
+                    .iter()
+                    .map(|(code, advance)| {
+                        let space = if code == &[32] {
+                            pass.state.word_spacing
+                        } else {
+                            0.0
+                        };
+                        *advance as f64
+                            + (pass.state.char_spacing + space) * 1000.0 / pass.state.font_size
+                    })
+                    .sum();
+                if !codes.is_empty() {
+                    let bytes: Vec<u8> = codes.iter().flat_map(|(code, _)| code.clone()).collect();
+                    rebuilt.push(Object::String(bytes, format));
+                    rebuilt.push(Object::Real(units as f32));
                 }
-                _ => out.push(op),
+                Outcome::Original {
+                    new: units * size / 1000.0,
+                    old: 0.0,
+                }
+            }
+            None => {
+                // The font cannot write it. Another font takes over for
+                // these characters only, in the same text object, so size,
+                // colour, position and reading order all carry over.
+                let text = &self.replacements[area];
+                let original = pass
+                    .state
+                    .font
+                    .and_then(|i| pass.fonts.get(i))
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!("text is shown without a font being set; nothing was written")
+                    })?;
+                if !text.is_empty() {
+                    let font = TextFont::new(d, text, None)?;
+                    let mut fonts = pass
+                        .resources
+                        .get(b"Font")
+                        .ok()
+                        .and_then(|f| doc::resolve(d, f).as_dict().ok())
+                        .cloned()
+                        .unwrap_or_default();
+                    let key = (1..)
+                        .map(|i| format!("PdfopsR{i}"))
+                        .find(|k| !fonts.has(k.as_bytes()))
+                        .expect("an unbounded range always yields a free name");
+                    fonts.set(key.as_str(), font.id);
+                    pass.resources.set("Font", fonts);
+                    // Word spacing applies to single-byte spaces only, which an embedded font has none of.
+                    let spaces = if font.is_embedded() {
+                        0
+                    } else {
+                        text.matches(' ').count()
+                    };
+                    let spacing = pass.state.char_spacing * text.chars().count() as f64
+                        + pass.state.word_spacing * spaces as f64;
+                    let units = font.width(text, 1000.0) + spacing * 1000.0 / pass.state.font_size;
+                    if !rebuilt.is_empty() {
+                        pass.out.push(Operation::new(
+                            "TJ",
+                            vec![Object::Array(std::mem::take(rebuilt))],
+                        ));
+                    }
+                    let size = Object::Real(pass.state.font_size as f32);
+                    pass.out.push(Operation::new(
+                        "Tf",
+                        vec![Object::Name(key.into_bytes()), size.clone()],
+                    ));
+                    pass.out.push(Operation::new(
+                        "TJ",
+                        vec![Object::Array(vec![
+                            font.operand(text),
+                            Object::Real(units as f32),
+                        ])],
+                    ));
+                    pass.out
+                        .push(Operation::new("Tf", vec![Object::Name(original), size]));
+                }
+                Outcome::Substitute
+            }
+        };
+        Ok(())
+    }
+
+    /// Handles `Do`: blanks an image, or descends into a form and swaps in the rewritten copy.
+    fn draw_object(
+        &mut self,
+        d: &mut Document,
+        op: Operation,
+        pass: &mut Pass,
+        depth: u32,
+    ) -> Result<()> {
+        let target = op
+            .operands
+            .first()
+            .and_then(|n| n.as_name().ok())
+            .and_then(|n| {
+                let xobjects = doc::resolve(d, pass.resources.get(b"XObject").ok()?)
+                    .as_dict()
+                    .ok()?;
+                Some((n.to_vec(), xobjects.get(n).ok()?.as_reference().ok()?))
+            });
+        if let Some((key, id)) = target {
+            let stream = d
+                .get_object(id)
+                .ok()
+                .and_then(|o| o.as_stream().ok())
+                .cloned();
+            let subtype = stream.as_ref().and_then(|s| {
+                s.dict
+                    .get(b"Subtype")
+                    .ok()?
+                    .as_name()
+                    .ok()
+                    .map(<[u8]>::to_vec)
+            });
+            let replacement = match (subtype.as_deref(), stream) {
+                (Some(b"Image"), _) if self.replacements.is_empty() && !self.collect_only => {
+                    self.image(d, id, pass.state.ctm)?
+                }
+                (Some(b"Form"), Some(form)) => {
+                    let matrix = form
+                        .dict
+                        .get(b"Matrix")
+                        .ok()
+                        .and_then(|m| doc::resolve(d, m).as_array().ok())
+                        .and_then(|m| numbers::<6>(m))
+                        .unwrap_or(IDENTITY);
+                    let inner = form
+                        .dict
+                        .get(b"Resources")
+                        .ok()
+                        .and_then(|r| doc::resolve(d, r).as_dict().ok())
+                        .cloned()
+                        .unwrap_or_else(|| pass.resources.clone());
+                    let body = stream_bytes(&form)?;
+                    // A changed form becomes a copy, so other pages drawing it keep theirs.
+                    match self.content(
+                        d,
+                        &body,
+                        &inner,
+                        concat(matrix, pass.state.ctm),
+                        depth + 1,
+                    )? {
+                        Some((body, inner)) => {
+                            let mut dict = form.dict.clone();
+                            dict.remove(b"Filter");
+                            dict.remove(b"DecodeParms");
+                            dict.set("Resources", inner);
+                            let mut copy = Stream::new(dict, body);
+                            let _ = copy.compress();
+                            Some(d.add_object(copy))
+                        }
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(new) = replacement {
+                let mut xobjects = pass
+                    .resources
+                    .get(b"XObject")
+                    .ok()
+                    .and_then(|x| doc::resolve(d, x).as_dict().ok())
+                    .cloned()
+                    .unwrap_or_default();
+                xobjects.set(key, new);
+                pass.resources.set("XObject", xobjects);
+                pass.changed = true;
             }
         }
-        if !changed {
-            return Ok(None);
-        }
-        let encoded = Content { operations: out }
-            .encode()
-            .map_err(|e| anyhow!("cannot write page content: {e}"))?;
-        Ok(Some((encoded, resources)))
+        pass.out.push(op);
+        Ok(())
     }
 }
 
