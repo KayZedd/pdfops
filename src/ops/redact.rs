@@ -1703,7 +1703,9 @@ fn clean_beside_pages(d: &mut Document, patterns: &[regex::Regex]) -> Beside {
         // it, as UTF-16 in either byte order.
         let wide = |big: bool| -> String {
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     if big {
                         u16::from_be_bytes([pair[0], pair[1]])
