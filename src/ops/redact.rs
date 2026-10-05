@@ -325,6 +325,8 @@ struct State {
     word_spacing: f64,
     font_size: f64,
     render_mode: i64,
+    /// How far text is raised above its baseline, in text space.
+    rise: f64,
     /// The current font, as an index into the names seen in this stream.
     font: Option<usize>,
 }
@@ -349,6 +351,8 @@ struct Rewriter<'a> {
     collect_only: bool,
     /// Changes of width that the rest of each line follows; empty when nothing moves.
     reflow: Vec<Reflow>,
+    /// Stretches of lines that go to another line as they stand.
+    moves: Vec<LineMove>,
 }
 
 /// What one walk over a content stream carries along and builds up.
@@ -398,6 +402,19 @@ struct Reflow {
     /// column. The same for every change on one line; a factor of one changes nothing.
     anchor: Point,
     factor: f64,
+}
+
+/// A stretch of a line of text that is drawn elsewhere: what stands on `baseline`
+/// from `from` up to `until` goes `dx` along the line and `dy` down the page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LineMove {
+    baseline: f64,
+    /// The height of the line, which says how near the baseline a glyph must stand.
+    tall: f64,
+    from: f64,
+    until: f64,
+    dx: f64,
+    dy: f64,
 }
 
 fn stream_bytes(stream: &Stream) -> Result<Vec<u8>> {
@@ -857,6 +874,7 @@ impl Rewriter<'_> {
                 word_spacing: 0.0,
                 font_size: 0.0,
                 render_mode: 0,
+                rise: 0.0,
                 font: None,
             },
             saved: Vec::new(),
@@ -882,6 +900,7 @@ impl Rewriter<'_> {
                 "Tw" => {
                     pass.state.word_spacing = op.operands.first().and_then(number).unwrap_or(0.0)
                 }
+                "Ts" => pass.state.rise = op.operands.first().and_then(number).unwrap_or(0.0),
                 "Tr" => {
                     pass.state.render_mode = op
                         .operands
@@ -987,6 +1006,19 @@ impl Rewriter<'_> {
         Ok(Some((encoded, pass.resources)))
     }
 
+    /// How far a glyph at `origin` goes, along the line and down the page, with the
+    /// stretch of line it stands in.
+    fn moved(&self, origin: Point) -> (f64, f64) {
+        self.moves
+            .iter()
+            .find(|m| {
+                (origin.y - m.baseline).abs() < 0.3 * m.tall
+                    && m.from - 0.05 <= origin.x
+                    && origin.x < m.until - 0.05
+            })
+            .map_or((0.0, 0.0), |m| (m.dx, m.dy))
+    }
+
     /// How far along its line a glyph at `origin` moves to follow the changes before it.
     fn shift_at(&self, origin: Point, em: (f64, f64)) -> f64 {
         let size = em.0.hypot(em.1);
@@ -1083,9 +1115,16 @@ impl Rewriter<'_> {
         let hits: Vec<Option<usize>> = run.iter().map(|g| g.hit(self.areas)).collect();
         let remove: Vec<bool> = hits.iter().map(Option::is_some).collect();
         // Where each glyph belongs once the line has made room for changed text.
-        let wants: Vec<f64> = run.iter().map(|g| self.shift_at(g.origin, g.em)).collect();
+        let elsewhere: Vec<(f64, f64)> = run.iter().map(|g| self.moved(g.origin)).collect();
+        let wants: Vec<f64> = run
+            .iter()
+            .zip(&elsewhere)
+            .map(|(g, to)| self.shift_at(g.origin, g.em) + to.0)
+            .collect();
+        // How far down the page each glyph goes: to another line, or nowhere.
+        let lowered = elsewhere.iter().any(|to| to.1.abs() > 0.01);
         let removes = remove.contains(&true);
-        if !removes && !wants.iter().any(|w| w.abs() > 0.01) {
+        if !removes && !lowered && !wants.iter().any(|w| w.abs() > 0.01) {
             pass.out.push(op);
             return Ok(());
         }
@@ -1165,6 +1204,38 @@ impl Rewriter<'_> {
                     applied = want;
                 }
             };
+        // Puts what is shown next `down` points lower on the page than its line. Text
+        // rise does that without touching the text matrix, so the operators that
+        // follow start where they always did.
+        let (rise, font_size) = (pass.state.rise, pass.state.font_size.abs());
+        let lowered_by = std::cell::Cell::new(0.0f64);
+        let lower = |down: f64,
+                     glyph: &Placed,
+                     rebuilt: &mut Vec<Object>,
+                     kept: &mut Option<(Vec<u8>, lopdf::StringFormat)>,
+                     out: &mut Vec<Operation>| {
+            if (down - lowered_by.get()).abs() <= 0.01 {
+                return;
+            }
+            rebuilt.extend(
+                kept.take()
+                    .map(|(bytes, format)| Object::String(bytes, format)),
+            );
+            if !rebuilt.is_empty() {
+                out.push(Operation::new(
+                    "TJ",
+                    vec![Object::Array(std::mem::take(rebuilt))],
+                ));
+            }
+            // A unit of text space is as long on the page as the glyphs are tall for
+            // each point of their size.
+            let unit = glyph.em.0.hypot(glyph.em.1).max(0.001) / font_size;
+            out.push(Operation::new(
+                "Ts",
+                vec![Object::Real((rise - down / unit) as f32)],
+            ));
+            lowered_by.set(down);
+        };
         for (at, piece) in pieces.iter().enumerate() {
             let (code, format) = match piece {
                 Ok(code) => code,
@@ -1178,6 +1249,13 @@ impl Rewriter<'_> {
                 }
             };
             if !remove[index] {
+                lower(
+                    elsewhere[index].1,
+                    &run[index],
+                    &mut rebuilt,
+                    &mut kept,
+                    &mut pass.out,
+                );
                 settle(wants[index], &run[index], &mut rebuilt, &mut kept);
                 kept.get_or_insert_with(|| (Vec::new(), *format))
                     .0
@@ -1192,6 +1270,13 @@ impl Rewriter<'_> {
             let glyph = &run[index];
             let area = hits[index].expect("removed glyphs have an area");
             if self.placed.get(area) == Some(&Outcome::Pending) {
+                lower(
+                    elsewhere[index].1,
+                    glyph,
+                    &mut rebuilt,
+                    &mut kept,
+                    &mut pass.out,
+                );
                 settle(wants[index], glyph, &mut rebuilt, &mut kept);
                 self.place_replacement(d, glyph, area, *format, pass, &mut rebuilt)?;
             }
@@ -1252,6 +1337,10 @@ impl Rewriter<'_> {
         if !rebuilt.is_empty() {
             pass.out
                 .push(Operation::new("TJ", vec![Object::Array(rebuilt)]));
+        }
+        if lowered_by.get().abs() > 0.01 {
+            pass.out
+                .push(Operation::new("Ts", vec![Object::Real(rise as f32)]));
         }
         pass.changed = true;
         if !removes {
@@ -1866,6 +1955,7 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
             seen: HashMap::new(),
             collect_only: false,
             reflow: Vec::new(),
+            moves: Vec::new(),
         };
         let content = d.get_page_content(id);
         let resources = own_resources(&d, id);
@@ -1990,7 +2080,10 @@ struct PageMatches {
     olds: Vec<String>,
     /// The box of every word on the page and its width, to tell how far a line may grow.
     words: Vec<Area>,
+    /// Straight strokes on the page, which a line that is added must not run into.
+    strokes: Vec<Area>,
     width: f64,
+    height: f64,
 }
 
 /// How much closer together the rest of a line may be drawn to stay in its column,
@@ -2003,7 +2096,181 @@ const SQUEEZE: f64 = 0.08;
 /// What follows a replacement on its line moves by the difference in width. A line
 /// that would then run past the column it stands in is drawn closer together from
 /// the replacement on, up to `SQUEEZE`; what is left over is the overflow.
-fn plan_reflow(placed: &[Outcome], words: &[Area], width: f64) -> (Vec<Reflow>, Vec<f64>) {
+/// What a line of text has around it on its page: the boxes of all words, the
+/// straight strokes, and how tall the page is.
+#[derive(Clone, Copy)]
+struct Surroundings<'a> {
+    words: &'a [Area],
+    strokes: &'a [Area],
+    height: f64,
+}
+
+/// Takes the words that no longer fit at the end of a line to the start of the next
+/// one, and from there on as far as it takes, as a typesetter would: the lines of the
+/// paragraph that follow make room, each passing on what it cannot hold, and the last
+/// words get a line of their own if the page is free below. `None` where that cannot
+/// be done with certainty: nothing below to tell the paragraph by and no free space,
+/// a next line that is set differently, or one that is itself being changed.
+///
+/// `grown_before` tells by how much the changes on the line push what starts at a
+/// given place; `changed` are the baselines of all lines with changes.
+fn wrap_line(
+    Surroundings {
+        words,
+        strokes,
+        height: page_height,
+    }: Surroundings<'_>,
+    baseline: f64,
+    extent: Area,
+    column: f64,
+    grown_before: &dyn Fn(f64) -> f64,
+    changed: &[f64],
+) -> Option<Vec<LineMove>> {
+    let tall = extent[3] - extent[1];
+    let base_of = |w: &Area| w[3] - 0.2 * (w[3] - w[1]);
+    let line_at = |from: f64, to: f64| -> Vec<&Area> {
+        let mut line: Vec<&Area> = words
+            .iter()
+            .filter(|w| {
+                let base = base_of(w);
+                from < base && base < to && w[0] < column && extent[0] - 2.0 * tall < w[2]
+            })
+            .collect();
+        line.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        line
+    };
+    let mut line = line_at(baseline - 0.3 * tall, baseline + 0.3 * tall);
+    // Where the words of the first line stand once its changes are made.
+    let first = line
+        .iter()
+        .position(|w| w[2] + grown_before(w[2]) > column + 0.5)?;
+    if first == 0 {
+        return None;
+    }
+    let gap = (line[first][0] - line[first - 1][2]).max(0.15 * tall);
+    let above = line_at(baseline - 1.8 * tall, baseline - 0.6 * tall);
+    let mut moves = Vec::new();
+    let mut baseline = baseline;
+    // The words being carried: where they start in the file, where they would stand
+    // on their own line, and how wide they are.
+    let mut from = line[first][0];
+    let mut stands = line[first][0] + grown_before(line[first][0] - 0.01);
+    let last = line[line.len() - 1];
+    let mut wide = last[2] + grown_before(last[2]) - stands;
+    let mut previous = above.first().map(|w| (w[0], base_of(w)));
+    for _ in 0..60 {
+        line = line_at(baseline + 0.6 * tall, baseline + 1.8 * tall);
+        let Some(left) = line.first().map(|w| w[0]) else {
+            // The paragraph ends here. The words get a line of their own, set like
+            // the ones before it, if nothing is in the way.
+            let (left, leading) = match previous {
+                Some((left, base)) => (left, baseline - base),
+                None => (extent[0], 1.25 * tall),
+            };
+            let new = baseline + leading;
+            let in_the_way = words.iter().chain(strokes).any(|w| {
+                w[1] < new + 0.3 * tall
+                    && w[3] > baseline + 0.3 * tall
+                    && w[0] < column
+                    && extent[0] < w[2]
+            });
+            if in_the_way || new + 0.3 * tall > page_height || left + wide > column + 0.5 {
+                return None;
+            }
+            moves.push(LineMove {
+                baseline,
+                tall,
+                from,
+                until: f64::INFINITY,
+                dx: left - stands,
+                dy: leading,
+            });
+            return Some(moves);
+        };
+        let next = base_of(line[0]);
+        let set_alike = (left - extent[0]).abs() < 0.5 * tall
+            || previous.is_some_and(|(above, _)| (left - above).abs() < 0.5 * tall);
+        let same_size = line
+            .iter()
+            .all(|w| ((w[3] - w[1]) - tall).abs() < 0.15 * tall);
+        let busy = changed.iter().any(|c| (c - next).abs() < 0.3 * tall);
+        if !set_alike || !same_size || busy || left + wide > column + 0.5 {
+            return None;
+        }
+        moves.push(LineMove {
+            baseline,
+            tall,
+            from,
+            until: f64::INFINITY,
+            dx: left - stands,
+            dy: next - baseline,
+        });
+        // The line the words arrive on makes room for them.
+        let room = wide + gap;
+        let over = line.iter().position(|w| w[2] + room > column + 0.5);
+        moves.push(LineMove {
+            baseline: next,
+            tall,
+            from: f64::NEG_INFINITY,
+            until: over.map_or(f64::INFINITY, |at| line[at][0]),
+            dx: room,
+            dy: 0.0,
+        });
+        let Some(over) = over else {
+            return Some(moves);
+        };
+        previous = Some((left, baseline));
+        (from, stands) = (line[over][0], line[over][0]);
+        wide = line[line.len() - 1][2] - line[over][0];
+        baseline = next;
+    }
+    None
+}
+
+/// The outcomes with the width that each replaced text took up on its line: from
+/// where it began to where it ended. Counted glyph by glyph, a text of several words
+/// that are placed one by one comes out short by the spaces between them, and what
+/// follows would move too far.
+fn with_extents(placed: &[Outcome], areas: &[Area]) -> Vec<Outcome> {
+    placed
+        .iter()
+        .zip(areas)
+        .map(|(outcome, area)| match *outcome {
+            Outcome::Written {
+                own_font,
+                new,
+                at,
+                along,
+                ..
+            } if along.0 > 0.99 => Outcome::Written {
+                own_font,
+                new,
+                old: area[2] - area[0],
+                at,
+                along,
+            },
+            other => other,
+        })
+        .collect()
+}
+
+/// What a page's changes of width lead to.
+struct Plan {
+    reflow: Vec<Reflow>,
+    /// For each replacement, by how much its line still runs over its column.
+    overflow: Vec<f64>,
+    moves: Vec<LineMove>,
+    /// Lines whose last words went to the next line.
+    wrapped: usize,
+}
+
+fn plan_reflow(
+    placed: &[Outcome],
+    words: &[Area],
+    strokes: &[Area],
+    width: f64,
+    height: f64,
+) -> Plan {
     let mut changes: Vec<(usize, Reflow, f64)> = placed
         .iter()
         .enumerate()
@@ -2029,6 +2296,8 @@ fn plan_reflow(placed: &[Outcome], words: &[Area], width: f64) -> (Vec<Reflow>, 
         })
         .collect();
     let mut overflow = vec![0.0; placed.len()];
+    let mut moves = Vec::new();
+    let mut wrapped = 0;
     // Lines are told apart by their baseline. Only level text is fitted to a column.
     let level = |c: &Reflow| c.along.0 > 0.99;
     let mut lines: Vec<f64> = changes
@@ -2038,6 +2307,7 @@ fn plan_reflow(placed: &[Outcome], words: &[Area], width: f64) -> (Vec<Reflow>, 
         .collect();
     lines.sort_by(f64::total_cmp);
     lines.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+    let changed = lines.clone();
     for baseline in lines {
         let on_line = |c: &Reflow| level(c) && (c.at.y - baseline).abs() < 1.0;
         let grown: f64 = changes
@@ -2087,6 +2357,33 @@ fn plan_reflow(placed: &[Outcome], words: &[Area], width: f64) -> (Vec<Reflow>, 
         };
         let anchor = Point::new(first.0.x + first.1, first.0.y);
         let tail = extent[2] + grown - anchor.x;
+        // More than drawing the line together can take up: its last words go to the
+        // next line, where that can be done.
+        if over > SQUEEZE * tail.max(0.0) + 0.5 {
+            let others: Vec<f64> = changed
+                .iter()
+                .copied()
+                .filter(|c| (c - baseline).abs() >= 1.0)
+                .collect();
+            let grown_before = |x: f64| -> f64 {
+                changes
+                    .iter()
+                    .filter(|c| on_line(&c.1) && c.1.at.x < x)
+                    .map(|c| c.1.delta)
+                    .sum()
+            };
+            let around = Surroundings {
+                words,
+                strokes,
+                height,
+            };
+            if let Some(wrap) = wrap_line(around, baseline, extent, column, &grown_before, &others)
+            {
+                moves.extend(wrap);
+                wrapped += 1;
+                continue;
+            }
+        }
         let taken = if tail > 0.0 {
             over.min(SQUEEZE * tail)
         } else {
@@ -2100,13 +2397,18 @@ fn plan_reflow(placed: &[Outcome], words: &[Area], width: f64) -> (Vec<Reflow>, 
             overflow[*i] = over - taken;
         }
     }
-    let moves = changes.iter().any(|c| c.1.delta.abs() > 0.05);
-    let reflow = if moves {
+    let any = changes.iter().any(|c| c.1.delta.abs() > 0.05);
+    let reflow = if any {
         changes.into_iter().map(|c| c.1).collect()
     } else {
         Vec::new()
     };
-    (reflow, overflow)
+    Plan {
+        reflow,
+        overflow,
+        moves,
+        wrapped,
+    }
 }
 
 /// Replaces the text in what is not page content: the values of text fields, which
@@ -2221,7 +2523,9 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
             texts,
             olds,
             words: scanned.words.iter().map(|w| w.bbox).collect(),
+            strokes: scanned.strokes(),
             width: scanned.width,
+            height: scanned.height,
         });
     }
     let mut d = doc::load(&a.input, a.password.as_deref())?;
@@ -2239,7 +2543,9 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
         texts,
         olds,
         words,
+        strokes,
         width,
+        height,
     } in &found
     {
         let id = *ids
@@ -2260,6 +2566,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
             seen: HashMap::new(),
             collect_only: true,
             reflow: Vec::new(),
+            moves: Vec::new(),
         };
         // First pass: learn which characters the page's fonts can write.
         rewriter
@@ -2276,9 +2583,21 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
         }
         // Third pass, when a width changed: the same again, with what follows each
         // replacement on its line moved along by the difference.
-        let (reflow, overflow) = plan_reflow(&rewriter.placed, words, *width);
+        let Plan {
+            reflow,
+            overflow,
+            moves,
+            wrapped,
+        } = plan_reflow(
+            &with_extents(&rewriter.placed, areas),
+            words,
+            strokes,
+            *width,
+            *height,
+        );
         if !reflow.is_empty() {
             rewriter.reflow = reflow;
+            rewriter.moves = moves;
             rewriter.next_run = 0;
             rewriter.placed = vec![Outcome::Pending; areas.len()];
             rewritten = rewriter
@@ -2288,6 +2607,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
                 return Err(out_of_step()).with_context(|| format!("page {n}"));
             }
         }
+        rewriter.placed = with_extents(&rewriter.placed, areas);
         let resources = match rewritten {
             Some((body, resources)) => {
                 let mut stream = Stream::new(Dictionary::new(), body);
@@ -2319,6 +2639,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
             "in_original_font": original,
             "in_substitute_font": substituted,
             "overflow_pt": tenths(overflow.iter().copied().fold(0.0, f64::max)),
+            "lines_rewrapped": wrapped,
         });
         if a.dry_run {
             entry["matches"] = (0..areas.len())

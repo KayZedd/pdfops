@@ -321,13 +321,16 @@ The short version. `pdfops <command> --help` has the detail for each command.
 - **Any script.** Text that `stamp`, `fill`, `replace`, `create` and `ocr -o` draw is shaped and
   embedded as font subsets; where no one font has every character, several share the text.
   Hebrew and Arabic are laid out from the right and read back in the order they are read in, so
-  a word is found by typing it.
+  a word is found by typing it. Some Indic and Thai clusters that pdfops itself wrote read back
+  with their characters regrouped.
 - **Redaction removes, it does not cover.** Glyphs, image pixels in any encoding, drawings and
   annotations under an area are deleted, a text to redact is also struck from metadata and
   bookmarks, and the result is read back by a second interpreter before anything is written.
 - **Replace** writes in the document's own font where it has the glyphs and moves the rest of
-  the line along; values of text fields and comments of annotations are changed too. Text does
-  not move to another line: `--dry-run` shows `overflow_pt` first.
+  the line along; values of text fields and comments of annotations are changed too. A line
+  that grows past its column passes its last words on to the next line, and the paragraph gets a
+  line more if there is room below. Where the paragraph cannot be told with certainty the line
+  is left as it is and `overflow_pt` says by how much it runs over; `--dry-run` shows it first.
 - **Dry run.** `redact`, `replace`, `annotate` and `stamp` take `--dry-run`: all the work,
   nothing written.
 - **Scan** reports scripts, actions, attachments, disguised content and hidden text by severity.
@@ -344,12 +347,11 @@ The short version. `pdfops <command> --help` has the detail for each command.
 - **Merging and page work** keep bookmarks and links that lead to pages in the output, and
   rename the form fields of later inputs `doc2.<name>` so equal names do not share a value.
 - **Damaged files** are repaired for reading and rebuilt for writing; the result then carries
-  `repaired_inputs`. **Protected files stay protected** when edited; only `decrypt` removes it.
+  `repaired_inputs`. A damaged file that is also encrypted is not rebuilt. **Protected files stay protected** when edited; only `decrypt` removes it.
 - **Limits.** 4 GiB and 300 seconds per command by default: `--max-memory`, `--timeout`, or
   `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`; 0 lifts a limit. Rasters are capped at 64 megapixels.
 - **Create** takes Markdown, and the HTML in it for what it says: headings, emphasis, links,
   lists, tables. How it should look is not read: there is no CSS.
-- **Not there:** moving text between lines in `replace`.
 
 ## Development
 

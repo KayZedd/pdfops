@@ -182,6 +182,22 @@ pub(crate) fn reading_order(pieces: &[&str]) -> Option<Vec<(usize, bool)>> {
     Some(order.into_iter().map(|i| (i, levels[i] % 2 == 1)).collect())
 }
 
+impl PageLayout {
+    /// The straight strokes on the page, as the boxes they take up.
+    pub(crate) fn strokes(&self) -> Vec<[f64; 4]> {
+        self.rules
+            .iter()
+            .map(|rule| {
+                if rule.horizontal {
+                    [rule.from, rule.at, rule.to, rule.at]
+                } else {
+                    [rule.at, rule.from, rule.at, rule.to]
+                }
+            })
+            .collect()
+    }
+}
+
 /// A bracket as it was typed, given as it is drawn in text running from the right.
 pub(crate) fn mirrored(piece: &str) -> &str {
     match piece {

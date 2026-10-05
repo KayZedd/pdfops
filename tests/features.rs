@@ -1191,16 +1191,84 @@ fn replace_draws_a_line_together_to_keep_it_in_its_column() {
     assert!(end <= edge + 0.6 && end > was, "{end} {edge} {was}");
     assert!(after.windows(2).all(|p| p[0].1[2] < p[1].1[0]), "{after:?}");
 
-    // Far more than drawing together can absorb: the rest is reported.
+    // Far more than drawing together can absorb: the last words of the line go to
+    // the next one, which passes on what it cannot hold, and the paragraph gets a
+    // line more.
     let v = call(
         "pdf_replace",
         json!({"input": pdf, "output": out, "find": "May", "with": "the month after that", "case_sensitive": true}),
     );
+    assert_eq!(v["pages"][0]["overflow_pt"], 0.0, "{v}");
+    assert_eq!(v["pages"][0]["lines_rewrapped"], 1, "{v}");
+    let after = words(&out, 1);
+    assert!(after.iter().all(|w| w.1[2] <= edge + 0.6), "{after:?}");
+    let mut tops: Vec<i64> = after.iter().map(|w| w.1[1].round() as i64).collect();
+    tops.dedup();
+    assert_eq!(tops.len(), 4, "{after:?}");
+    // Read line by line it is the same sentence, with the new words in it.
+    let mut read = after.clone();
+    read.sort_by(|a, b| {
+        (a.1[1].round(), a.1[0])
+            .partial_cmp(&(b.1[1].round(), b.1[0]))
+            .unwrap()
+    });
+    let read: Vec<&str> = read.iter().map(|w| w.0.as_str()).collect();
+    assert_eq!(
+        read.join(" "),
+        [
+            "The agreement runs from the first day of the month after that until notice is",
+            "given by either party, as the schedule below sets out."
+        ]
+        .join(" ")
+    );
+    // Words on a line stay apart, also where some arrived from the line above.
+    for top in tops {
+        let mut line: Vec<&(String, [f64; 4])> = after
+            .iter()
+            .filter(|w| w.1[1].round() as i64 == top)
+            .collect();
+        line.sort_by(|a, b| a.1[0].total_cmp(&b.1[0]));
+        assert!(line.windows(2).all(|p| p[0].1[2] < p[1].1[0]), "{line:?}");
+    }
+
+    // With something right under the paragraph there is no room for a line more, so
+    // nothing is rearranged and what is over is reported.
+    let crowded = format!("{column} 72 658 m 300 658 l S");
+    let pdf = custom(dir.path(), "crowded.pdf", &[&crowded]);
+    let v = call(
+        "pdf_replace",
+        json!({"input": pdf, "output": out, "find": "May", "with": "the month after that", "case_sensitive": true}),
+    );
+    assert_eq!(v["pages"][0]["lines_rewrapped"], 0, "{v}");
     let over = v["pages"][0]["overflow_pt"].as_f64().unwrap();
     let end = line(&words(&out, 1)).last().unwrap().1[2];
     assert!(
         over > 20.0 && (end - edge - over).abs() < 1.0,
         "{over} {end} {edge}"
+    );
+}
+
+#[test]
+fn replace_measures_text_of_several_words_by_what_it_took_up() {
+    let dir = tempfile::tempdir().unwrap();
+    // Every word is placed on its own, as many producers do it.
+    let made = dir.path().join("made.pdf");
+    call(
+        "pdf_create",
+        json!({"markdown": "alpha beta gamma delta epsilon", "output": made}),
+    );
+    let out = dir.path().join("out.pdf");
+    call(
+        "pdf_replace",
+        json!({"input": made, "output": out, "find": "beta gamma", "with": "beta gamma"}),
+    );
+    // The same words in the same place leave what follows where it was.
+    let place = |pdf: &std::path::Path| words(pdf, 1).iter().find(|w| w.0 == "delta").unwrap().1[0];
+    assert!(
+        (place(&made) - place(&out)).abs() < 0.3,
+        "{} {}",
+        place(&made),
+        place(&out)
     );
 }
 
