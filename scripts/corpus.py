@@ -84,7 +84,8 @@ def examine(pdfops, path, scratch):
         "replace": ["replace", path, "--find", "the", "--with", "THE", "-p", "1", "-o", out],
     }
     if IDENTITY:
-        commands["sign"] = ["sign", path, "--cert", IDENTITY[0], "--key", IDENTITY[1], "-o", out]
+        commands["sign"] = ["sign", path, "--cert", IDENTITY[0], "--key", IDENTITY[1], "--visible", "1:50,50,250,110",
+                            "-o", out]
     writes = {"pages", "merge", "rotate", "stamp", "set-meta", "compress", "encrypt", "annotate", "redact",
               "replace", "sign", "sanitize"}
     input_sound = None
