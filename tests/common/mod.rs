@@ -387,6 +387,36 @@ pub fn words(path: &Path, page: u32) -> Vec<(String, [f64; 4])> {
         .collect()
 }
 
+/// A signing identity issued by an authority made for it, as PEM files: the signer's
+/// certificate followed by nothing else, its private key, and the authority's certificate.
+pub fn issued_identity(dir: &Path, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let authority_key = rcgen::KeyPair::generate().unwrap();
+    let mut authority = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    authority
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, format!("{name} Authority"));
+    authority.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let authority_cert = authority.self_signed(&authority_key).unwrap();
+    let issuer = rcgen::Issuer::new(authority, authority_key);
+
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, name);
+    let cert = params.signed_by(&key, &issuer).unwrap();
+    let stem = name.replace(' ', "-");
+    let (cert_path, key_path, authority_path) = (
+        dir.join(format!("{stem}.crt")),
+        dir.join(format!("{stem}.key")),
+        dir.join(format!("{stem}-authority.crt")),
+    );
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    std::fs::write(&authority_path, authority_cert.pem()).unwrap();
+    (cert_path, key_path, authority_path)
+}
+
 /// A self-signed P-256 signing identity as PEM files: (certificate, private key).
 pub fn identity(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
     let key = rcgen::KeyPair::generate().unwrap();

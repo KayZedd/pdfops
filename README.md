@@ -184,7 +184,9 @@ pdfops forms form.pdf
 pdfops fill form.pdf --set name="Ada Lovelace" --set agree=true -o filled.pdf
 pdfops encrypt in.pdf --owner-password secret --deny-copy -o locked.pdf
 pdfops sign in.pdf --p12 identity.p12 --p12-password secret --reason "Approved" -o signed.pdf
+pdfops sign in.pdf --cert me.crt --key me.key --visible "1:360,700,560,760" -o signed.pdf
 pdfops signatures signed.pdf                            # valid, unchanged, who and when
+pdfops signatures signed.pdf --trust company-root.pem   # and whether the signer is one of yours
 pdfops scan inbox/offer.pdf                             # what is in it, before reading it
 pdfops sanitize inbox/offer.pdf -o offer-clean.pdf      # scripts, actions, attachments removed
 ```
@@ -313,121 +315,38 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
 
 ## Behaviour worth knowing
 
-- **Text outside Latin-1.** `stamp`, `fill`, `replace` and `create` embed a subset of a font that
-  has the glyphs: the one given with `stamp --font`, otherwise one found on the system. Latin-1
-  text uses the built-in Helvetica and embeds nothing. Embedded text is shaped: Arabic is joined,
-  Hebrew and Arabic run from the right, Indic and Thai clusters are formed and their marks placed,
-  and Latin gets its ligatures and kerning. Where no one font has every character, several share
-  the text: a usual sans-serif draws what it can and others stand in for the rest, so Polish,
-  Chinese and Hindi can sit in one line. `create` lays a line out as a whole, so a comma after a
-  Hebrew word in an English sentence lands where the sentence goes on, and a paragraph that runs
-  from the right is set against the right margin. One limit: reading such text back gives some
-  Indic and Thai clusters with their characters regrouped.
-- **Right-to-left text is read in the order it is read in.** A page holds Hebrew and Arabic as
-  they are drawn, last letter first. `text`, `search`, `layout`, `tables`, `redact --text`,
-  `replace --find` and `annotate --text` turn each line back, so a word is found by typing it.
-  Letters stay in the form the file has them in: Arabic stored as presentation forms is not
-  folded back to plain letters.
-- **Redaction** deletes what is under the areas from the page content: glyphs, image pixels,
-  drawings lying wholly inside an area, and annotations with the form values they show. Images are
-  blanked whatever they are stored as (scans in fax or JBIG2 coding, JPEG in any colour model,
-  JPEG 2000, images written into the page content itself) and are stored without loss afterwards.
-  Text around it does not move. The result is read back by a second, independent interpreter, and
-  nothing is written unless every area is empty. Where an image cannot be decoded, or text is
-  drawn in a way that cannot be taken apart with certainty, the command fails instead of guessing.
-  A text to redact is also taken out of the document information, the bookmark titles and the
-  metadata stream, which goes as a whole if it holds the text; `beside_pages` in the result says
-  what was done. Attached files that hold the text are named there and left alone: `sanitize`
-  removes attachments. The accessibility structure tree, which can repeat page text, is removed.
-- **Replace** writes the new text with the codes the document's own font already uses for those
-  characters on that page, so style is kept exactly. If the font (usually a subset) lacks a needed
-  glyph, another font writes just those words, at the same size, position and colour, and the result
-  says so. What follows on the same line moves along by the difference in width, however the
-  producer placed it. A line that would then run past its column, judged from the lines above and
-  below, is drawn up to 8% closer together from the replacement on, and `overflow_pt` reports
-  what is still over; without neighbouring lines the right margin is taken to equal the left one.
-  Text does not move from one line to the next, so a much longer replacement still needs a look:
-  `--dry-run` gives `width_change_pt` and `overflow_pt` per match beforehand. Text inside form
-  fields and annotations is not edited.
-- **Dry run.** `redact`, `replace`, `annotate` and `stamp` take `--dry-run` (`dry_run` over MCP):
-  the command does all of its work, including the check after redaction, reports what it would
-  change and writes nothing. `redact` lists every area with the text that matched and the counts of
-  glyphs, images, drawings and annotations that would go; `replace` lists every match with its box,
-  the old and new text, which font would write it and by how much it would overflow.
-- **Scan** inspects structure; it is not a virus scanner and never calls a file safe. The verdict is
-  `nothing found` or `findings`, each finding has a severity (`high`, `medium`, `low`, `info`), the
-  objects it sits in and samples, and the result lists what was checked and what was not. It reads
-  the raw bytes as well as the parsed objects, so a file that does not open, or hides a name behind
-  `#xx` escapes or inside a packed object, is still judged. With `--clamav` the file is also passed
-  to `clamscan` when that is installed; no signature database is bundled.
-- **Hidden text** is found by looking: every page is rendered, and a word that leaves no trace in
-  the picture is reported with its page, box, reason and text, whether it is in the invisible text
-  mode, in the colour of its background, under a flat shape, clipped away, smaller than 1.5 points
-  or off the page. The judgement is made from pdfops' own rendering, and is withheld where that
-  cannot be relied on: under translucent or blended drawing, and for fonts it cannot draw.
-  Rendering runs in a process of its own, so a file built to exhaust memory or time costs this one
-  check and is reported as `resource_exhaustion`; the rest of the result stands. Invisible text
-  over visible content, which scanned pages with recognised text have, is reported apart as
-  `invisible_text_layer` with severity `info`. Text under a picture that is not a flat colour is
-  not detected, and neither is text inside annotations and form fields. The boxes can be passed to
-  `redact --rect`.
-- **Sanitize** removes JavaScript, actions that run by themselves or start programs, send form
-  data or open other files, embedded files, XFA forms and media annotations; `--keep` leaves a
-  group in place. Ordinary web links stay, and hidden text is not touched. The result is scanned
-  before it is written, and nothing is written if any of it is still there. Like every rewrite, it
-  invalidates digital signatures.
-- **Tables** drawn with ruling lines are read cell by cell and are reliable. Tables without lines
-  are inferred from column alignment (`detected_by: alignment`): columns are the stretches of the
-  page that rows fill, kept apart even where a heading lies across two of them; a label or a
-  description that wraps is joined to its row; rows with empty cells, a heading over a group of
-  rows and a figure set alone under its column stay in the table; running text between two tables
-  splits them, and a list of contents with dot leaders is not a table. It is still inference:
-  whether a line continues the row above is judged from indentation, spacing and capitals, so such
-  tables deserve a look before trusting.
-- **Create** understands headings, emphasis, links, nested lists, quotes, code blocks, tables, rules
-  and local images. HTML inside the Markdown is ignored; there is no HTML or CSS engine.
-- **Bookmarks and links.** `merge`, `pages` and `split` keep the bookmarks whose target page is in
-  the output, each landing where it did on its page. Links between pages that are both in the
-  output keep working, also where they go to a destination by name: the name is replaced by the
-  page and position it stood for.
-- **Forms when merging.** Fields of the second and later inputs are renamed `doc2.<name>`,
-  `doc3.<name>`, so equal names do not share a value.
-- **Lossy compression** is opt-in through `--image-quality` and `--max-image-edge`. It re-encodes
-  8-bit grey and RGB images as JPEG. Masks, palette images, CMYK and 1-bit scans are left untouched,
-  and the output is never larger than the input.
-- **Images** are the ones a page actually draws, including inline images and images inside forms.
-  JPEG and JPEG 2000 are written as stored; everything else (Flate, LZW, CCITT fax, JBIG2, palette,
-  masks) is decoded to PNG.
-- **OCR** quality and languages are tesseract's. Recognised text is returned; with `-o` it is also
-  written into a copy of the PDF as an invisible layer over the picture of each word, so the copy
-  can be searched and selected in any viewer. Pages that have text of their own are left as they
-  are. When a language is missing, the error names the `ocr-install` call that fixes it, so an agent
-  can recover on its own. Data comes from the `tessdata_fast` repository (`--best` for the larger
-  models) and is kept in `~/.local/share/pdfops/tessdata`, or `PDFOPS_TESSDATA` if set. Installing
-  tesseract itself uses the system package manager; where that needs a password, the command to
-  run is returned instead.
-- **Limits.** A command may hold 4 GiB and run for 300 seconds by default; `--max-memory` (MiB) and
-  `--timeout` (seconds), or `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`, change that, and 0 lifts a
-  limit. Hitting one is an ordinary error. Rasters are capped at 64 megapixels.
-- **Damaged files** are read by a parser that repairs them, so `text`, `tables`, `render` and the
-  other reading commands work. Commands that write rebuild such a file from what that parser sees:
-  every object the catalog and the pages reach, with the page tree laid out afresh. The result then
-  carries `repaired_inputs`, and what could not be read is missing from the output, exactly as it
-  is from `text` and `render`. A damaged file that is also encrypted, or in which no page can be
-  read, is refused. Signing a rebuilt file rewrites it, so signatures it carried do not survive.
-- **Protected files stay protected.** Editing an encrypted file writes it back encrypted with the
-  same passwords and permissions. Only `decrypt` removes protection.
-- **Signing** appends to the file, so signatures already present stay valid. The signature is
-  invisible; combine it with `stamp --image` for a visible mark, stamping first. Keys are RSA or
-  ECDSA P-256, from PEM files or a PKCS #12 file. There is no timestamp authority and no long-term
-  validation data.
-- **Verifying** establishes two things: the signed bytes are unchanged, and the signature was made
-  by the embedded certificate's key. It does not decide whether that certificate is trustworthy;
-  pdfops has no list of certificate authorities. `covers_whole_document` is false when content was
-  appended after signing, as a later signature legitimately does.
-- **Any other change to a signed PDF invalidates its signatures**, as it must.
-- **Annotations** carry their own appearance, so they show in every viewer and in `render`.
-  `annotations` lists markup and links; form fields are listed by `forms`.
+The short version. `pdfops <command> --help` has the detail for each command.
+
+- **Any script.** Text that `stamp`, `fill`, `replace`, `create` and `ocr -o` draw is shaped and
+  embedded as font subsets; where no one font has every character, several share the text.
+  Hebrew and Arabic are laid out from the right and read back in the order they are read in, so
+  a word is found by typing it.
+- **Redaction removes, it does not cover.** Glyphs, image pixels in any encoding, drawings and
+  annotations under an area are deleted, a text to redact is also struck from metadata and
+  bookmarks, and the result is read back by a second interpreter before anything is written.
+- **Replace** writes in the document's own font where it has the glyphs and moves the rest of
+  the line along. Text does not move to another line: `--dry-run` shows `overflow_pt` first.
+- **Dry run.** `redact`, `replace`, `annotate` and `stamp` take `--dry-run`: all the work,
+  nothing written.
+- **Scan** reports scripts, actions, attachments, disguised content and hidden text by severity.
+  It is not a virus scanner and never calls a file safe. **Sanitize** removes the active content
+  and scans the result before writing it.
+- **Tables** with ruling lines are read cell by cell. Tables without are inferred from alignment
+  (`detected_by: alignment`) and deserve a look.
+- **OCR** is tesseract's. `ocr -o` writes the recognised text into a copy as an invisible layer.
+- **Signatures.** `sign` appends, so earlier signatures stay valid, and can show the signature
+  on a page with `--visible`. `signatures` checks that the bytes are unchanged and who signed;
+  with `--trust` it also checks the signer's chain against certificates you name. Any other
+  change to a signed PDF invalidates its signatures, as it must.
+- **Merging and page work** keep bookmarks and links that lead to pages in the output, and
+  rename the form fields of later inputs `doc2.<name>` so equal names do not share a value.
+- **Damaged files** are repaired for reading and rebuilt for writing; the result then carries
+  `repaired_inputs`. **Protected files stay protected** when edited; only `decrypt` removes it.
+- **Limits.** 4 GiB and 300 seconds per command by default: `--max-memory`, `--timeout`, or
+  `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`; 0 lifts a limit. Rasters are capped at 64 megapixels.
+- **Not there:** HTML or CSS in `create`, moving text between lines in `replace`, a timestamp
+  authority and revocation checks for signatures, editing text inside form fields and
+  annotations with `replace`.
 
 ## Development
 

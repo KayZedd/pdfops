@@ -1569,3 +1569,110 @@ fn redact_takes_the_text_out_of_metadata_and_bookmarks_too() {
     );
     assert!(v.get("beside_pages").is_none(), "{v}");
 }
+
+#[test]
+fn signatures_are_checked_against_certificates_the_caller_trusts() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 1);
+    let (cert, key, authority) = common::issued_identity(dir.path(), "Ada Signer");
+    let (stranger, _) = common::identity(dir.path(), "Somebody Else");
+    let signed = dir.path().join("signed.pdf");
+    call(
+        "pdf_sign",
+        json!({"input": pdf, "output": signed, "cert": cert, "key": key}),
+    );
+    // Nothing is said about trust unless certificates to trust are given.
+    let v = call("pdf_signatures", json!({"input": signed}));
+    assert!(v["details"][0].get("trusted").is_none(), "{v}");
+    assert!(
+        v["details"][0]["trust"]
+            .as_str()
+            .unwrap()
+            .starts_with("not checked")
+    );
+
+    // The authority that issued the signer's certificate, or that certificate itself.
+    for trust in [&authority, &cert] {
+        let v = call("pdf_signatures", json!({"input": signed, "trust": trust}));
+        let s = &v["details"][0];
+        assert_eq!(
+            (&s["valid"], &s["trusted"]),
+            (&json!(true), &json!(true)),
+            "{v}"
+        );
+    }
+    // Somebody else's certificate vouches for nothing; the signature is still intact.
+    let v = call(
+        "pdf_signatures",
+        json!({"input": signed, "trust": stranger}),
+    );
+    let s = &v["details"][0];
+    assert_eq!(
+        (&s["valid"], &s["trusted"]),
+        (&json!(true), &json!(false)),
+        "{v}"
+    );
+    assert!(
+        s["trust"]
+            .as_str()
+            .unwrap()
+            .contains("nothing leads from the certificate of Ada Signer"),
+        "{v}"
+    );
+    let e = call_err("pdf_signatures", json!({"input": signed, "trust": pdf}));
+    assert!(e.contains("is not a PEM certificate"), "{e}");
+}
+
+#[test]
+fn a_signature_can_be_shown_on_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 2);
+    let (cert, key) = common::identity(dir.path(), "Ada Signer");
+    let signed = dir.path().join("signed.pdf");
+    // A box in the lower half of page 2, 200 by 60 points.
+    call(
+        "pdf_sign",
+        json!({"input": pdf, "output": signed, "cert": cert, "key": key,
+               "reason": "Approved", "visible": "2:300,600,500,660"}),
+    );
+    let v = call("pdf_signatures", json!({"input": signed}));
+    assert_eq!(v["valid"], 1, "{v}");
+    // It is drawn there and nowhere else, and says who signed and why.
+    let rendered = call(
+        "pdf_render",
+        json!({"input": signed, "out_dir": dir.path().join("r"), "pages": "2", "dpi": 72}),
+    );
+    let page = image::open(rendered["files"][0]["file"].as_str().unwrap())
+        .unwrap()
+        .to_luma8();
+    let dark = |x0: u32, y0: u32, x1: u32, y1: u32| {
+        (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| page.get_pixel(x, y).0[0] < 140)
+            .count()
+    };
+    assert!(
+        dark(300, 600, 500, 660) > 150,
+        "{}",
+        dark(300, 600, 500, 660)
+    );
+    assert_eq!(dark(300, 500, 500, 595), 0);
+    let fields = lopdf::Document::load(&signed).unwrap();
+    let look = fields
+        .objects
+        .values()
+        .filter_map(|o| o.as_stream().ok())
+        .find(|s| s.dict.has(b"BBox"))
+        .unwrap();
+    let content = String::from_utf8_lossy(&look.content).into_owned();
+    assert!(
+        content.contains("(Digitally signed by Ada Signer) Tj")
+            && content.contains("(Approved) Tj"),
+        "{content}"
+    );
+    let e = call_err(
+        "pdf_sign",
+        json!({"input": pdf, "output": signed, "cert": cert, "key": key, "visible": "7:0,0,10,10"}),
+    );
+    assert!(e.contains("out of range"), "{e}");
+}

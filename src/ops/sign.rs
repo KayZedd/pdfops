@@ -14,7 +14,7 @@ use cms::content_info::ContentInfo;
 use cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
 use der::asn1::ObjectIdentifier;
 use der::{Decode, Encode};
-use lopdf::{Dictionary, Document, Object, StringFormat};
+use lopdf::{Dictionary, Document, Object, Stream, StringFormat};
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
 use rsa::signature::Verifier;
@@ -26,6 +26,9 @@ use x509_cert::Certificate;
 use x509_cert::spki::AlgorithmIdentifierOwned;
 
 use crate::doc;
+use crate::font::TextFont;
+use crate::ops::edit::visual_space;
+use crate::ops::redact::{apply, bounds, parse_rect};
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +59,9 @@ pub struct SignArgs {
     /// Signer's name (default: the certificate's common name)
     #[arg(long)]
     pub name: Option<String>,
+    /// Show the signature on a page, as a box with the signer's name, the date and the reason: "page:x0,y0,x1,y1" in the coordinates layout reports (default: the signature is not shown)
+    #[arg(long)]
+    pub visible: Option<String>,
 }
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
@@ -63,6 +69,9 @@ pub struct SignArgs {
 pub struct SignaturesArgs {
     /// PDF file to check
     pub input: PathBuf,
+    /// PEM file of certificates you trust, such as your organisation's root; each signer's chain is checked against them
+    #[arg(long)]
+    pub trust: Option<PathBuf>,
     /// Password, if the file is encrypted
     #[arg(long)]
     pub password: Option<String>,
@@ -79,6 +88,11 @@ const SIGNING_TIME: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113
 const RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
 const EC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
 const COMMON_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
+const RSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+const RSA_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
+const RSA_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
+const ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+const BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
 
 /// Room reserved in the file for the signature; the real one is padded to fit.
 const HOLE: usize = 16384;
@@ -267,6 +281,69 @@ fn civil(days: i64) -> (i64, u32, u32) {
     (year_of_era + era * 400 + i64::from(month <= 2), month, day)
 }
 
+/// Seconds since the Unix epoch as a date and time a person reads, in UTC.
+fn readable_date(seconds: u64) -> String {
+    let (year, month, day) = civil((seconds / 86_400) as i64);
+    let rest = seconds % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rest / 3600,
+        rest % 3600 / 60
+    )
+}
+
+/// What a signature that is shown looks like: a frame with lines of text in it, as
+/// large as fits the box, up to ten points.
+fn appearance(
+    d: &mut Document,
+    width: f64,
+    height: f64,
+    lines: &[String],
+) -> Result<lopdf::ObjectId> {
+    let font = TextFont::new(d, &lines.join("\n"), None)?;
+    let widest = lines
+        .iter()
+        .map(|line| font.width(line, 1.0))
+        .fold(0.001, f64::max);
+    let size = ((height - 6.0) / (lines.len() as f64 * 1.2))
+        .min((width - 8.0) / widest)
+        .clamp(1.0, 10.0);
+    let names: Vec<String> = (0..font.ids().len()).map(|k| format!("F{k}")).collect();
+    let mut fonts = Dictionary::new();
+    for (name, id) in names.iter().zip(font.ids()) {
+        fonts.set(name.as_str(), id);
+    }
+    let mut content = format!(
+        "q\n0.5 w\n0.45 G\n0.25 0.25 {:.2} {:.2} re\nS\nQ\nBT\n0 g\n",
+        width - 0.5,
+        height - 0.5
+    );
+    for (i, line) in lines.iter().enumerate() {
+        content += &format!(
+            "1 0 0 1 4 {:.2} Tm\n{}\n",
+            height - 3.0 - size * (0.9 + 1.2 * i as f64),
+            font.show_named(&names, line, size)
+        );
+    }
+    content += "ET\n";
+    let mut resources = Dictionary::new();
+    resources.set("Font", fonts);
+    let mut form = Dictionary::new();
+    form.set("Type", Object::Name(b"XObject".to_vec()));
+    form.set("Subtype", Object::Name(b"Form".to_vec()));
+    form.set(
+        "BBox",
+        vec![
+            0.into(),
+            0.into(),
+            Object::Real(width as f32),
+            Object::Real(height as f32),
+        ],
+    );
+    form.set("Resources", resources);
+    Ok(d.add_object(Stream::new(form, content.into_bytes())))
+}
+
 /// Seconds since the Unix epoch as a PDF date, in UTC.
 fn pdf_date(seconds: u64) -> String {
     let (year, month, day) = civil((seconds / 86_400) as i64);
@@ -320,8 +397,14 @@ fn add_signature(
     }
     let sig = target.add_object(sig);
 
-    let page = *doc::page_ids(source)
-        .first()
+    let pages = doc::page_ids(source);
+    let shown = a
+        .visible
+        .as_deref()
+        .map(|spec| parse_rect(spec, pages.len() as u32))
+        .transpose()?;
+    let page = *pages
+        .get(shown.map_or(0, |(n, _)| n as usize - 1))
         .ok_or_else(|| anyhow!("the document has no pages"))?;
     let catalog_id = doc::catalog_id(source)?;
     let catalog = source.get_dictionary(catalog_id)?;
@@ -338,7 +421,8 @@ fn add_signature(
         .cloned()
         .unwrap_or_default();
 
-    // The signature lives in a form field; an invisible one, on the first page.
+    // The signature lives in a form field: on the first page and without extent, or
+    // where it was asked to be shown.
     let mut field = Dictionary::new();
     field.set("Type", Object::Name(b"Annot".to_vec()));
     field.set("Subtype", Object::Name(b"Widget".to_vec()));
@@ -349,8 +433,38 @@ fn add_signature(
     );
     field.set("V", sig);
     field.set("P", page);
-    field.set("Rect", vec![Object::Integer(0); 4]);
-    // Hidden on screen, printed, and locked against changes.
+    match shown {
+        None => field.set("Rect", vec![Object::Integer(0); 4]),
+        Some((_, area)) => {
+            // Layout coordinates have their origin at the top-left; the field's are the page's own.
+            let (to_user, _, height) =
+                visual_space(doc::page_box(source, page), doc::rotation(source, page));
+            let rect = bounds(
+                [(area[0], area[1]), (area[2], area[3])]
+                    .map(|(x, y)| apply(to_user, x, height - y)),
+            );
+            let mut lines = vec![
+                format!(
+                    "Digitally signed by {}",
+                    signer.unwrap_or("the holder of the key")
+                ),
+                readable_date(now),
+            ];
+            lines.extend(
+                [a.reason.as_deref(), a.location.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string),
+            );
+            let look = appearance(target, rect[2] - rect[0], rect[3] - rect[1], &lines)?;
+            field.set("Rect", rect.map(|v| Object::Real(v as f32)).to_vec());
+            let mut states = Dictionary::new();
+            states.set("N", look);
+            field.set("AP", states);
+        }
+    }
+    // Printed, and locked against changes.
     field.set("F", 132);
     let field = target.add_object(field);
 
@@ -553,10 +667,130 @@ fn raw_signatures(file: &[u8]) -> Vec<([usize; 4], Vec<u8>)> {
     found
 }
 
+/// Whether the key of `issuer` made the signature on `cert`. `None` where the
+/// algorithm is not one that is checked.
+fn issued_by(cert: &Certificate, issuer: &Certificate) -> Option<bool> {
+    if cert.tbs_certificate.issuer != issuer.tbs_certificate.subject {
+        return Some(false);
+    }
+    let message = cert.tbs_certificate.to_der().ok()?;
+    let signature = cert.signature.raw_bytes();
+    let spki = issuer
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .ok()?;
+    let rsa_key = || rsa::RsaPublicKey::from_public_key_der(&spki).ok();
+    let rsa_signature = || rsa::pkcs1v15::Signature::try_from(signature).ok();
+    match cert.signature_algorithm.oid {
+        oid if oid == RSA_SHA256 => Some(
+            rsa::pkcs1v15::VerifyingKey::<Sha256>::new(rsa_key()?)
+                .verify(&message, &rsa_signature()?)
+                .is_ok(),
+        ),
+        oid if oid == RSA_SHA384 => Some(
+            rsa::pkcs1v15::VerifyingKey::<Sha384>::new(rsa_key()?)
+                .verify(&message, &rsa_signature()?)
+                .is_ok(),
+        ),
+        oid if oid == RSA_SHA512 => Some(
+            rsa::pkcs1v15::VerifyingKey::<Sha512>::new(rsa_key()?)
+                .verify(&message, &rsa_signature()?)
+                .is_ok(),
+        ),
+        oid if oid == ECDSA_SHA256 => {
+            let key = p256::ecdsa::VerifyingKey::from_public_key_der(&spki).ok()?;
+            let signature = p256::ecdsa::DerSignature::from_bytes(signature).ok()?;
+            Some(key.verify(&message, &signature).is_ok())
+        }
+        _ => None,
+    }
+}
+
+/// Whether a certificate says of itself that it may issue others.
+fn may_issue(cert: &Certificate) -> bool {
+    cert.tbs_certificate
+        .extensions
+        .iter()
+        .flatten()
+        .find(|extension| extension.extn_id == BASIC_CONSTRAINTS)
+        .and_then(|extension| {
+            x509_cert::ext::pkix::BasicConstraints::from_der(extension.extn_value.as_bytes()).ok()
+        })
+        .is_some_and(|constraints| constraints.ca)
+}
+
+/// Follows the signer's certificate up through the embedded ones to a trusted one.
+///
+/// Every certificate on the way must have been in date at `at`, seconds since 1970,
+/// and every one that issued another must be allowed to. Revocation is not looked up.
+fn chain_of_trust(
+    signer: &Certificate,
+    embedded: &[&Certificate],
+    trusted: &[Certificate],
+    at: u64,
+) -> Result<(), String> {
+    let name = |cert: &Certificate| {
+        common_name(&cert.tbs_certificate.subject)
+            .unwrap_or_else(|| cert.tbs_certificate.subject.to_string())
+    };
+    let in_date = |cert: &Certificate| {
+        let validity = &cert.tbs_certificate.validity;
+        (validity.not_before.to_unix_duration().as_secs()
+            ..=validity.not_after.to_unix_duration().as_secs())
+            .contains(&at)
+    };
+    let mut current = signer;
+    for _ in 0..12 {
+        if !in_date(current) {
+            return Err(format!(
+                "the certificate of {} was not in date when the document was signed",
+                name(current)
+            ));
+        }
+        if trusted.contains(current) {
+            return Ok(());
+        }
+        if let Some(root) = trusted
+            .iter()
+            .find(|root| issued_by(current, root) == Some(true))
+        {
+            return if in_date(root) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the trusted certificate of {} was not in date when the document was signed",
+                    name(root)
+                ))
+            };
+        }
+        let issuer = embedded.iter().find(|candidate| {
+            **candidate != current
+                && may_issue(candidate)
+                && issued_by(current, candidate) == Some(true)
+        });
+        match issuer {
+            Some(issuer) => current = issuer,
+            None => {
+                return Err(format!(
+                    "nothing leads from the certificate of {} to a trusted one",
+                    name(current)
+                ));
+            }
+        }
+    }
+    Err("the chain of certificates is too long".to_string())
+}
+
 /// Checks one signature against the file. Returns what was established.
-fn verify([a, b, c, len]: [usize; 4], contents: &[u8], file: &[u8]) -> Value {
+fn verify(
+    [a, b, c, len]: [usize; 4],
+    contents: &[u8],
+    file: &[u8],
+    trusted: Option<&[Certificate]>,
+) -> Value {
     let mut out = json!({
-        "trust": "not checked: pdfops has no list of trusted certificate authorities",
+        "trust": "not checked: give the certificates you trust to have the signer's chain checked against them",
     });
     let (Some(first), Some(second)) = (
         file.get(a..a.saturating_add(b)),
@@ -629,6 +863,35 @@ fn verify([a, b, c, len]: [usize; 4], contents: &[u8], file: &[u8]) -> Value {
     }
 
     let certificate = signer_certificate(&data, info);
+    if let Some((signer, trusted)) = certificate.zip(trusted) {
+        let embedded: Vec<&Certificate> = data
+            .certificates
+            .iter()
+            .flat_map(|set| set.0.iter())
+            .filter_map(|choice| match choice {
+                CertificateChoices::Certificate(cert) => Some(cert),
+                _ => None,
+            })
+            .collect();
+        // Judged at the time the signer states; without one, as of now.
+        let at = attribute(SIGNING_TIME)
+            .and_then(|v| v.decode_as::<der::asn1::UtcTime>().ok())
+            .map(|time| time.to_unix_duration().as_secs())
+            .or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|now| now.as_secs())
+            })
+            .unwrap_or(0);
+        let chain = chain_of_trust(signer, &embedded, trusted, at);
+        out["trusted"] = json!(chain.is_ok());
+        out["trust"] = json!(match chain {
+            Ok(()) => "the signer's certificate leads to one you trust; revocation is not checked"
+                .to_string(),
+            Err(why) => format!("not trusted: {why}"),
+        });
+    }
     if let Some(cert) = certificate {
         let tbs = &cert.tbs_certificate;
         out["certificate"] = json!({
@@ -713,10 +976,20 @@ pub fn signatures(a: SignaturesArgs) -> Result<Value> {
         .as_ref()
         .map(|(d, _)| signature_dicts(d))
         .unwrap_or_default();
+    let trusted = a
+        .trust
+        .as_ref()
+        .map(|path| {
+            let pem =
+                std::fs::read(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?;
+            Certificate::load_pem_chain(&pem)
+                .map_err(|e| anyhow!("{} is not a PEM certificate: {e}", path.display()))
+        })
+        .transpose()?;
     let found: Vec<Value> = raw_signatures(&file)
         .into_iter()
         .map(|(range, contents)| {
-            let mut entry = verify(range, &contents, &file);
+            let mut entry = verify(range, &contents, &file, trusted.as_deref());
             let own = parsed.as_ref().zip(stated.iter().find(|(_, sig)| {
                 sig.get(b"ByteRange")
                     .ok()

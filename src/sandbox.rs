@@ -12,8 +12,8 @@ use serde_json::Value;
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Argument names that hold file or directory paths, in any tool.
-pub const PATH_KEYS: [&str; 9] = [
-    "input", "inputs", "output", "out_dir", "image", "font", "cert", "key", "p12",
+pub const PATH_KEYS: [&str; 10] = [
+    "input", "inputs", "output", "out_dir", "image", "font", "cert", "key", "p12", "trust",
 ];
 
 /// Confines all later tool calls to `dir`, and resolves relative paths against it.
