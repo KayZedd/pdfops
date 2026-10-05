@@ -61,7 +61,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-  # Publishes the npm launcher, which downloads the binaries released above.
+  # Stages the npm launcher, which downloads the binaries released above.
   # Uses npm trusted publishing: the package on npmjs.com names this workflow as its
   # publisher, and GitHub's OIDC token stands in for a stored secret.
   npm:
@@ -83,4 +83,6 @@ jobs:
         run: |
           npm version --no-git-tag-version --allow-same-version "${GITHUB_REF_NAME#v}"
           cp ../README.md ../LICENSE .
-          npm publish --provenance --access public
+          # Staged, not published: the package's trusted publisher grants stage rights only,
+          # so a maintainer approves each version with 2FA (npm stage approve, or on npmjs.com).
+          npm stage publish . --provenance --access public
