@@ -1,5 +1,5 @@
 {
-  "name": "pdfops",
+  "name": "pdfops-cli",
   "version": "0.2.1",
   "description": "Fast PDF operations for AI agents: CLI and MCP server (text, tables, OCR, redaction, forms, stamps, merge, split)",
   "license": "MIT",

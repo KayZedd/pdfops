@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/KayZedd/pdfops/actions/workflows/ci.yml"><img src="https://github.com/KayZedd/pdfops/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://crates.io/crates/pdfops"><img src="https://img.shields.io/crates/v/pdfops.svg" alt="crates.io"></a>
-  <a href="https://www.npmjs.com/package/pdfops"><img src="https://img.shields.io/npm/v/pdfops.svg" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/pdfops-cli"><img src="https://img.shields.io/npm/v/pdfops-cli.svg" alt="npm"></a>
   <a href="https://github.com/KayZedd/pdfops/releases/latest"><img src="https://img.shields.io/github/v/release/KayZedd/pdfops.svg" alt="release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
@@ -40,12 +40,12 @@ As an MCP server, with nothing installed beforehand:
 ```json
 {
   "mcpServers": {
-    "pdfops": { "command": "npx", "args": ["-y", "pdfops", "mcp"] }
+    "pdfops": { "command": "npx", "args": ["-y", "pdfops-cli", "mcp"] }
   }
 }
 ```
 
-For Claude Code: `claude mcp add pdfops -- npx -y pdfops mcp`.
+For Claude Code: `claude mcp add pdfops -- npx -y pdfops-cli mcp`.
 
 Tools are named `pdf_info`, `pdf_text`, `pdf_redact` and so on, and take the same arguments as the
 CLI. Relative paths resolve against the server's working directory.
@@ -54,12 +54,12 @@ CLI. Relative paths resolve against the server's working directory.
 
 | Method | Command | Needs |
 | --- | --- | --- |
-| npm | `npm install -g pdfops` or `npx pdfops` | Node 18+ |
+| npm | `npm install -g pdfops-cli` or `npx pdfops-cli` | Node 18+ |
 | Prebuilt, via cargo | `cargo binstall pdfops` | [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) |
 | From source | `cargo install pdfops` | Rust 1.92+ |
 | Manual | [download an archive](https://github.com/KayZedd/pdfops/releases/latest) and put `pdfops` on your `PATH` | nothing |
 
-The npm package is a small launcher: on first run it downloads the binary for your platform from
+The npm package is called `pdfops-cli` and installs the `pdfops` command. It is a small launcher: on first run it downloads the binary for your platform from
 the GitHub release, checks it against the published SHA-256 sum and caches it. Prebuilt binaries
 cover Linux and macOS on x86-64 and ARM64, and Windows on x86-64.
 
