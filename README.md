@@ -1,33 +1,70 @@
-# pdfops
+<h1 align="center">pdfops</h1>
 
-Fast PDF operations for AI agents. A single Rust binary with no native PDF libraries to install, JSON in and out.
+<p align="center">
+  <b>Fast PDF tools for AI agents.</b><br>
+  One binary, 25 tools, JSON in and out. Works as a CLI, an MCP server and a Rust library.
+</p>
 
-- **CLI**: every command prints a single JSON document.
-- **MCP server**: `pdfops mcp` exposes every command as a tool over stdio.
-- **Function calling**: `pdfops tools` prints tool definitions with JSON Schemas.
-- **Library**: the same commands as Rust functions.
-
-## Install
-
-Download a prebuilt binary from the [latest release](https://github.com/KayZedd/pdfops/releases/latest)
-and put `pdfops` on your `PATH`. Archives are named by platform:
-
-| Platform | Archive |
-| --- | --- |
-| Linux x86-64 | `pdfops-<version>-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux ARM64 | `pdfops-<version>-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS Apple silicon | `pdfops-<version>-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `pdfops-<version>-x86_64-apple-darwin.tar.gz` |
-| Windows x86-64 | `pdfops-<version>-x86_64-pc-windows-msvc.zip` |
-
-Or install from [crates.io](https://crates.io/crates/pdfops) with Rust 1.92 or newer:
+<p align="center">
+  <a href="https://github.com/KayZedd/pdfops/actions/workflows/ci.yml"><img src="https://github.com/KayZedd/pdfops/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/pdfops"><img src="https://img.shields.io/crates/v/pdfops.svg" alt="crates.io"></a>
+  <a href="https://www.npmjs.com/package/pdfops"><img src="https://img.shields.io/npm/v/pdfops.svg" alt="npm"></a>
+  <a href="https://github.com/KayZedd/pdfops/releases/latest"><img src="https://img.shields.io/github/v/release/KayZedd/pdfops.svg" alt="release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+</p>
 
 ```sh
-cargo install pdfops
+$ pdfops tables invoice.pdf --format markdown        # tables as tables, not as a blob of text
+$ pdfops redact contract.pdf --text "Jan Kowalski" -o safe.pdf   # removed from the file, then verified
+$ pdfops text scan.pdf --ocr --ocr-lang pol+eng      # OCR only where there is no text layer
+$ pdfops stamp offer.pdf --image signature.png --x 380 --y 690 -o signed.pdf
 ```
 
-OCR additionally needs the `tesseract` program; nothing else does.
-Language data is fetched on request, without administrator rights:
+## Why pdfops
+
+- **Built for agents.** Every command returns one JSON document, errors say what to do next, and
+  text can be read under a character budget with a resume point.
+- **Everything in one place.** Reading, layout, tables, OCR, rendering, page surgery, stamping,
+  redaction, forms, encryption and creation: 25 tools behind one schema.
+- **Nothing to set up.** A single binary with no PDF libraries, no Python and no runtime. Only OCR
+  needs an extra program, and pdfops can fetch the language data itself.
+- **Fast.** Files open in milliseconds whatever their size, and page work runs on all cores. See the
+  [benchmarks](#benchmarks).
+- **Redaction you can trust.** Content is deleted from the page, not covered, and the result is
+  checked by a second interpreter before anything is written.
+
+## Quick start
+
+As an MCP server, with nothing installed beforehand:
+
+```json
+{
+  "mcpServers": {
+    "pdfops": { "command": "npx", "args": ["-y", "pdfops", "mcp"] }
+  }
+}
+```
+
+For Claude Code: `claude mcp add pdfops -- npx -y pdfops mcp`.
+
+Tools are named `pdf_info`, `pdf_text`, `pdf_redact` and so on, and take the same arguments as the
+CLI. Relative paths resolve against the server's working directory.
+
+### Install
+
+| Method | Command | Needs |
+| --- | --- | --- |
+| npm | `npm install -g pdfops` or `npx pdfops` | Node 18+ |
+| Prebuilt, via cargo | `cargo binstall pdfops` | [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) |
+| From source | `cargo install pdfops` | Rust 1.92+ |
+| Manual | [download an archive](https://github.com/KayZedd/pdfops/releases/latest) and put `pdfops` on your `PATH` | nothing |
+
+The npm package is a small launcher: on first run it downloads the binary for your platform from
+the GitHub release, checks it against the published SHA-256 sum and caches it. Prebuilt binaries
+cover Linux and macOS on x86-64 and ARM64, and Windows on x86-64.
+
+OCR additionally needs the `tesseract` program; nothing else does. Language data is fetched on
+request, without administrator rights:
 
 ```sh
 pdfops ocr-langs                     # is tesseract there, which languages can be used
@@ -35,36 +72,39 @@ pdfops ocr-install --lang pol+eng    # download language data into the user's da
 pdfops ocr-install --engine          # install tesseract itself where that needs no password
 ```
 
-## Commands
+## Tools
 
-| Command | What it does |
-| --- | --- |
-| `info` | Page count, page size, metadata, encryption, outline and form summary |
-| `text` | Extract text page by page, with a character budget and optional OCR fallback |
-| `search` | Find text or a regex, returns pages and snippets |
-| `layout` | Text with positions: bounding box, font and size of every line or word |
-| `tables` | Tables as rows of cells, Markdown or CSV |
-| `ocr` | Recognise text on scanned pages |
-| `ocr-langs` / `ocr-install` | Check the OCR setup, download language data, install tesseract |
-| `outline` | Bookmarks with target pages |
-| `render` | Pages to PNG, for charts and layout |
-| `images` | Extract the images drawn on pages |
-| `create` | New PDF from Markdown |
-| `merge` | Concatenate PDFs |
-| `pages` | Keep, reorder, duplicate or delete pages |
-| `split` | Split by page count or by ranges |
-| `rotate` | Rotate pages by multiples of 90 degrees |
-| `stamp` | Text watermark, header, footer or page numbers; an image such as a signature; a QR code |
-| `redact` | Remove text, images and drawings in given areas or matching given text, then verify |
-| `replace` | Replace text in place, in the document's own font where possible |
-| `set-meta` | Set title, author, subject, keywords, creator |
-| `compress` | Shrink: lossless by default, optionally re-encoding and downscaling images |
-| `encrypt` / `decrypt` | AES-256 passwords and permissions |
-| `forms` / `fill` | List and fill form fields |
+| | Command | What it does |
+| --- | --- | --- |
+| **Read** | `info` | Page count, page size, metadata, encryption, outline and form summary |
+| | `text` | Text page by page, with a character budget and optional OCR fallback |
+| | `search` | Find text or a regex, returns pages and snippets |
+| | `layout` | Bounding box, font and size of every line or word |
+| | `tables` | Tables as rows of cells, Markdown or CSV |
+| | `outline` | Bookmarks with target pages |
+| | `render` | Pages to PNG, to look at charts, scans and layout |
+| | `images` | The images drawn on pages, as files |
+| | `ocr` | Recognised text of scanned pages |
+| **Build** | `create` | A new PDF from Markdown |
+| | `merge` | Several PDFs into one |
+| | `pages` | Keep, reorder, duplicate or delete pages |
+| | `split` | Split by page count or by ranges |
+| **Edit** | `rotate` | Rotate pages by multiples of 90 degrees |
+| | `stamp` | Watermark, header, footer, page numbers, an image such as a signature, or a QR code |
+| | `replace` | Replace text in place, in the document's own font where possible |
+| | `redact` | Remove text, images and drawings in areas or matching text, then verify |
+| | `set-meta` | Title, author, subject, keywords, creator |
+| | `compress` | Shrink: lossless by default, optionally re-encoding and downscaling images |
+| **Forms** | `forms` | Fields with their types, values and options |
+| | `fill` | Fill fields by name |
+| **Protect** | `encrypt` | AES-256 passwords and permissions |
+| | `decrypt` | Remove password protection |
+| **Setup** | `ocr-langs` | Whether tesseract is installed and which languages are usable |
+| | `ocr-install` | Download OCR language data, optionally install tesseract |
 
 Run `pdfops <command> --help` for the options of each.
 
-## Usage
+## Examples
 
 ```sh
 $ pdfops info manual.pdf
@@ -77,61 +117,131 @@ $ pdfops search manual.pdf "calling convention" --max-results 1 --context 40
 {"file":"manual.pdf","matches":[{"match":"Calling Convention","page":12,
  "snippet":"... 10.5.1 The Pascal Calling Convention ..."}],"query":"calling convention",
  "total_matches":17,"unreadable_pages":[]}
-
-$ pdfops text manual.pdf --pages 12- --max-chars 4000     # resume_at_page says where to continue
-$ pdfops text scan.pdf --ocr --ocr-lang pol+eng           # OCR only the pages that have no text
-$ pdfops render report.pdf --pages 1-3 --dpi 150 -o out/  # look at charts and layout
-$ pdfops images report.pdf -o images/
-$ pdfops pages in.pdf --keep "3,1,5-" -o out.pdf
-$ pdfops split in.pdf --every 10 -o parts/
-$ pdfops merge a.pdf b.pdf -o merged.pdf
-$ pdfops tables report.pdf --pages 4 --format markdown
-$ pdfops layout report.pdf --pages 4 --level words         # bbox, font and size per word
-$ pdfops stamp in.pdf --text "Poufne · {page}/{pages}" --position footer -o out.pdf
-$ pdfops stamp in.pdf --image signature.png --x 380 --y 690 --width 140 --pages last -o out.pdf
-$ pdfops stamp in.pdf --qr "https://example.com/doc/42" --anchor bottom-right -o out.pdf
-$ pdfops redact in.pdf --text "Jan Kowalski" --text "\d{11}" --regex -o redacted.pdf
-$ pdfops redact in.pdf --rect "2:100,200,300,220" -o redacted.pdf
-$ pdfops replace in.pdf --find "2025" --with "2026" -o out.pdf
-$ pdfops create notes.md -o notes.pdf
-$ pdfops compress in.pdf --max-image-edge 1600 --image-quality 70 -o small.pdf
-$ pdfops forms form.pdf
-$ pdfops fill form.pdf --set name="Ada Lovelace" --set agree=true -o filled.pdf
-$ pdfops encrypt in.pdf --owner-password secret --deny-copy -o locked.pdf
 ```
 
-Positions are in points with the origin at the top-left corner of the page as displayed, y growing
-downwards. `layout` reports them, `stamp --x/--y` and `redact --rect` accept them, and a pixel of
-`render --dpi 72` is exactly one point.
+Reading:
 
-Page specs are 1-based and comma separated: `3`, `2-5`, `7-` (to the end), `-4` (from the start),
-`5-2` (descending), `last`, `odd`, `even`, `all`.
-
-Commands that write a file take `-o`; it may be the input file, since output goes through a
-temporary file. Errors are printed to stderr as `{"error": "..."}` with exit status 1. Add
-`--pretty` to indent the JSON.
-
-## MCP server
-
-```json
-{
-  "mcpServers": {
-    "pdfops": { "command": "pdfops", "args": ["mcp"] }
-  }
-}
+```sh
+pdfops text manual.pdf --pages 12- --max-chars 4000     # resume_at_page says where to continue
+pdfops text scan.pdf --ocr --ocr-lang pol+eng           # OCR only the pages that have no text
+pdfops tables report.pdf --pages 4 --format markdown
+pdfops layout report.pdf --pages 4 --level words        # bbox, font and size per word
+pdfops render report.pdf --pages 1-3 --dpi 150 -o out/  # look at charts and layout
+pdfops images report.pdf -o images/
 ```
 
-For Claude Code: `claude mcp add pdfops -- pdfops mcp`.
+Building and page work:
 
-Tools are named `pdf_info`, `pdf_text`, `pdf_set_meta` and so on, and take the same arguments as
-the CLI. Relative paths resolve against the server's working directory.
+```sh
+pdfops create notes.md -o notes.pdf
+pdfops merge a.pdf b.pdf -o merged.pdf
+pdfops pages in.pdf --keep "3,1,5-" -o out.pdf
+pdfops split in.pdf --every 10 -o parts/
+```
 
-## Function calling without MCP
+Editing:
+
+```sh
+pdfops stamp in.pdf --text "Poufne · {page}/{pages}" --position footer -o out.pdf
+pdfops stamp in.pdf --image signature.png --x 380 --y 690 --width 140 --pages last -o out.pdf
+pdfops stamp in.pdf --qr "https://example.com/doc/42" --anchor bottom-right -o out.pdf
+pdfops redact in.pdf --text "Jan Kowalski" --text "\d{11}" --regex -o redacted.pdf
+pdfops redact in.pdf --rect "2:100,200,300,220" -o redacted.pdf
+pdfops replace in.pdf --find "2025" --with "2026" -o out.pdf
+pdfops compress in.pdf --max-image-edge 1600 --image-quality 70 -o small.pdf
+```
+
+Forms and protection:
+
+```sh
+pdfops forms form.pdf
+pdfops fill form.pdf --set name="Ada Lovelace" --set agree=true -o filled.pdf
+pdfops encrypt in.pdf --owner-password secret --deny-copy -o locked.pdf
+```
+
+### Conventions
+
+- **Output.** Every command prints one JSON document on stdout. Errors go to stderr as
+  `{"error": "..."}` with exit status 1. Add `--pretty` to indent.
+- **Writing.** Commands that write take `-o`. It may be the input file: output goes through a
+  temporary file.
+- **Pages** are 1-based and comma separated: `3`, `2-5`, `7-` (to the end), `-4` (from the start),
+  `5-2` (descending), `last`, `odd`, `even`, `all`.
+- **Positions** are in points with the origin at the top-left corner of the page as displayed, y
+  growing downwards. `layout` reports them, `stamp --x/--y` and `redact --rect` accept them, and a
+  pixel of `render --dpi 72` is exactly one point.
+
+## How it compares
+
+| | pdfops | PyMuPDF | pypdf | pdfplumber | qpdf | poppler-utils |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: |
+| Text extraction | ✓ | ✓ | ✓ | ✓ | – | ✓ |
+| Word positions and fonts | ✓ | ✓ | – | ✓ | – | positions |
+| Tables | ✓ | ✓ | – | ✓ | – | – |
+| Render pages | ✓ | ✓ | – | ✓ | – | ✓ |
+| OCR | ✓ | ✓ | – | – | – | – |
+| Merge, split, reorder, rotate | ✓ | ✓ | ✓ | – | ✓ | partly |
+| Text, image and QR stamps | ✓ | ✓ | by overlay | – | by overlay | – |
+| Redaction that removes content | ✓ | ✓ | – | – | – | – |
+| Redaction verified before writing | ✓ | – | – | – | – | – |
+| Replace text in place | ✓ | – | – | – | – | – |
+| Fill forms | ✓ | ✓ | ✓ | – | – | – |
+| Encrypt and decrypt | ✓ | ✓ | ✓ | – | ✓ | – |
+| Create from Markdown | ✓ | from HTML | – | – | – | – |
+| Built-in MCP server and tool schemas | ✓ | – | – | – | – | – |
+| JSON from every command | ✓ | library | library | library | partly | – |
+| Runtime needed | none | Python | Python | Python | none | none |
+| License | MIT | AGPL or commercial | BSD | MIT | Apache-2.0 | GPL |
+
+PyMuPDF is the closest in scope and is an excellent library; it is written in C, needs Python, and
+its AGPL license matters if you ship it. pdfops trades some breadth for a single MIT-licensed
+binary whose tools an agent can call directly.
+
+## Benchmarks
+
+Best of 3 whole-process runs, start-up included, since that is what one tool call costs an agent.
+Document: a 357 page, 1.4 MB manual; `images` on a 4.6 MB manual with pictures; forms on a one page
+form. Machine: 4 core Intel i5-4460. Versions: poppler 26.08, qpdf 12.4, PyMuPDF 1.28, pypdf 6.19,
+pdfplumber 0.11, tesseract 5.5. The fastest entry of each row is bold.
+
+| Task | pdfops | command line tool | PyMuPDF | pypdf | pdfplumber |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `info` | **5 ms** | `pdfinfo` 13 ms | 211 ms | 454 ms | 371 ms |
+| `text`, all pages | **483 ms** | `pdftotext` 541 ms | 641 ms | 4146 ms | 34.5 s |
+| `search`, all pages | **430 ms** | - | 627 ms | - | - |
+| `layout`, every word with its box | **548 ms** | - | 758 ms | - | 33.0 s |
+| `tables`, 50 pages | **52 ms** | - | 4422 ms | - | 4133 ms |
+| `outline` | **20 ms** | - | 201 ms | 353 ms | - |
+| `render`, 20 pages at 150 dpi | **195 ms** | `pdftoppm` 5962 ms | 1229 ms | - | - |
+| `ocr`, one page (render, then tesseract) | 2338 ms | `tesseract` **1511 ms** | - | - | - |
+| `images`, all embedded images | **391 ms** | `pdfimages` 3897 ms | 675 ms | 5232 ms | - |
+| `create`, 100 sections of Markdown | **10 ms** | - | - | - | - |
+| `merge`, three copies | **123 ms** | `qpdf` 254 ms | 1183 ms | 3825 ms | - |
+| `pages`, keep 10 | **21 ms** | `qpdf` 122 ms | 204 ms | 419 ms | - |
+| `split`, one file per page | **54 ms** | `pdfseparate` over 60 s | 877 ms | 2492 ms | - |
+| `rotate`, all pages | **47 ms** | `qpdf` 152 ms | 252 ms | 1309 ms | - |
+| `stamp`, text on every page | **33 ms** | - | 610 ms | - | - |
+| `stamp`, QR code on every page | **180 ms** | - | - | - | - |
+| `redact`, a word on every page | 2144 ms | - | **1532 ms** | - | - |
+| `replace`, a word on every page | **1736 ms** | - | - | - | - |
+| `set-meta` | **60 ms** | - | 269 ms | 1416 ms | - |
+| `compress` | **65 ms** | `qpdf` 274 ms | 1109 ms | - | - |
+| `encrypt`, AES-256 | **49 ms** | `qpdf` 160 ms | 253 ms | 1715 ms | - |
+| `decrypt` | **76 ms** | `qpdf` 178 ms | 397 ms | 2418 ms | - |
+| `forms`, list fields | **15 ms** | - | 391 ms | 236 ms | - |
+| `fill`, one field | **7 ms** | - | 509 ms | 433 ms | - |
+
+Reproduce with `scripts/bench.py` on any document.
+
+Why it is fast: `info`, `layout`, `tables`, `render`, `images` and `ocr` read objects on demand, so
+opening a file costs a few milliseconds whatever its size. Text extraction, layout, tables,
+rendering, splitting, image export and OCR run on all cores. Page operations copy only the objects
+the selected pages reach, so output size and time follow the selection, not the source.
+
+## Using it without MCP
 
 `pdfops tools` prints `[{"name", "description", "inputSchema"}]` for every command. Pass these to
 any function calling API, then run the call through the CLI or the library.
-
-## Library
 
 ```rust
 let result = pdfops::tools::call(
@@ -142,28 +252,10 @@ let result = pdfops::tools::call(
 
 Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(TextArgs { .. })`.
 
-## Performance
-
-Best of 5 runs on a 357 page, 1.4 MB manual, 4 core Intel i5-4460, against poppler 26 and qpdf 12:
-
-| Task | pdfops | Reference tool |
-| --- | ---: | ---: |
-| Info | 7 ms | `pdfinfo` 16 ms |
-| Text, all pages | 466 ms | `pdftotext` 565 ms |
-| Keep 10 pages | 32 ms | `qpdf` 164 ms |
-| Split into single pages | 64 ms | `pdfseparate` over 40 s |
-| Merge three copies | 164 ms | `qpdf` 314 ms |
-| Render 20 pages at 150 dpi | 214 ms | `pdftoppm` 6125 ms |
-
-`info`, `render`, `images` and `ocr` read objects on demand, so opening a file costs a few
-milliseconds whatever its size. Text extraction, rendering, splitting, image export and OCR run on
-all cores. Page operations copy only the objects the selected pages reach, so output size and time
-follow the selection, not the source.
-
 ## Behaviour worth knowing
 
-- **Text outside Latin-1.** `stamp`, `fill`, `replace` and `create` embed a subset of a font that has the glyphs: the one
-  given with `stamp --font`, otherwise one found on the system. Latin-1 text uses the built-in
+- **Text outside Latin-1.** `stamp`, `fill`, `replace` and `create` embed a subset of a font that
+  has the glyphs: the one given with `stamp --font`, otherwise one found on the system. Latin-1 text uses the built-in
   Helvetica and embeds nothing. Text is placed glyph by glyph: scripts that need shaping or
   right-to-left layout (Arabic, Hebrew, Indic) will not come out right.
 - **Redaction** deletes what is under the areas from the page content: glyphs, image pixels
@@ -207,6 +299,7 @@ cargo test                                # under a second; fixtures are generat
 cargo test -- --ignored                   # OCR test, needs tesseract with a language pack
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+scripts/bench.py --help                   # regenerate the benchmark table
 ```
 
 Built on [lopdf](https://github.com/J-F-Liu/lopdf) (object model),

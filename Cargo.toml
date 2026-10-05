@@ -1,14 +1,24 @@
 [package]
 name = "pdfops"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.92"
 description = "Fast PDF operations with JSON output for AI agents: CLI, MCP server and library"
 license = "MIT"
 repository = "https://github.com/KayZedd/pdfops"
 readme = "README.md"
+exclude = ["npm/", "scripts/", ".github/"]
 keywords = ["pdf", "mcp", "agent", "cli"]
 categories = ["command-line-utilities", "text-processing"]
+
+# Lets `cargo binstall pdfops` fetch the release archives instead of compiling.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [dependencies]
 anyhow = "1.0.104"

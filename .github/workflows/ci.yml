@@ -21,6 +21,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The npm launcher must pass arguments, output and the exit status through.
+      - name: npm launcher
+        shell: bash
+        run: |
+          bin="$PWD/target/debug/pdfops"
+          [ "$RUNNER_OS" = "Windows" ] && bin="$bin.exe"
+          test "$(PDFOPS_BINARY="$bin" node npm/bin/pdfops.js --version)" = "$("$bin" --version)"
+          ! PDFOPS_BINARY="$bin" node npm/bin/pdfops.js info missing.pdf
       # The OCR test drives tesseract; the font test needs a font with non-Latin glyphs.
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-eng fonts-dejavu-core

@@ -60,3 +60,24 @@ jobs:
       - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes pdfops-* SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
+
+  # Publishes the npm launcher, which downloads the binaries released above.
+  # Skipped until an NPM_TOKEN secret is configured.
+  npm:
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Publish
+        if: env.NODE_AUTH_TOKEN != ''
+        working-directory: npm
+        run: |
+          npm version --no-git-tag-version --allow-same-version "${GITHUB_REF_NAME#v}"
+          cp ../README.md ../LICENSE .
+          npm publish --access public

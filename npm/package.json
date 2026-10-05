@@ -1,0 +1,19 @@
+{
+  "name": "pdfops",
+  "version": "0.2.1",
+  "description": "Fast PDF operations for AI agents: CLI and MCP server (text, tables, OCR, redaction, forms, stamps, merge, split)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KayZedd/pdfops.git"
+  },
+  "homepage": "https://github.com/KayZedd/pdfops",
+  "keywords": ["pdf", "mcp", "mcp-server", "ai-agents", "ocr", "redaction", "cli"],
+  "bin": {
+    "pdfops": "bin/pdfops.js"
+  },
+  "files": ["bin"],
+  "engines": {
+    "node": ">=18"
+  }
+}
