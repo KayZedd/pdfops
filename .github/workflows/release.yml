@@ -16,6 +16,9 @@ jobs:
           # The oldest Ubuntu image, so the binaries run against older glibc versions too.
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          # Static builds for Alpine and other systems without glibc.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-musl }
           - { os: macos-latest, target: aarch64-apple-darwin }
           - { os: macos-latest, target: x86_64-apple-darwin }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
@@ -28,6 +31,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
         shell: bash
@@ -60,6 +65,57 @@ jobs:
       - run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes pdfops-* SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
+
+  # Publishes the crate through crates.io trusted publishing: no stored token.
+  crates:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # Builds the container image on each architecture natively, then joins the two under one name.
+  image:
+    needs: release
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-22.04, arch: amd64 }
+          - { os: ubuntu-22.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - run: |
+          image="ghcr.io/kayzedd/pdfops:${GITHUB_REF_NAME#v}-${{ matrix.arch }}"
+          docker build -t "$image" .
+          docker run --rm "$image" --version
+          docker push "$image"
+
+  manifest:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - run: |
+          name="ghcr.io/kayzedd/pdfops"
+          version="${GITHUB_REF_NAME#v}"
+          for tag in "$version" latest; do
+            docker buildx imagetools create -t "$name:$tag" "$name:$version-amd64" "$name:$version-arm64"
+          done
 
   # Stages the npm launcher, which downloads the binaries released above.
   # Uses npm trusted publishing: the package on npmjs.com names this workflow as its

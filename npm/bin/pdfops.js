@@ -39,8 +39,16 @@ async function download(url) {
   return Buffer.from(await response.arrayBuffer());
 }
 
+// Alpine and similar systems use musl instead of glibc and need the static build.
+function usesMusl() {
+  if (process.platform !== 'linux') return false;
+  const report = process.report && process.report.getReport();
+  return !(report && report.header && report.header.glibcVersionRuntime);
+}
+
 async function install(binary) {
-  const target = TARGETS[`${process.platform}-${process.arch}`];
+  let target = TARGETS[`${process.platform}-${process.arch}`];
+  if (target && usesMusl()) target = target.replace('-gnu', '-musl');
   if (!target) {
     fail(`no prebuilt binary for ${process.platform}-${process.arch}; install with "cargo install pdfops"`);
   }
