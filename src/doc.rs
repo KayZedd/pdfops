@@ -621,24 +621,26 @@ pub struct OutlineItem {
     pub title: String,
     /// The page the bookmark jumps to, if it has a resolvable target.
     pub page: Option<ObjectId>,
+    /// Where on that page it lands: what follows the page in the destination, such as
+    /// `/XYZ left top zoom`. Empty when there is no target.
+    pub view: Vec<Object>,
 }
 
-/// The page a destination (an array, or a dictionary wrapping one) points at.
-fn destination_page(doc: &Document, dest: &Object) -> Option<ObjectId> {
-    match resolve(doc, dest) {
-        Object::Array(a) => a.first()?.as_reference().ok(),
-        Object::Dictionary(d) => resolve(doc, d.get(b"D").ok()?)
-            .as_array()
-            .ok()?
-            .first()?
-            .as_reference()
-            .ok(),
-        _ => None,
-    }
+/// A destination (an array, or a dictionary wrapping one) as its page and the view of it.
+fn destination(doc: &Document, dest: &Object) -> Option<(ObjectId, Vec<Object>)> {
+    let array = match resolve(doc, dest) {
+        Object::Array(a) => a,
+        Object::Dictionary(d) => resolve(doc, d.get(b"D").ok()?).as_array().ok()?,
+        _ => return None,
+    };
+    let page = array.first()?.as_reference().ok()?;
+    let view = array[1..].iter().map(|o| resolve(doc, o).clone()).collect();
+    Some((page, view))
 }
 
-/// Named destinations from the catalog's /Dests dictionary and /Names tree.
-fn named_destinations(doc: &Document) -> HashMap<Vec<u8>, ObjectId> {
+/// Named destinations from the catalog's /Dests dictionary and /Names tree: for each
+/// name, the page and the view of it.
+pub fn named_destinations(doc: &Document) -> HashMap<Vec<u8>, (ObjectId, Vec<Object>)> {
     let mut map = HashMap::new();
     let Ok(catalog) = doc.catalog() else {
         return map;
@@ -652,7 +654,7 @@ fn named_destinations(doc: &Document) -> HashMap<Vec<u8>, ObjectId> {
     };
     if let Some(dests) = dict(catalog, b"Dests") {
         for (name, dest) in dests.iter() {
-            map.extend(destination_page(doc, dest).map(|page| (name.clone(), page)));
+            map.extend(destination(doc, dest).map(|to| (name.clone(), to)));
         }
     }
     let mut open: Vec<Dictionary> = dict(catalog, b"Names")
@@ -672,11 +674,10 @@ fn named_destinations(doc: &Document) -> HashMap<Vec<u8>, ObjectId> {
             .into_iter()
             .flatten()
         {
-            if let (Ok(name), Some(page)) = (
-                resolve(doc, &pair[0]).as_str(),
-                destination_page(doc, &pair[1]),
-            ) {
-                map.insert(name.to_vec(), page);
+            if let (Ok(name), Some(to)) =
+                (resolve(doc, &pair[0]).as_str(), destination(doc, &pair[1]))
+            {
+                map.insert(name.to_vec(), to);
             }
         }
         for kid in array(b"Kids").into_iter().flatten() {
@@ -705,7 +706,7 @@ pub fn outline(doc: &Document) -> Vec<OutlineItem> {
         .into_iter()
         .collect();
     let mut seen = HashSet::new();
-    let mut named: Option<HashMap<Vec<u8>, ObjectId>> = None;
+    let mut named = None;
     while let Some((id, level)) = open.pop() {
         // `seen` guards against cyclic First/Next links.
         let Ok(item) = doc.get_dictionary(id) else {
@@ -722,19 +723,25 @@ pub fn outline(doc: &Document) -> Vec<OutlineItem> {
             let action = resolve(doc, item.get(b"A").ok()?).as_dict().ok()?;
             (action.get(b"S").ok()?.as_name().ok()? == b"GoTo").then(|| action.get(b"D").ok())?
         });
-        let page = target.and_then(|t| match resolve(doc, t) {
+        let to = target.and_then(|t| match resolve(doc, t) {
             Object::Name(name) | Object::String(name, _) => named
                 .get_or_insert_with(|| named_destinations(doc))
                 .get(name)
-                .copied(),
-            other => destination_page(doc, other),
+                .cloned(),
+            other => destination(doc, other),
         });
+        let (page, view) = to.map_or((None, Vec::new()), |(page, view)| (Some(page), view));
         let title = item
             .get(b"Title")
             .ok()
             .and_then(|t| text(resolve(doc, t)))
             .unwrap_or_default();
-        items.push(OutlineItem { level, title, page });
+        items.push(OutlineItem {
+            level,
+            title,
+            page,
+            view,
+        });
     }
     items
 }

@@ -1079,6 +1079,117 @@ fn compress_can_downscale_and_reencode_images() {
 }
 
 #[test]
+fn bookmarks_and_named_links_land_where_they_did() {
+    use lopdf::{Object, dictionary};
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 3);
+    let mut doc = lopdf::Document::load(&pdf).unwrap();
+    let pages: Vec<_> = doc.get_pages().into_values().collect();
+    // The bookmark goes to a height on page 2, not just to the page.
+    let catalog = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+    let outlines = doc
+        .get_dictionary(catalog)
+        .unwrap()
+        .get(b"Outlines")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let item = doc
+        .get_dictionary(outlines)
+        .unwrap()
+        .get(b"First")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    doc.get_dictionary_mut(item).unwrap().set(
+        "Dest",
+        vec![Object::Reference(pages[1]), "FitH".into(), 500.into()],
+    );
+    // Two links on page 1 go to places that have names: one named in the old way, in
+    // the catalog's own dictionary, the other in the name tree and through an action.
+    let tree = doc.add_object(dictionary! {
+        "Names" => vec![
+            Object::string_literal("figure"),
+            vec![Object::Reference(pages[1]), "XYZ".into(), 30.into(), 400.into(), Object::Null].into(),
+        ],
+    });
+    let catalog = doc.get_dictionary_mut(catalog).unwrap();
+    catalog.set(
+        "Dests",
+        dictionary! {
+            "chapter" => dictionary! {
+                "D" => vec![Object::Reference(pages[2]), "XYZ".into(), 10.into(), 700.into(), Object::Null],
+            },
+        },
+    );
+    catalog.set("Names", dictionary! { "Dests" => tree });
+    let by_name = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Link",
+        "Rect" => vec![72.into(), 700.into(), 172.into(), 720.into()],
+        "Dest" => "chapter",
+    });
+    let by_action = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Link",
+        "Rect" => vec![72.into(), 600.into(), 172.into(), 620.into()],
+        "A" => dictionary! { "S" => "GoTo", "D" => Object::string_literal("figure") },
+    });
+    doc.get_dictionary_mut(pages[0]).unwrap().set(
+        "Annots",
+        vec![Object::Reference(by_name), Object::Reference(by_action)],
+    );
+    doc.save(&pdf).unwrap();
+
+    // Pages reordered, in a merge with another file that uses the same name.
+    let reordered = dir.path().join("reordered.pdf");
+    call(
+        "pdf_pages",
+        json!({"input": pdf, "keep": "3,1,2", "output": reordered}),
+    );
+    let merged = dir.path().join("merged.pdf");
+    call(
+        "pdf_merge",
+        json!({"inputs": [sample(dir.path(), "b.pdf", 2), reordered], "output": merged}),
+    );
+    let v = call("pdf_outline", json!({"input": merged}));
+    let titles: Vec<(&str, u64)> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| (o["title"].as_str().unwrap(), o["page"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(titles, [("Second chapter", 2), ("Second chapter", 5)]);
+    // The links still lead to their pages, now given outright.
+    let v = call("pdf_annotations", json!({"input": merged}));
+    let targets: Vec<u64> = v["annotations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["target_page"].as_u64().unwrap())
+        .collect();
+    assert_eq!(targets, [3, 5], "{v}");
+    let out = lopdf::Document::load(&merged).unwrap();
+    let views: Vec<Vec<Object>> = out
+        .objects
+        .values()
+        .filter_map(|o| o.as_dict().ok())
+        .filter_map(|d| {
+            let to = d
+                .get(b"Dest")
+                .ok()
+                .or_else(|| d.get(b"A").ok()?.as_dict().ok()?.get(b"D").ok())?;
+            Some(to.as_array().ok()?[1..].to_vec())
+        })
+        .collect();
+    for view in [
+        vec!["FitH".into(), 500.into()],
+        vec!["XYZ".into(), 10.into(), 700.into(), Object::Null],
+        vec!["XYZ".into(), 30.into(), 400.into(), Object::Null],
+    ] {
+        assert!(views.contains(&view), "{view:?} not in {views:?}");
+    }
+}
+
+#[test]
 fn recognised_words_become_an_invisible_text_layer() {
     use pdfops::ops::ocr::{add_text_layer, parse_tsv};
     let dir = tempfile::tempdir().unwrap();

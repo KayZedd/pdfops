@@ -74,7 +74,12 @@ pub struct Source<'a> {
     /// The source's bookmarks, read once by the caller: a split builds many
     /// documents from the same source.
     pub outline: &'a [doc::OutlineItem],
+    /// The source's named destinations, which its links may go by, read once likewise.
+    pub named: &'a Destinations,
 }
+
+/// Named destinations: for each name, the page and the view of it.
+pub type Destinations = HashMap<Vec<u8>, (ObjectId, Vec<Object>)>;
 
 /// Copies the object graph reachable from selected pages into another document.
 struct Copier<'a> {
@@ -83,6 +88,7 @@ struct Copier<'a> {
     all_pages: HashSet<ObjectId>,
     map: HashMap<ObjectId, ObjectId>,
     queue: Vec<ObjectId>,
+    named: &'a Destinations,
 }
 
 impl Copier<'_> {
@@ -103,12 +109,34 @@ impl Copier<'_> {
                 }
             }
             Object::Array(items) => items.iter_mut().for_each(|o| self.rewrite(o, out)),
-            Object::Dictionary(dict) => dict.iter_mut().for_each(|(_, o)| self.rewrite(o, out)),
+            Object::Dictionary(dict) => {
+                self.spell_out_destination(dict);
+                dict.iter_mut().for_each(|(_, o)| self.rewrite(o, out))
+            }
             Object::Stream(stream) => stream
                 .dict
                 .iter_mut()
                 .for_each(|(_, o)| self.rewrite(o, out)),
             _ => {}
+        }
+    }
+
+    /// Replaces a destination given by name, in a link or in an action that goes to
+    /// one, by the page and view the name stands for. The names live in the source's
+    /// catalog, which is not copied, and two sources may use one name differently.
+    fn spell_out_destination(&self, dict: &mut Dictionary) {
+        let goes_to = dict
+            .get(b"S")
+            .is_ok_and(|s| s.as_name().ok() == Some(b"GoTo"));
+        let key: &[u8] = if goes_to { b"D" } else { b"Dest" };
+        let name = match dict.get(key) {
+            Ok(Object::Name(name)) | Ok(Object::String(name, _)) => name,
+            _ => return,
+        };
+        if let Some((page, view)) = self.named.get(name) {
+            let mut to = vec![Object::Reference(*page)];
+            to.extend(view.iter().cloned());
+            dict.set(key, to);
         }
     }
 
@@ -175,7 +203,7 @@ pub fn assemble(sources: &[Source]) -> Result<Document> {
     let pages_id = out.new_object_id();
     let mut kids = Vec::new();
     let mut form: Option<Dictionary> = None;
-    let mut outline: Vec<(usize, String, ObjectId)> = Vec::new();
+    let mut outline: Vec<(usize, String, ObjectId, Vec<Object>)> = Vec::new();
     let mut catalog = Dictionary::new();
     catalog.set("Type", Object::Name(b"Catalog".to_vec()));
     catalog.set("Pages", pages_id);
@@ -187,6 +215,7 @@ pub fn assemble(sources: &[Source]) -> Result<Document> {
             all_pages: ids.iter().copied().collect(),
             map: HashMap::new(),
             queue: Vec::new(),
+            named: src.named,
         };
         // Selected pages get their ids first, so links between them survive the copy.
         let mut targets = Vec::with_capacity(src.pages.len());
@@ -213,7 +242,7 @@ pub fn assemble(sources: &[Source]) -> Result<Document> {
         // Bookmarks follow their pages: entries whose target was not selected are dropped.
         for entry in src.outline {
             if let Some(&page) = entry.page.and_then(|old| copier.map.get(&old)) {
-                outline.push((entry.level, entry.title.clone(), page));
+                outline.push((entry.level, entry.title.clone(), page, entry.view.clone()));
             }
         }
         let source_form = src.doc.catalog().ok().and_then(|c| {
@@ -277,10 +306,14 @@ pub fn assemble(sources: &[Source]) -> Result<Document> {
     Ok(out)
 }
 
-/// Writes an outline tree for `entries` (level, title, target page) and returns its root.
+/// Writes an outline tree for `entries` (level, title, target page, view of it) and
+/// returns its root.
 ///
 /// An entry whose parent was dropped moves up to the nearest surviving ancestor.
-fn build_outline(out: &mut Document, entries: &[(usize, String, ObjectId)]) -> Option<ObjectId> {
+fn build_outline(
+    out: &mut Document,
+    entries: &[(usize, String, ObjectId, Vec<Object>)],
+) -> Option<ObjectId> {
     if entries.is_empty() {
         return None;
     }
@@ -299,7 +332,7 @@ fn build_outline(out: &mut Document, entries: &[(usize, String, ObjectId)]) -> O
         parents.push(parent);
         open.push((*level, i));
     }
-    for (i, (_, title, page)) in entries.iter().enumerate() {
+    for (i, (_, title, page, view)) in entries.iter().enumerate() {
         let siblings = &children[parents[i].map_or(0, |p| p + 1)];
         let at = siblings
             .iter()
@@ -308,17 +341,15 @@ fn build_outline(out: &mut Document, entries: &[(usize, String, ObjectId)]) -> O
         let mut item = Dictionary::new();
         item.set("Title", lopdf::text_string(title));
         item.set("Parent", parents[i].map_or(root, |p| ids[p]));
-        // XYZ with nulls keeps the reader's zoom and lands at the top of the page.
-        item.set(
-            "Dest",
-            vec![
-                Object::Reference(*page),
-                "XYZ".into(),
-                Object::Null,
-                Object::Null,
-                Object::Null,
-            ],
-        );
+        // The bookmark lands where it did. One that named no place gets XYZ with
+        // nulls, which keeps the reader's zoom and shows the top of the page.
+        let mut to = vec![Object::Reference(*page)];
+        if view.is_empty() {
+            to.extend(["XYZ".into(), Object::Null, Object::Null, Object::Null]);
+        } else {
+            to.extend(view.iter().cloned());
+        }
+        item.set("Dest", to);
         if at > 0 {
             item.set("Prev", ids[siblings[at - 1]]);
         }
@@ -349,13 +380,15 @@ pub fn merge(a: MergeArgs) -> Result<Value> {
         .map(|p| doc::load(p, a.password.as_deref()))
         .collect::<Result<_>>()?;
     let outlines: Vec<Vec<doc::OutlineItem>> = docs.iter().map(doc::outline).collect();
+    let named: Vec<Destinations> = docs.iter().map(doc::named_destinations).collect();
     let sources: Vec<Source> = docs
         .iter()
-        .zip(&outlines)
-        .map(|(d, outline)| Source {
+        .zip(outlines.iter().zip(&named))
+        .map(|(d, (outline, named))| Source {
             doc: d,
             pages: (1..=doc::page_ids(d).len() as u32).collect(),
             outline,
+            named,
         })
         .collect();
     let mut out = assemble(&sources)?;
@@ -388,6 +421,7 @@ pub fn pages(a: PagesArgs) -> Result<Value> {
         doc: &d,
         pages: selected.clone(),
         outline: &doc::outline(&d),
+        named: &doc::named_destinations(&d),
     }])?;
     let size = doc::save(&mut out, &a.output)?;
     Ok(
@@ -425,6 +459,7 @@ pub fn split(a: SplitArgs) -> Result<Value> {
         .unwrap_or_else(|| "part".into());
 
     let outline = doc::outline(&d);
+    let named = doc::named_destinations(&d);
     let progress = Progress::new("split", parts.len());
     let files: Vec<Value> = parts
         .par_iter()
@@ -435,6 +470,7 @@ pub fn split(a: SplitArgs) -> Result<Value> {
                 doc: &d,
                 pages: pages.clone(),
                 outline: &outline,
+                named: &named,
             }])?;
             let size = doc::save(&mut out, &path)?;
             progress.tick(json!({"part": i + 1, "file": path}));

@@ -110,6 +110,8 @@ pub fn annotations(a: AnnotationsArgs) -> Result<Value> {
     let numbers_of: HashMap<ObjectId, u32> = pages.iter().map(|(n, id)| (*id, *n)).collect();
     let wanted = pagespec::parse_or_all(a.pages.as_deref(), pages.len() as u32)?;
     let mut found = Vec::new();
+    // Read only if a link goes by name.
+    let mut named = None;
     for n in wanted {
         let id = pages[&n];
         let (to_user, _, visual_height) =
@@ -168,14 +170,21 @@ pub fn annotations(a: AnnotationsArgs) -> Result<Value> {
             {
                 entry["url"] = json!(url);
             }
-            // A link inside the document: a destination array whose first element is the page.
+            // A link inside the document: a destination array whose first element is the
+            // page, or the name of one.
             let dest = dict
                 .get(b"Dest")
                 .ok()
                 .or_else(|| action.and_then(|act| act.get(b"D").ok()));
             let target = dest
-                .and_then(|o| doc::resolve(&d, o).as_array().ok())
-                .and_then(|arr| arr.first()?.as_reference().ok())
+                .and_then(|o| match doc::resolve(&d, o) {
+                    Object::Array(to) => to.first()?.as_reference().ok(),
+                    Object::Name(name) | Object::String(name, _) => named
+                        .get_or_insert_with(|| doc::named_destinations(&d))
+                        .get(name)
+                        .map(|to| to.0),
+                    _ => None,
+                })
                 .and_then(|page| numbers_of.get(&page));
             if let Some(target) = target {
                 entry["target_page"] = json!(target);

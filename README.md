@@ -384,8 +384,10 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
   tables deserve a look before trusting.
 - **Create** understands headings, emphasis, links, nested lists, quotes, code blocks, tables, rules
   and local images. HTML inside the Markdown is ignored; there is no HTML or CSS engine.
-- **Bookmarks.** `merge`, `pages` and `split` keep the bookmarks whose target page is in the output.
-  They land at the top of that page. Named destinations used by links are not carried over.
+- **Bookmarks and links.** `merge`, `pages` and `split` keep the bookmarks whose target page is in
+  the output, each landing where it did on its page. Links between pages that are both in the
+  output keep working, also where they go to a destination by name: the name is replaced by the
+  page and position it stood for.
 - **Forms when merging.** Fields of the second and later inputs are renamed `doc2.<name>`,
   `doc3.<name>`, so equal names do not share a value.
 - **Lossy compression** is opt-in through `--image-quality` and `--max-image-edge`. It re-encodes
