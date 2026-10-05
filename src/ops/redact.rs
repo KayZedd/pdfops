@@ -1353,6 +1353,9 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
     }))
 }
 
+/// The matches on one page: its number, then each match's area, new text and old text.
+type PageMatches = (u32, Vec<Area>, Vec<String>, Vec<String>);
+
 pub fn replace(a: ReplaceArgs) -> Result<Value> {
     if a.find.is_empty() {
         bail!("the text to find is empty");
@@ -1362,7 +1365,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
     let total = pdf.pages().len() as u32;
 
     // Per page: where each match is and what replaces it.
-    let mut found: Vec<(u32, Vec<Area>, Vec<String>, Vec<String>)> = Vec::new();
+    let mut found: Vec<PageMatches> = Vec::new();
     for n in pagespec::parse_or_all(a.pages.as_deref(), total)? {
         let matches = text_areas(&layout::scan(&pdf.pages()[n as usize - 1]), &patterns);
         if matches.is_empty() {
