@@ -326,7 +326,8 @@ The short version. `pdfops <command> --help` has the detail for each command.
   annotations under an area are deleted, a text to redact is also struck from metadata and
   bookmarks, and the result is read back by a second interpreter before anything is written.
 - **Replace** writes in the document's own font where it has the glyphs and moves the rest of
-  the line along. Text does not move to another line: `--dry-run` shows `overflow_pt` first.
+  the line along; values of text fields and comments of annotations are changed too. Text does
+  not move to another line: `--dry-run` shows `overflow_pt` first.
 - **Dry run.** `redact`, `replace`, `annotate` and `stamp` take `--dry-run`: all the work,
   nothing written.
 - **Scan** reports scripts, actions, attachments, disguised content and hidden text by severity.
@@ -346,8 +347,7 @@ The short version. `pdfops <command> --help` has the detail for each command.
   `repaired_inputs`. **Protected files stay protected** when edited; only `decrypt` removes it.
 - **Limits.** 4 GiB and 300 seconds per command by default: `--max-memory`, `--timeout`, or
   `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`; 0 lifts a limit. Rasters are capped at 64 megapixels.
-- **Not there:** HTML or CSS in `create`, moving text between lines in `replace`, editing text inside form fields and
-  annotations with `replace`.
+- **Not there:** HTML or CSS in `create`, and moving text between lines in `replace`.
 
 ## Development
 

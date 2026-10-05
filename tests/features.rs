@@ -1867,3 +1867,66 @@ fn revoked_certificates_are_found_in_their_issuers_lists() {
         "{v}"
     );
 }
+
+#[test]
+fn replace_reaches_form_field_values_and_annotation_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    // A filled form with a comment on it; the name stands in both and on no page.
+    let filled = dir.path().join("filled.pdf");
+    call(
+        "pdf_fill",
+        json!({"input": form(dir.path()), "output": filled, "values": {"name": "Ada Lovelace", "notes": "Call Ada"}}),
+    );
+    let noted = dir.path().join("noted.pdf");
+    call(
+        "pdf_annotate",
+        json!({"input": filled, "output": noted, "kind": "note", "rects": ["1:300,300,320,320"],
+               "comment": "Ask Ada about this"}),
+    );
+    let out = dir.path().join("out.pdf");
+    let plan = call(
+        "pdf_replace",
+        json!({"input": noted, "output": out, "find": "Ada", "with": "Grace", "dry_run": true}),
+    );
+    assert_eq!(plan["form_fields"].as_array().unwrap().len(), 2, "{plan}");
+    assert!(!out.exists());
+
+    let v = call(
+        "pdf_replace",
+        json!({"input": noted, "output": out, "find": "Ada", "with": "Grace"}),
+    );
+    assert_eq!(v["annotation_comments"], 1, "{v}");
+    assert!(
+        v["form_fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"field": "name", "old": "Ada Lovelace", "new": "Grace Lovelace"})),
+        "{v}"
+    );
+    let fields = call("pdf_forms", json!({"input": out}));
+    let value = |name: &str| {
+        fields["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == name)
+            .unwrap()["value"]
+            .clone()
+    };
+    assert_eq!(value("name"), "Grace Lovelace");
+    assert_eq!(value("notes"), "Call Grace");
+    let notes = call("pdf_annotations", json!({"input": out}));
+    assert!(
+        notes.to_string().contains("Ask Grace about this"),
+        "{notes}"
+    );
+    // The fields show their new values: the old name is neither read nor drawn.
+    let bytes = std::fs::read(&out).unwrap();
+    // The author named in the document information is the one place it stays.
+    assert_eq!(bytes.windows(3).filter(|w| w == b"Ada").count(), 1);
+    assert!(
+        texts(&out)[0].contains("Grace Lovelace"),
+        "{:?}",
+        texts(&out)
+    );
+}

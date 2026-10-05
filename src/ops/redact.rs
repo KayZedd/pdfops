@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 
 use crate::font::TextFont;
 use crate::ops::edit::{append_content, own_resources, prune, visual_space};
+use crate::ops::forms;
 use crate::ops::layout;
 use crate::progress::Progress;
 use crate::{doc, pagespec};
@@ -2108,6 +2109,85 @@ fn plan_reflow(placed: &[Outcome], words: &[Area], width: f64) -> (Vec<Reflow>, 
     (reflow, overflow)
 }
 
+/// Replaces the text in what is not page content: the values of text fields, which
+/// are drawn afresh, and the comments of annotations. Returns the fields changed, with
+/// their old and new values, and the number of comments.
+fn replace_beside_content(
+    d: &mut Document,
+    pattern: &regex::Regex,
+    a: &ReplaceArgs,
+) -> Result<(Vec<Value>, usize)> {
+    let renew = |text: &str| -> String {
+        if a.regex {
+            pattern.replace_all(text, a.with.as_str()).into_owned()
+        } else {
+            pattern
+                .replace_all(text, regex::NoExpand(&a.with))
+                .into_owned()
+        }
+    };
+    let mut fields = Vec::new();
+    let mut helvetica = None;
+    for field in forms::collect(d) {
+        // A password field does not show its value, and is not to be searched for it.
+        let shown = field.kind == forms::Kind::Text && field.flags & forms::FLAG_PASSWORD == 0;
+        let Some(old) = field
+            .value
+            .as_deref()
+            .filter(|v| shown && pattern.is_match(v))
+        else {
+            continue;
+        };
+        let new = renew(old);
+        forms::set_value(d, &field, &new, &mut helvetica)?;
+        fields.push(json!({"field": field.name, "old": old, "new": new}));
+    }
+    if !fields.is_empty() {
+        forms::need_appearances(d)?;
+    }
+    let mut comments = 0;
+    for page in doc::page_ids(d) {
+        let notes: Vec<ObjectId> = d
+            .get_dictionary(page)
+            .ok()
+            .and_then(|page| page.get(b"Annots").ok())
+            .and_then(|annots| doc::resolve(d, annots).as_array().ok())
+            .map(|annots| {
+                annots
+                    .iter()
+                    .filter_map(|a| a.as_reference().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in notes {
+            let Ok(note) = d.get_dictionary(id) else {
+                continue;
+            };
+            let kind = note.get(b"Subtype").ok().and_then(|s| s.as_name().ok());
+            let old = note
+                .get(b"Contents")
+                .ok()
+                .and_then(|c| doc::text(doc::resolve(d, c)));
+            let Some(old) = old.filter(|old| kind != Some(b"Widget") && pattern.is_match(old))
+            else {
+                continue;
+            };
+            let free_text = kind == Some(b"FreeText");
+            let new = renew(&old);
+            let note = d.get_dictionary_mut(id)?;
+            note.set("Contents", lopdf::text_string(&new));
+            // The styled copy of the comment would keep the old words.
+            note.remove(b"RC");
+            if free_text {
+                // Its picture shows the old words; a viewer draws it anew from the comment.
+                note.remove(b"AP");
+            }
+            comments += 1;
+        }
+    }
+    Ok((fields, comments))
+}
+
 pub fn replace(a: ReplaceArgs) -> Result<Value> {
     if a.find.is_empty() {
         bail!("the text to find is empty");
@@ -2144,11 +2224,11 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
             width: scanned.width,
         });
     }
-    if found.is_empty() {
+    let mut d = doc::load(&a.input, a.password.as_deref())?;
+    let (fields, comments) = replace_beside_content(&mut d, &patterns[0], &a)?;
+    if found.is_empty() && fields.is_empty() && comments == 0 {
         bail!("'{}' was not found; nothing was written", a.find);
     }
-
-    let mut d = doc::load(&a.input, a.password.as_deref())?;
     let ids = doc::page_ids(&d);
     let mut report = Vec::new();
     let mut total = 0;
@@ -2263,9 +2343,9 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
         report.push(entry);
         progress.tick(json!({"page": n}));
     }
-    if total == 0 {
+    if total == 0 && fields.is_empty() && comments == 0 {
         bail!(
-            "'{}' only occurs inside annotations or form fields, which replace does not edit; nothing was written",
+            "'{}' only occurs in what annotations and form fields draw by themselves, which replace does not edit; nothing was written",
             a.find
         );
     }
@@ -2276,6 +2356,8 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
         "dry_run": a.dry_run,
         "replacements": total,
         "pages": report,
+        "form_fields": fields,
+        "annotation_comments": comments,
         "size_bytes": size,
     }))
 }

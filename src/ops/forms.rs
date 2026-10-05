@@ -47,7 +47,7 @@ pub struct FillArgs {
 
 const FLAG_READ_ONLY: i64 = 1;
 const FLAG_MULTILINE: i64 = 1 << 12;
-const FLAG_PASSWORD: i64 = 1 << 13;
+pub(crate) const FLAG_PASSWORD: i64 = 1 << 13;
 const FLAG_RADIO: i64 = 1 << 15;
 const FLAG_PUSHBUTTON: i64 = 1 << 16;
 
@@ -438,6 +438,55 @@ fn text_appearance(
     Ok(true)
 }
 
+/// Gives a text or choice field a value and draws it into the field's widgets.
+///
+/// `helvetica` is the built-in font, added to the document on first use and shared
+/// by the fields of one call.
+pub(crate) fn set_value(
+    d: &mut Document,
+    field: &Field,
+    value: &str,
+    helvetica: &mut Option<TextFont>,
+) -> Result<()> {
+    d.get_dictionary_mut(field.id)?
+        .set("V", lopdf::text_string(value));
+    // Password fields must not show their value.
+    let visible = field.kind == Kind::Text && field.flags & FLAG_PASSWORD == 0;
+    let latin = crate::font::winansi(&value.replace(char::is_control, "")).is_some();
+    let embedded;
+    let font = if !visible {
+        None
+    } else if latin {
+        if helvetica.is_none() {
+            *helvetica = Some(TextFont::new(d, "", None)?);
+        }
+        helvetica.as_ref()
+    } else {
+        // Without a font that has the glyphs, drawing is left to the viewer.
+        embedded = TextFont::new(d, value, None).ok();
+        embedded.as_ref()
+    };
+    for &w in &field.widgets {
+        let drawn = match font {
+            Some(font) => text_appearance(d, field, w, value, font)?,
+            None => false,
+        };
+        if !drawn {
+            // A stale appearance would keep showing the old value.
+            d.get_dictionary_mut(w)?.remove(b"AP");
+        }
+    }
+    Ok(())
+}
+
+/// Tells viewers to draw field values afresh where this program did not.
+pub(crate) fn need_appearances(d: &mut Document) -> Result<()> {
+    let catalog = doc::catalog_id(d)?;
+    let form = doc::ensure_indirect_dict(d, Some(catalog), b"AcroForm")?;
+    d.get_dictionary_mut(form)?.set("NeedAppearances", true);
+    Ok(())
+}
+
 pub fn fill(a: FillArgs) -> Result<Value> {
     let mut values = a.values.clone();
     for pair in &a.set {
@@ -507,42 +556,11 @@ pub fn fill(a: FillArgs) -> Result<Value> {
     for (field, value) in plan {
         match field.kind {
             Kind::Checkbox | Kind::Radio => set_button(&mut d, field, &value)?,
-            _ => {
-                d.get_dictionary_mut(field.id)?
-                    .set("V", lopdf::text_string(&value));
-                // Password fields must not show their value.
-                let visible = field.kind == Kind::Text && field.flags & FLAG_PASSWORD == 0;
-                let latin = crate::font::winansi(&value.replace(char::is_control, "")).is_some();
-                let embedded;
-                let font = if !visible {
-                    None
-                } else if latin {
-                    if helvetica.is_none() {
-                        helvetica = Some(TextFont::new(&mut d, "", None)?);
-                    }
-                    helvetica.as_ref()
-                } else {
-                    // Without a font that has the glyphs, drawing is left to the viewer.
-                    embedded = TextFont::new(&mut d, &value, None).ok();
-                    embedded.as_ref()
-                };
-                for &w in &field.widgets {
-                    let drawn = match font {
-                        Some(font) => text_appearance(&mut d, field, w, &value, font)?,
-                        None => false,
-                    };
-                    if !drawn {
-                        // A stale appearance would keep showing the old value.
-                        d.get_dictionary_mut(w)?.remove(b"AP");
-                    }
-                }
-            }
+            _ => set_value(&mut d, field, &value, &mut helvetica)?,
         }
         filled.push(json!({"name": field.name, "value": value}));
     }
-    let catalog = doc::catalog_id(&d)?;
-    let form = doc::ensure_indirect_dict(&mut d, Some(catalog), b"AcroForm")?;
-    d.get_dictionary_mut(form)?.set("NeedAppearances", true);
+    need_appearances(&mut d)?;
     let size = doc::save(&mut d, &a.output)?;
     Ok(json!({"output": a.output, "filled": filled, "size_bytes": size}))
 }

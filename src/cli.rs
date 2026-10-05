@@ -121,7 +121,7 @@ enum Command {
     ///
     /// The new text is written with the codes the document's own font already uses for those characters on that page, so style is kept exactly. If the font, usually a subset, lacks a needed glyph, other fonts write just those words at the same size, position and colour, and the result says so.
     ///
-    /// What follows on the same line moves along by the difference in width. A line that would then run past its column, judged from the lines above and below, is drawn up to 8% closer together from the replacement on, and overflow_pt reports what is still over; without neighbouring lines the right margin is taken to equal the left one. Text does not move from one line to the next, so a much longer replacement needs a look: a dry run gives width_change_pt and overflow_pt per match beforehand. Text inside form fields and annotations is not edited.
+    /// What follows on the same line moves along by the difference in width. A line that would then run past its column, judged from the lines above and below, is drawn up to 8% closer together from the replacement on, and overflow_pt reports what is still over; without neighbouring lines the right margin is taken to equal the left one. Text does not move from one line to the next, so a much longer replacement needs a look: a dry run gives width_change_pt and overflow_pt per match beforehand. The values of text fields that hold the text are changed too and drawn afresh, and so are the comments of annotations; the result lists them. Password fields are left alone.
     Replace(redact::ReplaceArgs),
     /// Remove scripts, automatic and risky actions, attachments, XFA and media, then verify by scanning
     ///
