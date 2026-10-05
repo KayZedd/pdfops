@@ -343,6 +343,8 @@ struct Rewriter<'a> {
     seen: HashMap<(u128, String), (Vec<u8>, f32)>,
     /// First pass: only fill `seen`.
     collect_only: bool,
+    /// Changes of width that the rest of each line follows; empty when nothing moves.
+    reflow: Vec<Reflow>,
 }
 
 /// What one walk over a content stream carries along and builds up.
@@ -366,13 +368,30 @@ struct Pass {
 #[derive(Clone, Copy, PartialEq)]
 enum Outcome {
     Pending,
-    /// Written in the original font; widths of the new and old text in points.
-    Original {
+    Written {
+        /// In the font of the text it replaces; otherwise that font lacked a glyph
+        /// and another one wrote it.
+        own_font: bool,
+        /// Widths of the new and the old text, in points.
         new: f64,
         old: f64,
+        /// Where on the page it starts, and the direction its line runs in.
+        at: Point,
+        along: (f64, f64),
     },
-    /// The font lacks a needed glyph, so another font wrote the replacement.
-    Substitute,
+}
+
+/// A change in the width of a piece of text, which what follows on its line makes room for.
+#[derive(Clone, Copy)]
+struct Reflow {
+    at: Point,
+    along: (f64, f64),
+    /// By how much the text grew, in points; negative when it shrank.
+    delta: f64,
+    /// Beyond this point the line is drawn closer together by `factor`, to stay in its
+    /// column. The same for every change on one line; a factor of one changes nothing.
+    anchor: Point,
+    factor: f64,
 }
 
 fn stream_bytes(stream: &Stream) -> Result<Vec<u8>> {
@@ -638,6 +657,35 @@ impl Rewriter<'_> {
         Ok(Some((encoded, pass.resources)))
     }
 
+    /// How far along its line a glyph at `origin` moves to follow the changes before it.
+    fn shift_at(&self, origin: Point, em: (f64, f64)) -> f64 {
+        let size = em.0.hypot(em.1);
+        if self.reflow.is_empty() || size <= 0.0 {
+            return 0.0;
+        }
+        let mut moved = 0.0;
+        let mut line = None;
+        for change in &self.reflow {
+            let from = origin - change.at;
+            let same_way = (em.0 * change.along.0 + em.1 * change.along.1) / size > 0.99;
+            let beside = (from.x * change.along.1 - from.y * change.along.0).abs();
+            if same_way && beside < 0.3 * size {
+                if from.x * change.along.0 + from.y * change.along.1 > 0.01 {
+                    moved += change.delta;
+                }
+                line = Some(change);
+            }
+        }
+        if let Some(change) = line.filter(|c| c.factor < 1.0) {
+            let from = origin - change.anchor;
+            let beyond = from.x * change.along.0 + from.y * change.along.1 + moved;
+            if beyond > 0.0 {
+                moved -= beyond * (1.0 - change.factor);
+            }
+        }
+        moved
+    }
+
     /// Handles one text-showing operator: passes it on, or rewrites it without the glyphs in an area.
     fn show_text(&mut self, d: &mut Document, op: Operation, pass: &mut Pass) -> Result<()> {
         let name = op.operator.as_str();
@@ -704,11 +752,19 @@ impl Rewriter<'_> {
         }
         let hits: Vec<Option<usize>> = run.iter().map(|g| g.hit(self.areas)).collect();
         let remove: Vec<bool> = hits.iter().map(Option::is_some).collect();
-        if !remove.contains(&true) {
+        // Where each glyph belongs once the line has made room for changed text.
+        let wants: Vec<f64> = run.iter().map(|g| self.shift_at(g.origin, g.em)).collect();
+        let removes = remove.contains(&true);
+        if !removes && !wants.iter().any(|w| w.abs() > 0.01) {
             pass.out.push(op);
             return Ok(());
         }
         if run.is_empty() || !strings.is_multiple_of(run.len()) || pass.state.font_size == 0.0 {
+            if !removes {
+                // Text that cannot be taken apart stays where it is.
+                pass.out.push(op);
+                return Ok(());
+            }
             bail!(
                 "text in the area uses an encoding that cannot be redacted safely; nothing was written"
             );
@@ -757,6 +813,28 @@ impl Rewriter<'_> {
         let mut rebuilt: Vec<Object> = Vec::new();
         let mut kept: Option<(Vec<u8>, lopdf::StringFormat)> = None;
         let mut index = 0;
+        // How far the pen has been moved off its own course so far, in points, and the
+        // size of the glyphs it was moved by.
+        let mut applied = 0.0f64;
+        let mut em = 1.0f64;
+        // Moves the pen so that what is shown next lands `want` points along the line
+        // from where it would have. A number in a TJ array moves the pen back by
+        // thousandths of the font size.
+        let mut settle =
+            |want: f64,
+             glyph: &Placed,
+             rebuilt: &mut Vec<Object>,
+             kept: &mut Option<(Vec<u8>, lopdf::StringFormat)>| {
+                em = glyph.em.0.hypot(glyph.em.1).max(0.001);
+                if (want - applied).abs() > 0.01 {
+                    rebuilt.extend(
+                        kept.take()
+                            .map(|(bytes, format)| Object::String(bytes, format)),
+                    );
+                    rebuilt.push(Object::Real((-(want - applied) / em * 1000.0) as f32));
+                    applied = want;
+                }
+            };
         for (at, piece) in pieces.iter().enumerate() {
             let (code, format) = match piece {
                 Ok(code) => code,
@@ -770,6 +848,7 @@ impl Rewriter<'_> {
                 }
             };
             if !remove[index] {
+                settle(wants[index], &run[index], &mut rebuilt, &mut kept);
                 kept.get_or_insert_with(|| (Vec::new(), *format))
                     .0
                     .extend_from_slice(code);
@@ -783,6 +862,7 @@ impl Rewriter<'_> {
             let glyph = &run[index];
             let area = hits[index].expect("removed glyphs have an area");
             if self.placed.get(area) == Some(&Outcome::Pending) {
+                settle(wants[index], glyph, &mut rebuilt, &mut kept);
                 self.place_replacement(d, glyph, area, *format, pass, &mut rebuilt)?;
             }
             // The renderer's own positions say how far the glyph moved the pen:
@@ -824,7 +904,7 @@ impl Rewriter<'_> {
                 );
             }
             rebuilt.push(Object::Real(-shift as f32));
-            if let Some(Outcome::Original { old, .. }) = self.placed.get_mut(area) {
+            if let Some(Outcome::Written { old, .. }) = self.placed.get_mut(area) {
                 *old += shift * glyph.em.0.hypot(glyph.em.1) / 1000.0;
             }
             self.stats.glyphs += 1;
@@ -834,9 +914,18 @@ impl Rewriter<'_> {
             kept.take()
                 .map(|(bytes, format)| Object::String(bytes, format)),
         );
+        // The pen goes back on its own course, so that the next operator starts where
+        // it always did and is moved, if at all, on its own account.
+        if applied.abs() > 0.01 {
+            rebuilt.push(Object::Real((applied / em * 1000.0) as f32));
+        }
         if !rebuilt.is_empty() {
             pass.out
                 .push(Operation::new("TJ", vec![Object::Array(rebuilt)]));
+        }
+        pass.changed = true;
+        if !removes {
+            return Ok(());
         }
         // Marked content may repeat the removed text as /ActualText or /Alt.
         for section in pass.marked.iter().flatten() {
@@ -869,6 +958,7 @@ impl Rewriter<'_> {
         // with the codes this font uses for the same characters elsewhere, then
         // the pen is moved back, so everything after keeps its position.
         let size = (glyph.em.0.hypot(glyph.em.1)).max(0.001);
+        let (at, along) = (glyph.origin, (glyph.em.0 / size, glyph.em.1 / size));
         let written: Option<Vec<&(Vec<u8>, f32)>> = glyph.font.and_then(|font| {
             self.replacements[area]
                 .chars()
@@ -894,9 +984,12 @@ impl Rewriter<'_> {
                     rebuilt.push(Object::String(bytes, format));
                     rebuilt.push(Object::Real(units as f32));
                 }
-                Outcome::Original {
+                Outcome::Written {
+                    own_font: true,
                     new: units * size / 1000.0,
                     old: 0.0,
+                    at,
+                    along,
                 }
             }
             None => {
@@ -904,6 +997,7 @@ impl Rewriter<'_> {
                 // these characters only, in the same text object, so size,
                 // colour, position and reading order all carry over.
                 let text = &self.replacements[area];
+                let mut new = 0.0;
                 let original = pass
                     .state
                     .font
@@ -936,6 +1030,7 @@ impl Rewriter<'_> {
                     let spacing = pass.state.char_spacing * text.chars().count() as f64
                         + pass.state.word_spacing * spaces as f64;
                     let units = font.width(text, 1000.0) + spacing * 1000.0 / pass.state.font_size;
+                    new = units * size / 1000.0;
                     let mut shown = font.elements(text);
                     shown.push(Object::Real(units as f32));
                     if !rebuilt.is_empty() {
@@ -954,7 +1049,13 @@ impl Rewriter<'_> {
                     pass.out
                         .push(Operation::new("Tf", vec![Object::Name(original), size]));
                 }
-                Outcome::Substitute
+                Outcome::Written {
+                    own_font: false,
+                    new,
+                    old: 0.0,
+                    at,
+                    along,
+                }
             }
         };
         Ok(())
@@ -1247,6 +1348,7 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
             placed: Vec::new(),
             seen: HashMap::new(),
             collect_only: false,
+            reflow: Vec::new(),
         };
         let content = d.get_page_content(id);
         let resources = own_resources(&d, id);
@@ -1353,8 +1455,133 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
     }))
 }
 
-/// The matches on one page: its number, then each match's area, new text and old text.
-type PageMatches = (u32, Vec<Area>, Vec<String>, Vec<String>);
+/// The matches on one page.
+struct PageMatches {
+    page: u32,
+    /// Each match's area, the text it becomes and the text it was.
+    areas: Vec<Area>,
+    texts: Vec<String>,
+    olds: Vec<String>,
+    /// The box of every word on the page and its width, to tell how far a line may grow.
+    words: Vec<Area>,
+    width: f64,
+}
+
+/// How much closer together the rest of a line may be drawn to stay in its column,
+/// as a share of its length.
+const SQUEEZE: f64 = 0.08;
+
+/// The changes of width on a page, each with what its line does about it, and for
+/// each replacement by how much its line still runs over its column.
+///
+/// What follows a replacement on its line moves by the difference in width. A line
+/// that would then run past the column it stands in is drawn closer together from
+/// the replacement on, up to `SQUEEZE`; what is left over is the overflow.
+fn plan_reflow(placed: &[Outcome], words: &[Area], width: f64) -> (Vec<Reflow>, Vec<f64>) {
+    let mut changes: Vec<(usize, Reflow, f64)> = placed
+        .iter()
+        .enumerate()
+        .filter_map(|(i, outcome)| match *outcome {
+            Outcome::Written {
+                new,
+                old,
+                at,
+                along,
+                ..
+            } => Some((
+                i,
+                Reflow {
+                    at,
+                    along,
+                    delta: new - old,
+                    anchor: at,
+                    factor: 1.0,
+                },
+                new,
+            )),
+            Outcome::Pending => None,
+        })
+        .collect();
+    let mut overflow = vec![0.0; placed.len()];
+    // Lines are told apart by their baseline. Only level text is fitted to a column.
+    let level = |c: &Reflow| c.along.0 > 0.99;
+    let mut lines: Vec<f64> = changes
+        .iter()
+        .filter(|c| level(&c.1))
+        .map(|c| c.1.at.y)
+        .collect();
+    lines.sort_by(f64::total_cmp);
+    lines.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+    for baseline in lines {
+        let on_line = |c: &Reflow| level(c) && (c.at.y - baseline).abs() < 1.0;
+        let grown: f64 = changes
+            .iter()
+            .filter(|c| on_line(&c.1))
+            .map(|c| c.1.delta)
+            .sum();
+        // Words of this line have the baseline inside their box; the others that
+        // overlap it sideways show how wide the column is.
+        let mine = |w: &Area| w[1] < baseline && baseline <= w[3] + 0.5;
+        let extent = bounds(
+            words
+                .iter()
+                .filter(|w| mine(w))
+                .flat_map(|w| [(w[0], w[1]), (w[2], w[3])]),
+        );
+        if !extent[0].is_finite() {
+            continue;
+        }
+        // Two lines or more above and below make a column. With fewer there is none to
+        // keep to, and the line may run to a right margin as wide as the left one.
+        let beside: Vec<&Area> = words
+            .iter()
+            .filter(|w| !mine(w) && w[0] < extent[2] && extent[0] < w[2])
+            .collect();
+        let mut others: Vec<i64> = beside.iter().map(|w| w[3].round() as i64).collect();
+        others.sort_unstable();
+        others.dedup();
+        let left = words.iter().map(|w| w[0]).fold(extent[0], f64::min);
+        let column = if others.len() >= 2 {
+            beside.iter().map(|w| w[2]).fold(extent[2], f64::max)
+        } else {
+            (width - left).max(extent[2])
+        };
+        let over = extent[2] + grown - column;
+        if over <= 0.5 {
+            continue;
+        }
+        // The line is drawn together from the end of its first replacement.
+        let Some(first) = changes
+            .iter()
+            .filter(|c| on_line(&c.1))
+            .min_by(|a, b| a.1.at.x.total_cmp(&b.1.at.x))
+            .map(|c| (c.1.at, c.2))
+        else {
+            continue;
+        };
+        let anchor = Point::new(first.0.x + first.1, first.0.y);
+        let tail = extent[2] + grown - anchor.x;
+        let taken = if tail > 0.0 {
+            over.min(SQUEEZE * tail)
+        } else {
+            0.0
+        };
+        for (i, change, _) in changes.iter_mut().filter(|c| on_line(&c.1)) {
+            change.anchor = anchor;
+            if tail > 0.0 {
+                change.factor = 1.0 - taken / tail;
+            }
+            overflow[*i] = over - taken;
+        }
+    }
+    let moves = changes.iter().any(|c| c.1.delta.abs() > 0.05);
+    let reflow = if moves {
+        changes.into_iter().map(|c| c.1).collect()
+    } else {
+        Vec::new()
+    };
+    (reflow, overflow)
+}
 
 pub fn replace(a: ReplaceArgs) -> Result<Value> {
     if a.find.is_empty() {
@@ -1367,7 +1594,8 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
     // Per page: where each match is and what replaces it.
     let mut found: Vec<PageMatches> = Vec::new();
     for n in pagespec::parse_or_all(a.pages.as_deref(), total)? {
-        let matches = text_areas(&layout::scan(&pdf.pages()[n as usize - 1]), &patterns);
+        let scanned = layout::scan(&pdf.pages()[n as usize - 1]);
+        let matches = text_areas(&scanned, &patterns);
         if matches.is_empty() {
             continue;
         }
@@ -1382,7 +1610,14 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
             })
             .collect();
         let (areas, olds) = matches.into_iter().map(|m| (m.0, m.1)).unzip();
-        found.push((n, areas, texts, olds));
+        found.push(PageMatches {
+            page: n,
+            areas,
+            texts,
+            olds,
+            words: scanned.words.iter().map(|w| w.bbox).collect(),
+            width: scanned.width,
+        });
     }
     if found.is_empty() {
         bail!("'{}' was not found; nothing was written", a.find);
@@ -1393,7 +1628,15 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
     let mut report = Vec::new();
     let mut total = 0;
     let progress = Progress::new("replace", found.len());
-    for (n, areas, texts, olds) in &found {
+    for PageMatches {
+        page: n,
+        areas,
+        texts,
+        olds,
+        words,
+        width,
+    } in &found
+    {
         let id = *ids
             .get(*n as usize - 1)
             .with_context(|| format!("page {n} is missing"))?;
@@ -1411,18 +1654,34 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
             placed: vec![Outcome::Pending; areas.len()],
             seen: HashMap::new(),
             collect_only: true,
+            reflow: Vec::new(),
         };
         // First pass: learn which characters the page's fonts can write.
         rewriter
             .content(&mut d, &content, &resources, IDENTITY, 0)
             .with_context(|| format!("page {n}"))?;
+        // Second pass: write the replacements in place, which also measures them.
         rewriter.next_run = 0;
         rewriter.collect_only = false;
-        let rewritten = rewriter
+        let mut rewritten = rewriter
             .content(&mut d, &content, &resources, IDENTITY, 0)
             .with_context(|| format!("page {n}"))?;
         if rewriter.next_run != runs.len() {
             return Err(out_of_step()).with_context(|| format!("page {n}"));
+        }
+        // Third pass, when a width changed: the same again, with what follows each
+        // replacement on its line moved along by the difference.
+        let (reflow, overflow) = plan_reflow(&rewriter.placed, words, *width);
+        if !reflow.is_empty() {
+            rewriter.reflow = reflow;
+            rewriter.next_run = 0;
+            rewriter.placed = vec![Outcome::Pending; areas.len()];
+            rewritten = rewriter
+                .content(&mut d, &content, &resources, IDENTITY, 0)
+                .with_context(|| format!("page {n}"))?;
+            if rewriter.next_run != runs.len() {
+                return Err(out_of_step()).with_context(|| format!("page {n}"));
+            }
         }
         let resources = match rewritten {
             Some((body, resources)) => {
@@ -1435,17 +1694,14 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
             None => resources,
         };
 
-        let (mut original, mut substituted, mut overflow) = (0, 0, 0.0f64);
-        for outcome in &rewriter.placed {
-            match outcome {
-                Outcome::Original { new, old } => {
-                    original += 1;
-                    overflow = overflow.max(new - old);
-                }
-                Outcome::Substitute => substituted += 1,
-                Outcome::Pending => {}
-            }
-        }
+        let written = |own: bool| {
+            rewriter
+                .placed
+                .iter()
+                .filter(|o| matches!(o, Outcome::Written { own_font, .. } if *own_font == own))
+                .count()
+        };
+        let (original, substituted) = (written(true), written(false));
         d.get_dictionary_mut(id)?.set("Resources", resources);
         // A match the page content does not draw itself sits in an annotation,
         // such as a form field's value; those are left alone and counted.
@@ -1457,7 +1713,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
             "not_replaced_in_annotations": areas.len() - original - substituted,
             "in_original_font": original,
             "in_substitute_font": substituted,
-            "overflow_pt": tenths(overflow.max(0.0)),
+            "overflow_pt": tenths(overflow.iter().copied().fold(0.0, f64::max)),
         });
         if a.dry_run {
             entry["matches"] = (0..areas.len())
@@ -1465,11 +1721,13 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
                     let mut m =
                         json!({"bbox": round_box(&areas[i]), "old": olds[i], "new": texts[i]});
                     match rewriter.placed[i] {
-                        Outcome::Original { new, old } => {
-                            m["font"] = json!("original");
-                            m["overflow_pt"] = json!(tenths((new - old).max(0.0)));
+                        Outcome::Written {
+                            own_font, new, old, ..
+                        } => {
+                            m["font"] = json!(if own_font { "original" } else { "substitute" });
+                            m["width_change_pt"] = json!(tenths(new - old));
+                            m["overflow_pt"] = json!(tenths(overflow[i]));
                         }
-                        Outcome::Substitute => m["font"] = json!("substitute"),
                         // Drawn by an annotation or form field, which replace leaves alone.
                         Outcome::Pending => m["font"] = Value::Null,
                     }

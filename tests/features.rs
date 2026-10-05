@@ -463,7 +463,7 @@ fn redact_refuses_bad_requests() {
 }
 
 #[test]
-fn replace_swaps_text_and_keeps_what_follows_in_place() {
+fn replace_swaps_text_and_moves_what_follows_along() {
     let dir = tempfile::tempdir().unwrap();
     let pdf = sample(dir.path(), "a.pdf", 2);
     let out = dir.path().join("out.pdf");
@@ -484,10 +484,18 @@ fn replace_swaps_text_and_keeps_what_follows_in_place() {
         "{t:?}"
     );
     assert!(t[1].contains("sample"));
-    // "Keyword" comes after the replaced word and must not have moved, though "plan" is shorter.
+    // "plan" is 1333 thousandths narrower than "sample": at 18 points, what follows on the
+    // line closes up by 24 points, and what stands before it stays.
     let after = words(&out, 1);
-    let keyword = |w: &[(String, [f64; 4])]| w.iter().find(|w| w.0 == "Keyword").unwrap().1;
-    assert_eq!(keyword(&after), keyword(&before));
+    let at = |w: &[(String, [f64; 4])], word: &str| w.iter().find(|w| w.0 == word).unwrap().1;
+    assert!(
+        (at(&before, "Keyword")[0] - at(&after, "Keyword")[0] - 24.0).abs() < 0.1,
+        "{before:?} {after:?}"
+    );
+    assert!((at(&before, "alpha-1.")[0] - at(&after, "alpha-1.")[0] - 24.0).abs() < 0.1);
+    assert_eq!(at(&before, "the"), at(&after, "the"));
+    // The full stop still follows its word directly.
+    assert!(after.iter().any(|w| w.0 == "plan."), "{after:?}");
 
     // Capture groups, on every page.
     call(
@@ -993,11 +1001,13 @@ fn dry_run_reports_the_plan_and_writes_nothing() {
             &json!("original")
         )
     );
-    // "template for all" is 3335 thousandths wider than "sample": 60 points at 18 point Helvetica.
+    // "template for all" is 3335 thousandths wider than "sample": 60 points at 18 point
+    // Helvetica, which the line has room for.
     assert!(
-        (m["overflow_pt"].as_f64().unwrap() - 60.0).abs() < 0.2,
+        (m["width_change_pt"].as_f64().unwrap() - 60.0).abs() < 0.2,
         "{m}"
     );
+    assert_eq!(m["overflow_pt"], 0.0, "{m}");
     assert!(!out.exists());
 
     let v = call(
@@ -1081,5 +1091,96 @@ fn right_to_left_text_is_shaped_and_laid_out_from_the_right() {
         line.iter().any(|w| w.0.contains('\u{633}')
             && w.1[0] > line.iter().map(|o| o.1[0]).fold(f64::MAX, f64::min)),
         "{line:?}"
+    );
+}
+
+#[test]
+fn replace_makes_room_on_the_line_and_only_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pdf");
+    // Every word placed on its own, as many producers write text; two lines.
+    let page = "BT /F1 10 Tf \
+        1 0 0 1 72 700 Tm (Total) Tj 1 0 0 1 120 700 Tm (2025) Tj 1 0 0 1 160 700 Tm (EUR) Tj \
+        1 0 0 1 72 686 Tm (Paid) Tj 1 0 0 1 120 686 Tm (none) Tj 1 0 0 1 160 686 Tm (EUR) Tj ET";
+    let pdf = custom(dir.path(), "p.pdf", &[page]);
+    let before = words(&pdf, 1);
+    let v = call(
+        "pdf_replace",
+        json!({"input": pdf, "output": out, "find": "2025", "with": "20252025"}),
+    );
+    assert_eq!(
+        (&v["replacements"], &v["pages"][0]["overflow_pt"]),
+        (&json!(1), &json!(0.0))
+    );
+    let after = words(&out, 1);
+    let texts: Vec<&str> = after.iter().map(|w| w.0.as_str()).collect();
+    assert_eq!(texts, ["Total", "20252025", "EUR", "Paid", "none", "EUR"]);
+    // Four more figures of 556 thousandths at 10 points: the word after moves 22.24 points.
+    assert!(
+        (after[2].1[0] - before[2].1[0] - 22.24).abs() < 0.05,
+        "{after:?}"
+    );
+    // The word before, and the whole of the other line, stay where they were.
+    assert_eq!(after[0], before[0]);
+    assert_eq!(after[3..], before[3..]);
+    // A second edit of the result starts from a sound page.
+    call(
+        "pdf_replace",
+        json!({"input": out, "output": out, "find": "20252025", "with": "2025"}),
+    );
+    let back = words(&out, 1);
+    for (a, b) in back.iter().zip(&before) {
+        assert!(a.0 == b.0 && (a.1[0] - b.1[0]).abs() < 0.05, "{back:?}");
+    }
+}
+
+#[test]
+fn replace_draws_a_line_together_to_keep_it_in_its_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pdf");
+    // A column of three full lines, the second with a word to replace.
+    let column = "BT /F1 12 Tf 72 700 Td (The agreement runs from the first day) Tj \
+        0 -15 Td (of May until notice is given by either) Tj \
+        0 -15 Td (party, as the schedule below sets out.) Tj ET";
+    let pdf = custom(dir.path(), "c.pdf", &[column]);
+    let before = words(&pdf, 1);
+    let edge = before.iter().map(|w| w.1[2]).fold(0.0, f64::max);
+    let line = |w: &[(String, [f64; 4])]| -> Vec<(String, [f64; 4])> {
+        w.iter()
+            .filter(|w| (w.1[1] - before[7].1[1]).abs() < 1.0)
+            .cloned()
+            .collect()
+    };
+    let was = line(&before).last().unwrap().1[2];
+
+    // "May" to "March" lengthens a line that has less room than that to the edge.
+    let v = call(
+        "pdf_replace",
+        json!({"input": pdf, "output": out, "find": "May", "with": "March", "case_sensitive": true}),
+    );
+    assert_eq!(v["pages"][0]["overflow_pt"], 0.0, "{v}");
+    let after = line(&words(&out, 1));
+    let now: Vec<&str> = after.iter().map(|w| w.0.as_str()).collect();
+    assert_eq!(
+        now,
+        [
+            "of", "March", "until", "notice", "is", "given", "by", "either"
+        ]
+    );
+    // The line ends at the column's edge, not beyond it, and its words stay apart.
+    let end = after.last().unwrap().1[2];
+    assert!(end <= edge + 0.6 && end > was, "{end} {edge} {was}");
+    assert!(after.windows(2).all(|p| p[0].1[2] < p[1].1[0]), "{after:?}");
+
+    // Far more than drawing together can absorb: the rest is reported.
+    let v = call(
+        "pdf_replace",
+        json!({"input": pdf, "output": out, "find": "May", "with": "the month after that", "case_sensitive": true}),
+    );
+    let over = v["pages"][0]["overflow_pt"].as_f64().unwrap();
+    let end = line(&words(&out, 1)).last().unwrap().1[2];
+    assert!(
+        over > 20.0 && (end - edge - over).abs() < 1.0,
+        "{over} {end} {edge}"
     );
 }

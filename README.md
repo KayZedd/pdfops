@@ -321,8 +321,13 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
 - **Replace** writes the new text with the codes the document's own font already uses for those
   characters on that page, so style is kept exactly. If the font (usually a subset) lacks a needed
   glyph, another font writes just those words, at the same size, position and colour, and the result
-  says so. Lines are not re-flowed: a longer replacement runs into what follows, and `overflow_pt`
-  reports by how much. Text inside form fields and annotations is not edited.
+  says so. What follows on the same line moves along by the difference in width, however the
+  producer placed it. A line that would then run past its column, judged from the lines above and
+  below, is drawn up to 8% closer together from the replacement on, and `overflow_pt` reports
+  what is still over; without neighbouring lines the right margin is taken to equal the left one.
+  Text does not move from one line to the next, so a much longer replacement still needs a look:
+  `--dry-run` gives `width_change_pt` and `overflow_pt` per match beforehand. Text inside form
+  fields and annotations is not edited.
 - **Dry run.** `redact`, `replace`, `annotate` and `stamp` take `--dry-run` (`dry_run` over MCP):
   the command does all of its work, including the check after redaction, reports what it would
   change and writes nothing. `redact` lists every area with the text that matched and the counts of
