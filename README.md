@@ -347,7 +347,9 @@ The short version. `pdfops <command> --help` has the detail for each command.
   `repaired_inputs`. **Protected files stay protected** when edited; only `decrypt` removes it.
 - **Limits.** 4 GiB and 300 seconds per command by default: `--max-memory`, `--timeout`, or
   `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`; 0 lifts a limit. Rasters are capped at 64 megapixels.
-- **Not there:** HTML or CSS in `create`, and moving text between lines in `replace`.
+- **Create** takes Markdown, and the HTML in it for what it says: headings, emphasis, links,
+  lists, tables. How it should look is not read: there is no CSS.
+- **Not there:** moving text between lines in `replace`.
 
 ## Development
 

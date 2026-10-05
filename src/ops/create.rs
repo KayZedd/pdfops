@@ -819,15 +819,11 @@ pub fn create(a: CreateArgs) -> Result<Value> {
         );
     }
 
-    let events: Vec<Event<'_>> = Parser::new_ext(
-        &source,
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
-    )
-    .collect();
-    let html = events
-        .iter()
-        .filter(|e| matches!(e, Event::Html(_) | Event::InlineHtml(_)))
-        .count();
+    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    // HTML in the text is rewritten as the Markdown that says the same; tags that
+    // mean nothing here are dropped and counted.
+    let (source, html) = crate::ops::html::to_markdown(&source, options);
+    let events: Vec<Event<'_>> = Parser::new_ext(&source, options).collect();
     let content = blocks(&events, &mut 0);
 
     let mut chars = BTreeMap::new();

@@ -1930,3 +1930,58 @@ fn replace_reaches_form_field_values_and_annotation_comments() {
         texts(&out)
     );
 }
+
+#[test]
+fn create_understands_the_html_that_markdown_carries() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pdf");
+    let source = "<h1>Offer</h1>\n<p>Dear <b>customer</b>, see <a href=\"https://example.com/terms\">the terms</a>.</p>\n\n\
+                  <table>\n<tr><th>Part</th><th>Price</th></tr>\n<tr><td>Bolt</td><td>12</td></tr>\n<tr><td>Nut</td><td>7</td></tr>\n</table>\n\n\
+                  <ul><li>first</li><li>second</li></ul>\n\nPlain *Markdown* after it, with <blink>one</blink> tag nobody knows.";
+    let v = call("pdf_create", json!({"markdown": source, "output": out}));
+    assert_eq!(v["html_fragments_ignored"], 1, "{v}");
+    assert_eq!(v["title"], "Offer", "{v}");
+    let text = &texts(&out)[0];
+    assert!(!text.contains('<'), "{text}");
+    for expected in [
+        "Offer",
+        "Dear customer, see the terms.",
+        "first",
+        "second",
+        "one tag nobody knows",
+    ] {
+        assert!(text.contains(expected), "{expected:?} not in {text}");
+    }
+    // The heading is set as one, the bold word in bold, the link is a link, and the
+    // table is drawn as a table.
+    let layout = call("pdf_layout", json!({"input": out, "level": "words"}));
+    let word = |text: &str| {
+        layout["pages"][0]["words"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["text"] == text)
+            .unwrap_or_else(|| panic!("{text} not in {layout}"))
+            .clone()
+    };
+    assert!(word("Offer")["size"].as_f64().unwrap() > word("Dear")["size"].as_f64().unwrap());
+    let made = lopdf::Document::load(&out).unwrap();
+    let fonts = made.get_page_fonts(made.get_pages()[&1]).unwrap();
+    assert!(
+        fonts
+            .values()
+            .any(|f| f.get(b"BaseFont").unwrap().as_name().unwrap() == b"Helvetica-Bold"),
+        "{fonts:?}"
+    );
+    let links = call("pdf_annotations", json!({"input": out}));
+    assert_eq!(
+        links["annotations"][0]["url"], "https://example.com/terms",
+        "{links}"
+    );
+    let tables = call("pdf_tables", json!({"input": out}));
+    assert_eq!(
+        tables["tables"][0]["cells"],
+        json!([["Part", "Price"], ["Bolt", "12"], ["Nut", "7"]]),
+        "{tables}"
+    );
+}

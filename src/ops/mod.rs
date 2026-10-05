@@ -6,6 +6,7 @@ pub mod assemble;
 pub mod create;
 pub mod edit;
 pub mod forms;
+pub mod html;
 pub mod layout;
 pub mod lossy;
 pub mod ocr;
