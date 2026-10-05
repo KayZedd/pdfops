@@ -1,1 +1,4 @@
 /target
+# Copied in when the npm package is published.
+/npm/README.md
+/npm/LICENSE
