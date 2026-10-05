@@ -20,10 +20,10 @@ and put `pdfops` on your `PATH`. Archives are named by platform:
 | macOS Intel | `pdfops-<version>-x86_64-apple-darwin.tar.gz` |
 | Windows x86-64 | `pdfops-<version>-x86_64-pc-windows-msvc.zip` |
 
-Or build from source with Rust 1.92 or newer:
+Or install from [crates.io](https://crates.io/crates/pdfops) with Rust 1.92 or newer:
 
 ```sh
-cargo install --git https://github.com/KayZedd/pdfops
+cargo install pdfops
 ```
 
 OCR additionally needs the `tesseract` program; nothing else does.
