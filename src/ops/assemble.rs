@@ -70,6 +70,9 @@ pub struct SplitArgs {
 pub struct Source<'a> {
     pub doc: &'a Document,
     pub pages: Vec<u32>,
+    /// The source's bookmarks, read once by the caller: a split builds many
+    /// documents from the same source.
+    pub outline: &'a [doc::OutlineItem],
 }
 
 /// Copies the object graph reachable from selected pages into another document.
@@ -157,13 +160,13 @@ impl Copier<'_> {
 
 /// Builds a document from the selected pages of each source.
 ///
-/// Document info comes from the first source and form fields from all of them.
-/// Outlines are not carried over, because their targets may no longer exist.
+/// Document info comes from the first source; form fields and bookmarks from all of them.
 pub fn assemble(sources: &[Source]) -> Result<Document> {
     let mut out = Document::with_version("1.7");
     let pages_id = out.new_object_id();
     let mut kids = Vec::new();
     let mut form: Option<Dictionary> = None;
+    let mut outline: Vec<(usize, String, ObjectId)> = Vec::new();
     let mut catalog = Dictionary::new();
     catalog.set("Type", Object::Name(b"Catalog".to_vec()));
     catalog.set("Pages", pages_id);
@@ -197,6 +200,12 @@ pub fn assemble(sources: &[Source]) -> Result<Document> {
             copier.rewrite(&mut info, &mut out);
             out.trailer.set("Info", info);
             copier.drain(&mut out);
+        }
+        // Bookmarks follow their pages: entries whose target was not selected are dropped.
+        for entry in src.outline {
+            if let Some(&page) = entry.page.and_then(|old| copier.map.get(&old)) {
+                outline.push((entry.level, entry.title.clone(), page));
+            }
         }
         let source_form = src.doc.catalog().ok().and_then(|c| {
             doc::resolve(src.doc, c.get(b"AcroForm").ok()?)
@@ -245,6 +254,9 @@ pub fn assemble(sources: &[Source]) -> Result<Document> {
     if let Some(form) = form {
         catalog.set("AcroForm", form);
     }
+    if let Some(root) = build_outline(&mut out, &outline) {
+        catalog.set("Outlines", root);
+    }
 
     let mut pages = Dictionary::new();
     pages.set("Type", Object::Name(b"Pages".to_vec()));
@@ -256,17 +268,85 @@ pub fn assemble(sources: &[Source]) -> Result<Document> {
     Ok(out)
 }
 
+/// Writes an outline tree for `entries` (level, title, target page) and returns its root.
+///
+/// An entry whose parent was dropped moves up to the nearest surviving ancestor.
+fn build_outline(out: &mut Document, entries: &[(usize, String, ObjectId)]) -> Option<ObjectId> {
+    if entries.is_empty() {
+        return None;
+    }
+    let root = out.new_object_id();
+    let ids: Vec<ObjectId> = entries.iter().map(|_| out.new_object_id()).collect();
+    // children[0] belongs to the root, children[i + 1] to entry i.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); entries.len() + 1];
+    let mut parents = Vec::with_capacity(entries.len());
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    for (i, (level, ..)) in entries.iter().enumerate() {
+        while open.last().is_some_and(|&(l, _)| l >= *level) {
+            open.pop();
+        }
+        let parent = open.last().map(|&(_, p)| p);
+        children[parent.map_or(0, |p| p + 1)].push(i);
+        parents.push(parent);
+        open.push((*level, i));
+    }
+    for (i, (_, title, page)) in entries.iter().enumerate() {
+        let siblings = &children[parents[i].map_or(0, |p| p + 1)];
+        let at = siblings
+            .iter()
+            .position(|&s| s == i)
+            .expect("every entry is listed under its parent");
+        let mut item = Dictionary::new();
+        item.set("Title", lopdf::text_string(title));
+        item.set("Parent", parents[i].map_or(root, |p| ids[p]));
+        // XYZ with nulls keeps the reader's zoom and lands at the top of the page.
+        item.set(
+            "Dest",
+            vec![
+                Object::Reference(*page),
+                "XYZ".into(),
+                Object::Null,
+                Object::Null,
+                Object::Null,
+            ],
+        );
+        if at > 0 {
+            item.set("Prev", ids[siblings[at - 1]]);
+        }
+        if let Some(&next) = siblings.get(at + 1) {
+            item.set("Next", ids[next]);
+        }
+        if let (Some(&first), Some(&last)) = (children[i + 1].first(), children[i + 1].last()) {
+            item.set("First", ids[first]);
+            item.set("Last", ids[last]);
+            // Negative: the entry starts collapsed.
+            item.set("Count", -(children[i + 1].len() as i64));
+        }
+        out.objects.insert(ids[i], Object::Dictionary(item));
+    }
+    let mut dict = Dictionary::new();
+    dict.set("Type", Object::Name(b"Outlines".to_vec()));
+    dict.set("First", ids[*children[0].first()?]);
+    dict.set("Last", ids[*children[0].last()?]);
+    dict.set("Count", children[0].len() as i64);
+    out.objects.insert(root, Object::Dictionary(dict));
+    Some(root)
+}
+
 pub fn merge(a: MergeArgs) -> Result<Value> {
     let docs: Vec<Document> = a
         .inputs
         .par_iter()
         .map(|p| doc::load(p, a.password.as_deref()))
         .collect::<Result<_>>()?;
+    let outlines: Vec<Vec<doc::OutlineItem>> = docs.iter().map(doc::outline).collect();
     let sources: Vec<Source> = docs
         .iter()
-        .map(|d| Source {
+        .zip(&outlines)
+        .map(|(d, outline)| Source {
             doc: d,
             pages: (1..=doc::page_ids(d).len() as u32).collect(),
+            outline,
         })
         .collect();
     let mut out = assemble(&sources)?;
@@ -298,6 +378,7 @@ pub fn pages(a: PagesArgs) -> Result<Value> {
     let mut out = assemble(&[Source {
         doc: &d,
         pages: selected.clone(),
+        outline: &doc::outline(&d),
     }])?;
     let size = doc::save(&mut out, &a.output)?;
     Ok(
@@ -334,6 +415,7 @@ pub fn split(a: SplitArgs) -> Result<Value> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "part".into());
 
+    let outline = doc::outline(&d);
     let files: Vec<Value> = parts
         .par_iter()
         .enumerate()
@@ -342,6 +424,7 @@ pub fn split(a: SplitArgs) -> Result<Value> {
             let mut out = assemble(&[Source {
                 doc: &d,
                 pages: pages.clone(),
+                outline: &outline,
             }])?;
             let size = doc::save(&mut out, &path)?;
             Ok(json!({"file": path, "source_pages": pages, "size_bytes": size}))

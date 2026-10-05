@@ -17,3 +17,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The OCR test drives tesseract; the font test needs a font with non-Latin glyphs.
+      - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-eng fonts-dejavu-core
+      - run: cargo test -- --include-ignored

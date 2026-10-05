@@ -1,17 +1,20 @@
 //! Read-only commands: info, text, search, outline.
 
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::Args;
-use lopdf::Document;
+use hayro::hayro_syntax::object::{Array, Dict};
+use lopdf::{Document, Object, StringFormat};
 use rayon::prelude::*;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{doc, ops::forms, pagespec};
+use crate::ops::ocr;
+use crate::{doc, pagespec};
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +37,13 @@ pub struct TextArgs {
     /// Stop after this many characters in total; the result says where to resume
     #[arg(long)]
     pub max_chars: Option<usize>,
+    /// Run OCR on pages that have no extractable text, such as scans (needs tesseract)
+    #[arg(long)]
+    #[serde(default)]
+    pub ocr: bool,
+    /// Tesseract language codes for OCR, e.g. "pol+eng" (default: eng)
+    #[arg(long)]
+    pub ocr_lang: Option<String>,
     /// Password, if the file is encrypted
     #[arg(long)]
     pub password: Option<String>,
@@ -83,48 +93,118 @@ pub struct OutlineArgs {
     pub password: Option<String>,
 }
 
-pub fn info(a: InfoArgs) -> Result<Value> {
-    let d = doc::load(&a.input, a.password.as_deref())?;
-    let ids = doc::page_ids(&d);
-    let size = |id| {
-        let b = doc::page_box(&d, id);
-        let (w, h) = (b[2] - b[0], b[3] - b[1]);
-        if doc::rotation(&d, id) % 180 == 90 {
-            (h, w)
-        } else {
-            (w, h)
+/// Counts outline items by walking the First/Next links.
+fn count_outline(catalog: &Dict<'_>) -> usize {
+    let mut seen = HashSet::new();
+    let mut open: Vec<Dict<'_>> = Vec::new();
+    open.extend(
+        catalog
+            .get::<Dict<'_>>(b"Outlines")
+            .and_then(|o| o.get::<Dict<'_>>(b"First")),
+    );
+    let mut count = 0;
+    while let Some(item) = open.pop() {
+        // `seen` stops a cyclic chain; the cap covers items stored without an object id.
+        if item.obj_id().is_some_and(|id| !seen.insert(id)) || count >= 1_000_000 {
+            continue;
         }
-    };
-    let sizes: Vec<(f64, f64)> = ids.iter().map(|&id| size(id)).collect();
+        count += 1;
+        open.extend(item.get::<Dict<'_>>(b"Next"));
+        open.extend(item.get::<Dict<'_>>(b"First"));
+    }
+    count
+}
+
+/// Counts terminal form fields below `field`, the same way `forms` lists them.
+fn count_fields(field: &Dict<'_>, depth: u32) -> usize {
+    let kids: Vec<Dict<'_>> = field
+        .get::<Array<'_>>(b"Kids")
+        .map(|k| k.iter::<Dict<'_>>().collect())
+        .unwrap_or_default();
+    if depth >= 32 || !kids.iter().any(|k| k.contains_key(b"T")) {
+        return 1;
+    }
+    kids.iter().map(|k| count_fields(k, depth + 1)).sum()
+}
+
+pub fn info(a: InfoArgs) -> Result<Value> {
+    let (pdf, encrypted) = doc::open_lazy(&a.input, a.password.as_deref())?;
+    let sizes: Vec<(f32, f32)> = pdf.pages().iter().map(|p| p.render_dimensions()).collect();
     let uniform = sizes.windows(2).all(|w| w[0] == w[1]);
 
+    let meta = pdf.metadata();
     let mut metadata = serde_json::Map::new();
-    if let Some(info) = doc::info_dict(&d) {
-        for (key, value) in info.iter() {
-            if let Some(text) = doc::text(doc::resolve(&d, value)) {
-                metadata.insert(String::from_utf8_lossy(key).to_lowercase(), json!(text));
-            }
+    let texts = [
+        ("title", &meta.title),
+        ("author", &meta.author),
+        ("subject", &meta.subject),
+        ("keywords", &meta.keywords),
+        ("creator", &meta.creator),
+        ("producer", &meta.producer),
+    ];
+    for (key, value) in texts {
+        let text = value
+            .as_ref()
+            .and_then(|b| doc::text(&Object::String(b.clone(), StringFormat::Literal)));
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            metadata.insert(key.to_string(), json!(text));
+        }
+    }
+    for (key, date) in [
+        ("created", meta.creation_date),
+        ("modified", meta.modification_date),
+    ] {
+        if let Some(d) = date {
+            let sign = if d.utc_offset_hour < 0 { '-' } else { '+' };
+            let iso = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}",
+                d.year,
+                d.month,
+                d.day,
+                d.hour,
+                d.minute,
+                d.second,
+                d.utc_offset_hour.unsigned_abs(),
+                d.utc_offset_minute
+            );
+            metadata.insert(key.to_string(), json!(iso));
         }
     }
 
+    let xref = pdf.xref();
+    let catalog: Option<Dict<'_>> = xref.get(xref.root_id());
+    let fields = catalog
+        .as_ref()
+        .and_then(|c| c.get::<Dict<'_>>(b"AcroForm"))
+        .and_then(|f| f.get::<Array<'_>>(b"Fields"))
+        .map(|f| {
+            f.iter::<Dict<'_>>()
+                .map(|d| count_fields(&d, 0))
+                .sum::<usize>()
+        });
+    let digits: String = format!("{:?}", pdf.version())
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
+
     Ok(json!({
         "file": a.input,
-        "size_bytes": std::fs::metadata(&a.input)?.len(),
-        "pdf_version": d.version,
-        "pages": ids.len(),
-        "encrypted": d.was_encrypted(),
+        "size_bytes": pdf.data().as_ref().len(),
+        "pdf_version": format!("{}.{}", &digits[..1.min(digits.len())], &digits[1.min(digits.len())..]),
+        "pages": sizes.len(),
+        "encrypted": encrypted,
         "page_size_pt": sizes.first().map(|s| json!({"width": s.0, "height": s.1})),
         "uniform_page_size": uniform,
         "metadata": metadata,
-        "outline_entries": d.get_toc().map(|t| t.toc.len()).unwrap_or(0),
-        "form_fields": forms::collect(&d).len(),
+        "outline_entries": catalog.as_ref().map_or(0, count_outline),
+        "form_fields": fields.unwrap_or(0),
     }))
 }
 
 /// Collapses runs of spaces and blank lines left over from the page layout.
 ///
 /// They carry no meaning in extracted text and cost an agent tokens.
-fn tidy(text: &str) -> String {
+pub fn tidy(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut blank = 0;
     for line in text.lines() {
@@ -171,7 +251,24 @@ pub fn text(a: TextArgs) -> Result<Value> {
     let mut out = Vec::new();
     let mut resume = None;
     let mut chars_total = 0usize;
-    for (n, res) in page_texts(&d, &pages) {
+    let mut texts = page_texts(&d, &pages);
+    let mut recognised = HashSet::new();
+    let blank: Vec<u32> = texts
+        .iter()
+        .filter(|(_, t)| t.as_ref().is_ok_and(|t| t.is_empty()))
+        .map(|p| p.0)
+        .collect();
+    if a.ocr && !blank.is_empty() {
+        let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
+        let read = ocr::recognise(&pdf, &blank, a.ocr_lang.as_deref().unwrap_or("eng"), 300.0)?;
+        for (n, text) in read {
+            recognised.insert(n);
+            for slot in texts.iter_mut().filter(|t| t.0 == n) {
+                slot.1 = text.clone().map(|t| tidy(&t));
+            }
+        }
+    }
+    for (n, res) in texts {
         if budget == 0 {
             resume = Some(n);
             break;
@@ -188,7 +285,11 @@ pub fn text(a: TextArgs) -> Result<Value> {
                 };
                 chars_total += chars.min(budget);
                 budget -= chars.min(budget);
-                out.push(json!({"page": n, "text": shown, "truncated": cut}));
+                let mut page = json!({"page": n, "text": shown, "truncated": cut});
+                if recognised.contains(&n) {
+                    page["ocr"] = json!(true);
+                }
+                out.push(page);
                 if cut {
                     // The rest of this page was dropped, so it is where reading resumes.
                     resume = Some(n);
@@ -278,16 +379,12 @@ fn ceil_boundary(s: &str, mut i: usize) -> usize {
 
 pub fn outline(a: OutlineArgs) -> Result<Value> {
     let d = doc::load(&a.input, a.password.as_deref())?;
-    // lopdf reports a missing outline as an error; for callers that is an empty list.
-    let entries: Vec<Value> = d
-        .get_toc()
-        .map(|t| {
-            t.toc
-                .into_iter()
-                .map(|e| json!({"level": e.level, "title": e.title, "page": e.page}))
-                .collect()
-        })
-        .unwrap_or_default();
+    let numbers: HashMap<lopdf::ObjectId, u32> =
+        d.get_pages().into_iter().map(|(n, id)| (id, n)).collect();
+    let entries: Vec<Value> = doc::outline(&d)
+        .into_iter()
+        .map(|e| json!({"level": e.level, "title": e.title, "page": e.page.and_then(|p| numbers.get(&p))}))
+        .collect();
     Ok(json!({"file": a.input, "entries": entries}))
 }
 

@@ -4,5 +4,7 @@
 pub mod assemble;
 pub mod edit;
 pub mod forms;
+pub mod lossy;
+pub mod ocr;
 pub mod read;
 pub mod render;

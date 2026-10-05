@@ -1,6 +1,8 @@
 mod common;
 
-use common::{call, call_err, form, page_count, sample, texts};
+use common::{
+    call, call_err, form, image_stream, ocr_lang, page_count, sample, scan, texts, with_images,
+};
 use serde_json::json;
 
 #[test]
@@ -318,13 +320,6 @@ fn stamp_draws_page_numbers_and_watermarks() {
     assert!(
         call_err(
             "pdf_stamp",
-            json!({"input": pdf, "output": out, "text": "\u{4f60}"})
-        )
-        .contains("Latin-1")
-    );
-    assert!(
-        call_err(
-            "pdf_stamp",
             json!({"input": pdf, "output": out, "text": "x", "opacity": 2})
         )
         .contains("opacity")
@@ -601,4 +596,323 @@ fn bad_inputs_produce_clear_errors() {
     // Unknown arguments are rejected rather than silently ignored.
     assert!(call_err("pdf_info", json!({"input": junk, "pagez": "1"})).contains("unknown field"));
     assert!(call_err("pdf_nope", json!({})).contains("unknown tool"));
+}
+
+#[test]
+fn info_counts_form_fields_like_forms_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = form(dir.path());
+    let listed = call("pdf_forms", json!({"input": pdf}))["fields"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        call("pdf_info", json!({"input": pdf}))["form_fields"],
+        listed
+    );
+}
+
+#[test]
+fn stamp_and_fill_draw_text_outside_latin1() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pdf");
+    let text = "Zażółć gęślą {page}";
+    let stamped = pdfops::tools::call(
+        "pdf_stamp",
+        json!({"input": sample(dir.path(), "a.pdf", 2), "output": out, "text": text, "position": "footer"}),
+    );
+    if let Err(e) = &stamped {
+        // Needs any installed font with Polish letters; a bare container may have none.
+        assert!(e.to_string().contains("no installed font"), "{e:#}");
+        eprintln!("skipped: {e}");
+        return;
+    }
+    // The embedded font carries a ToUnicode map, so the stamp is extractable and searchable.
+    assert!(
+        texts(&out)[1].contains("Zażółć gęślą 2"),
+        "{:?}",
+        texts(&out)
+    );
+    assert_eq!(
+        call("pdf_search", json!({"input": out, "query": "gęślą"}))["total_matches"],
+        2
+    );
+    // Only the glyphs in use are embedded, not the whole font.
+    assert!(std::fs::metadata(&out).unwrap().len() < 40_000);
+
+    let filled = dir.path().join("filled.pdf");
+    call(
+        "pdf_fill",
+        json!({"input": form(dir.path()), "output": filled, "values": {"name": "Zażółć"}}),
+    );
+    assert_eq!(
+        call("pdf_forms", json!({"input": filled}))["fields"][0]["value"],
+        "Zażółć"
+    );
+    assert!(ink(&filled, dir.path(), [[72, 600, 300, 620]])[0] > 20);
+}
+
+#[test]
+fn outline_follows_pages_through_pages_split_and_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 4);
+    let out = dir.path().join("out.pdf");
+    let entries =
+        |path: &std::path::Path| call("pdf_outline", json!({"input": path}))["entries"].clone();
+
+    // The bookmark targets source page 2, which becomes page 1 here.
+    call(
+        "pdf_pages",
+        json!({"input": pdf, "output": out, "keep": "2-3"}),
+    );
+    assert_eq!(
+        entries(&out),
+        json!([{"level": 1, "title": "Second chapter", "page": 1}])
+    );
+
+    // Its target is gone, so the bookmark goes too.
+    call(
+        "pdf_pages",
+        json!({"input": pdf, "output": out, "delete": "2"}),
+    );
+    assert_eq!(entries(&out), json!([]));
+
+    call("pdf_merge", json!({"inputs": [pdf, pdf], "output": out}));
+    let merged = entries(&out);
+    assert_eq!(
+        merged
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["page"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [2, 6]
+    );
+
+    let v = call(
+        "pdf_split",
+        json!({"input": pdf, "out_dir": dir.path().join("parts"), "every": 2}),
+    );
+    let first = std::path::Path::new(v["files"][0]["file"].as_str().unwrap()).to_path_buf();
+    assert_eq!(entries(&first)[0]["page"], 2);
+}
+
+#[test]
+fn outline_keeps_nesting_and_promotes_orphans() {
+    use lopdf::{Document, Object, dictionary};
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 3);
+    // Replace the fixture's outline with: A (page 1) > B (page 2) > C (page 3).
+    let mut doc = Document::load(&pdf).unwrap();
+    let pages: Vec<_> = doc.get_pages().into_values().collect();
+    let (root, a, b, c) = (
+        doc.new_object_id(),
+        doc.new_object_id(),
+        doc.new_object_id(),
+        doc.new_object_id(),
+    );
+    let item = |title: &str, parent, page, child: Option<lopdf::ObjectId>| {
+        let mut d = dictionary! {
+            "Title" => Object::string_literal(title), "Parent" => parent,
+            "Dest" => vec![Object::Reference(page), "Fit".into()],
+        };
+        if let Some(child) = child {
+            d.set("First", child);
+            d.set("Last", child);
+            d.set("Count", 1);
+        }
+        Object::Dictionary(d)
+    };
+    doc.objects.insert(a, item("A", root, pages[0], Some(b)));
+    doc.objects.insert(b, item("B", a, pages[1], Some(c)));
+    doc.objects.insert(c, item("C", b, pages[2], None));
+    doc.objects.insert(
+        root,
+        Object::Dictionary(
+            dictionary! { "Type" => "Outlines", "First" => a, "Last" => a, "Count" => 1 },
+        ),
+    );
+    doc.catalog_mut().unwrap().set("Outlines", root);
+    doc.save(&pdf).unwrap();
+
+    let out = dir.path().join("out.pdf");
+    let levels = |keep: &str| {
+        call(
+            "pdf_pages",
+            json!({"input": pdf, "output": out, "keep": keep}),
+        );
+        let v = call("pdf_outline", json!({"input": out}));
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["title"].as_str().unwrap().to_string(),
+                    e["level"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        levels("1-3"),
+        [
+            ("A".to_string(), 1),
+            ("B".to_string(), 2),
+            ("C".to_string(), 3)
+        ]
+    );
+    // B's page is dropped, so C moves up under A.
+    assert_eq!(levels("1,3"), [("A".to_string(), 1), ("C".to_string(), 2)]);
+}
+
+#[test]
+fn images_decodes_indexed_and_fax_encoded_images() {
+    let dir = tempfile::tempdir().unwrap();
+    // A 2x2 palette image: red, blue / blue, red.
+    let palette = lopdf::Object::Array(vec![
+        "Indexed".into(),
+        "DeviceRGB".into(),
+        1.into(),
+        lopdf::Object::String(vec![255, 0, 0, 0, 0, 255], lopdf::StringFormat::Hexadecimal),
+    ]);
+    let indexed = image_stream(2, 2, palette, 8, vec![0, 1, 1, 0]);
+    // 64x32 CCITT Group 4: white with a black rectangle from (8,8) to (40,20) inclusive.
+    let mut fax = image_stream(
+        64,
+        32,
+        "DeviceGray".into(),
+        1,
+        vec![
+            0xff, 0x33, 0x06, 0xbf, 0xff, 0xff, 0xff, 0xff, 0x8f, 0xff, 0x00, 0x10, 0x01,
+        ],
+    );
+    fax.dict.set("Filter", "CCITTFaxDecode");
+    fax.dict.set(
+        "DecodeParms",
+        lopdf::dictionary! { "K" => -1, "Columns" => 64, "Rows" => 32 },
+    );
+    let pdf = with_images(dir.path(), "img.pdf", vec![indexed, fax]);
+
+    let v = call(
+        "pdf_images",
+        json!({"input": pdf, "out_dir": dir.path().join("img")}),
+    );
+    assert_eq!(v["exported"], 2, "{v}");
+    let decode = |i: usize| {
+        let bytes = std::fs::read(v["images"][i]["file"].as_str().unwrap()).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+            .read_info()
+            .unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        (info.width, info.height, buf)
+    };
+    let mut seen: Vec<_> = (0..2).map(decode).collect();
+    seen.sort_by_key(|s| s.0);
+    assert_eq!(
+        seen[0],
+        (2, 2, vec![255, 0, 0, 0, 0, 255, 0, 0, 255, 255, 0, 0])
+    );
+    let (w, h, fax) = &seen[1];
+    assert_eq!((*w, *h), (64, 32));
+    let channels = fax.len() / (64 * 32);
+    let dark = |x: usize, y: usize| fax[(y * 64 + x) * channels] < 128;
+    assert!(dark(8, 8) && dark(40, 20) && dark(24, 14));
+    assert!(!dark(7, 8) && !dark(41, 20) && !dark(24, 21) && !dark(0, 0));
+}
+
+#[test]
+fn compress_can_downscale_and_reencode_images() {
+    let dir = tempfile::tempdir().unwrap();
+    // A smooth 256x256 colour gradient, stored raw like a scanner's lossless output.
+    let pixels: Vec<u8> = (0..256u32)
+        .flat_map(|y| (0..256u32).flat_map(move |x| [x as u8, y as u8, ((x + y) / 2) as u8]))
+        .collect();
+    let pdf = with_images(
+        dir.path(),
+        "photo.pdf",
+        vec![image_stream(256, 256, "DeviceRGB".into(), 8, pixels)],
+    );
+    let out = dir.path().join("out.pdf");
+
+    let v = call(
+        "pdf_compress",
+        json!({"input": pdf, "output": out, "max_image_edge": 64, "image_quality": 70}),
+    );
+    assert_eq!(v["images_recompressed"], 1, "{v}");
+    assert!(
+        v["size_after"].as_u64().unwrap() * 10 < v["size_before"].as_u64().unwrap(),
+        "{v}"
+    );
+    let img = call(
+        "pdf_images",
+        json!({"input": out, "out_dir": dir.path().join("img")}),
+    );
+    assert_eq!(
+        (
+            img["images"][0]["width"].as_u64(),
+            img["images"][0]["height"].as_u64()
+        ),
+        (Some(64), Some(64))
+    );
+    assert!(img["images"][0]["file"].as_str().unwrap().ends_with(".jpg"));
+    // The picture still shows: the page is not blank where it is drawn.
+    assert!(ink(&out, dir.path(), [[50, 600, 150, 700]])[0] > 500);
+
+    // Without the lossy options images are left alone.
+    let v = call("pdf_compress", json!({"input": pdf, "output": out}));
+    assert_eq!(v["images_recompressed"], 0);
+    let img = call(
+        "pdf_images",
+        json!({"input": out, "out_dir": dir.path().join("img2")}),
+    );
+    assert_eq!(img["images"][0]["width"], 256);
+    assert!(
+        call_err(
+            "pdf_compress",
+            json!({"input": pdf, "output": out, "image_quality": 0})
+        )
+        .contains("between 1 and 100")
+    );
+}
+
+// Drives the external tesseract program, which takes seconds: run with `cargo test -- --ignored`.
+#[test]
+#[ignore = "needs tesseract; slow"]
+fn ocr_reads_pages_without_a_text_layer() {
+    let Some(lang) = ocr_lang() else {
+        eprintln!("skipped: tesseract with language data is not installed");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = scan(dir.path(), &sample(dir.path(), "a.pdf", 1));
+    let plain = call("pdf_text", json!({"input": pdf}));
+    assert_eq!(plain["pages"][0]["text"], "");
+
+    let v = call("pdf_ocr", json!({"input": pdf, "lang": lang}));
+    let text = v["pages"][0]["text"].as_str().unwrap().to_lowercase();
+    assert!(
+        text.contains("sample") && text.contains("keyword"),
+        "{text}"
+    );
+
+    let v = call(
+        "pdf_text",
+        json!({"input": pdf, "ocr": true, "ocr_lang": lang}),
+    );
+    assert_eq!(v["pages"][0]["ocr"], true);
+    assert!(
+        v["pages"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("sample")
+    );
+
+    let e = call_err("pdf_ocr", json!({"input": pdf, "lang": "zzz"}));
+    assert!(
+        e.contains("no language data for 'zzz'") && e.contains(&lang),
+        "{e}"
+    );
 }

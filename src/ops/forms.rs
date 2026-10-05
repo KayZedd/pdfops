@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::doc;
-use crate::ops::edit::{helvetica_width, literal, winansi};
+use crate::font::TextFont;
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
 #[serde(deny_unknown_fields)]
@@ -301,11 +301,8 @@ fn set_button(d: &mut Document, field: &Field, state: &str) -> Result<()> {
     Ok(())
 }
 
-/// Breaks `value` into lines no wider than `width` points.
-///
-/// Widths are Helvetica's, which is what form fields nearly always use; with
-/// another font the breaks are approximate and the clip keeps text in the field.
-fn wrap(value: &str, width: f64, size: f64) -> Vec<String> {
+/// Breaks `value` into lines no wider than `width` points, as measured by `measure`.
+fn wrap(value: &str, width: f64, measure: impl Fn(&str) -> f64) -> Vec<String> {
     let mut lines = Vec::new();
     for paragraph in value.lines() {
         let mut line = String::new();
@@ -315,8 +312,7 @@ fn wrap(value: &str, width: f64, size: f64) -> Vec<String> {
             } else {
                 format!("{line} {word}")
             };
-            let fits = winansi(&candidate).is_ok_and(|b| helvetica_width(&b, size) <= width);
-            if fits || line.is_empty() {
+            if line.is_empty() || measure(&candidate) <= width {
                 line = candidate;
             } else {
                 lines.push(std::mem::replace(&mut line, word.to_string()));
@@ -329,12 +325,16 @@ fn wrap(value: &str, width: f64, size: f64) -> Vec<String> {
 
 /// Draws `value` into a text widget, so viewers that do not rebuild appearances
 /// (and our own renderer) still show it.
+///
+/// Latin-1 values use the font the form asks for, measured as Helvetica, which is
+/// what form fields nearly always use. Other values are drawn with `font`, an
+/// embedded font that has the glyphs.
 fn text_appearance(
     d: &mut Document,
     field: &Field,
     widget: ObjectId,
     value: &str,
-    fallback_font: ObjectId,
+    font: &TextFont,
 ) -> Result<bool> {
     let multiline = field.flags & FLAG_MULTILINE != 0;
     let rect: Vec<f64> = d
@@ -353,7 +353,7 @@ fn text_appearance(
     let da = field.appearance.as_deref().unwrap_or("/Helv 0 Tf 0 g");
     let tokens: Vec<&str> = da.split_whitespace().collect();
     let tf = tokens.iter().position(|t| *t == "Tf").filter(|&i| i >= 2);
-    let (font, size, color) = match tf {
+    let (asked_font, size, color) = match tf {
         Some(i) => (
             tokens[i - 2].trim_start_matches('/').to_string(),
             tokens[i - 1].parse::<f64>().unwrap_or(0.0),
@@ -368,36 +368,43 @@ fn text_appearance(
         (h - 4.0).clamp(4.0, 12.0)
     };
 
-    let mut fonts = acroform(d)
-        .and_then(|f| doc::resolve(d, f.get(b"DR").ok()?).as_dict().ok())
-        .and_then(|dr| doc::resolve(d, dr.get(b"Font").ok()?).as_dict().ok())
-        .cloned()
-        .unwrap_or_default();
-    if !fonts.has(font.as_bytes()) {
-        fonts.set(font.as_str(), fallback_font);
-    }
+    let (font_name, fonts) = if font.is_embedded() {
+        let mut fonts = Dictionary::new();
+        fonts.set("PdfopsF", font.id);
+        ("PdfopsF".to_string(), fonts)
+    } else {
+        let mut fonts = acroform(d)
+            .and_then(|f| doc::resolve(d, f.get(b"DR").ok()?).as_dict().ok())
+            .and_then(|dr| doc::resolve(d, dr.get(b"Font").ok()?).as_dict().ok())
+            .cloned()
+            .unwrap_or_default();
+        if !fonts.has(asked_font.as_bytes()) {
+            fonts.set(asked_font.as_str(), font.id);
+        }
+        (asked_font, fonts)
+    };
     let mut resources = Dictionary::new();
     resources.set("Font", fonts);
 
     // A field too short for a second line is laid out as a single centred line.
     let leading = size * 1.15;
     let (lines, baseline) = if multiline && h >= 2.0 * leading + 4.0 {
-        (wrap(value, w - 4.0, size), h - 2.0 - size * 0.9)
+        (
+            wrap(value, w - 4.0, |s| font.width(s, size)),
+            h - 2.0 - size * 0.9,
+        )
     } else {
         (
             vec![value.split_whitespace().collect::<Vec<_>>().join(" ")],
             (h - size) / 2.0 + size * 0.22,
         )
     };
-    let mut shown = Vec::with_capacity(lines.len());
-    for line in &lines {
-        let Ok(bytes) = winansi(line) else {
-            return Ok(false);
-        };
-        shown.push(format!("{} Tj", literal(&bytes)));
-    }
+    let shown: Vec<String> = lines
+        .iter()
+        .map(|line| format!("{} Tj", font.encode(line)))
+        .collect();
     let content = format!(
-        "/Tx BMC\nq\n1 1 {:.2} {:.2} re W n\nBT\n/{font} {size:.2} Tf\n{color}\n{leading:.2} TL\n2 {baseline:.2} Td\n{}\nET\nQ\nEMC\n",
+        "/Tx BMC\nq\n1 1 {:.2} {:.2} re W n\nBT\n/{font_name} {size:.2} Tf\n{color}\n{leading:.2} TL\n2 {baseline:.2} Td\n{}\nET\nQ\nEMC\n",
         (w - 2.0).max(0.0),
         (h - 2.0).max(0.0),
         shown.join("\nT*\n")
@@ -485,12 +492,7 @@ pub fn fill(a: FillArgs) -> Result<Value> {
         plan.push((field, resolved));
     }
 
-    let mut helvetica = Dictionary::new();
-    helvetica.set("Type", Object::Name(b"Font".to_vec()));
-    helvetica.set("Subtype", Object::Name(b"Type1".to_vec()));
-    helvetica.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
-    helvetica.set("Encoding", Object::Name(b"WinAnsiEncoding".to_vec()));
-    let helvetica = d.add_object(helvetica);
+    let mut helvetica: Option<TextFont> = None;
 
     let mut filled = Vec::new();
     for (field, value) in plan {
@@ -501,8 +503,26 @@ pub fn fill(a: FillArgs) -> Result<Value> {
                     .set("V", lopdf::text_string(&value));
                 // Password fields must not show their value.
                 let visible = field.kind == Kind::Text && field.flags & FLAG_PASSWORD == 0;
+                let latin = crate::font::winansi(&value.replace(char::is_control, "")).is_some();
+                let embedded;
+                let font = if !visible {
+                    None
+                } else if latin {
+                    if helvetica.is_none() {
+                        helvetica = Some(TextFont::new(&mut d, "", None)?);
+                    }
+                    helvetica.as_ref()
+                } else {
+                    // Without a font that has the glyphs, drawing is left to the viewer.
+                    embedded = TextFont::new(&mut d, &value, None).ok();
+                    embedded.as_ref()
+                };
                 for &w in &field.widgets {
-                    if !(visible && text_appearance(&mut d, field, w, &value, helvetica)?) {
+                    let drawn = match font {
+                        Some(font) => text_appearance(&mut d, field, w, &value, font)?,
+                        None => false,
+                    };
+                    if !drawn {
                         // A stale appearance would keep showing the old value.
                         d.get_dictionary_mut(w)?.remove(b"AP");
                     }

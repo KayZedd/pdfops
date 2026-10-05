@@ -3,7 +3,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::ops::{assemble, edit, forms, read, render};
+use crate::ops::{assemble, edit, forms, ocr, read, render};
 
 pub struct Tool {
     /// CLI subcommand name, e.g. `set-meta`.
@@ -35,6 +35,7 @@ pub const TOOLS: &[Tool] = &[
     tool!("info", read::InfoArgs, read::info),
     tool!("text", read::TextArgs, read::text),
     tool!("search", read::SearchArgs, read::search),
+    tool!("ocr", ocr::OcrArgs, ocr::ocr),
     tool!("outline", read::OutlineArgs, read::outline),
     tool!("render", render::RenderArgs, render::render),
     tool!("images", render::ImagesArgs, render::images),

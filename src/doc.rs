@@ -1,9 +1,11 @@
 //! Loading, saving and low level object helpers on top of `lopdf`.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use hayro::hayro_syntax::{LoadPdfError, Pdf};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 /// Attributes a page may inherit from its ancestors in the page tree.
@@ -117,11 +119,6 @@ pub fn text(obj: &Object) -> Option<String> {
     }
 }
 
-/// The document information dictionary, if present.
-pub fn info_dict(doc: &Document) -> Option<&Dictionary> {
-    resolve(doc, doc.trailer.get(b"Info").ok()?).as_dict().ok()
-}
-
 /// Id of an indirect dictionary stored under `key`, creating or relocating it as needed.
 pub fn ensure_indirect_dict(
     doc: &mut Document,
@@ -146,4 +143,221 @@ pub fn ensure_indirect_dict(
 
 pub fn catalog_id(doc: &Document) -> Result<ObjectId> {
     Ok(doc.trailer.get(b"Root")?.as_reference()?)
+}
+
+/// One bookmark of the document outline.
+pub struct OutlineItem {
+    /// Nesting depth, 1 for top-level entries.
+    pub level: usize,
+    pub title: String,
+    /// The page the bookmark jumps to, if it has a resolvable target.
+    pub page: Option<ObjectId>,
+}
+
+/// The page a destination (an array, or a dictionary wrapping one) points at.
+fn destination_page(doc: &Document, dest: &Object) -> Option<ObjectId> {
+    match resolve(doc, dest) {
+        Object::Array(a) => a.first()?.as_reference().ok(),
+        Object::Dictionary(d) => resolve(doc, d.get(b"D").ok()?)
+            .as_array()
+            .ok()?
+            .first()?
+            .as_reference()
+            .ok(),
+        _ => None,
+    }
+}
+
+/// Named destinations from the catalog's /Dests dictionary and /Names tree.
+fn named_destinations(doc: &Document) -> HashMap<Vec<u8>, ObjectId> {
+    let mut map = HashMap::new();
+    let Ok(catalog) = doc.catalog() else {
+        return map;
+    };
+    let dict = |owner: &Dictionary, key: &[u8]| {
+        owner
+            .get(key)
+            .ok()
+            .and_then(|o| resolve(doc, o).as_dict().ok())
+            .cloned()
+    };
+    if let Some(dests) = dict(catalog, b"Dests") {
+        for (name, dest) in dests.iter() {
+            map.extend(destination_page(doc, dest).map(|page| (name.clone(), page)));
+        }
+    }
+    let mut open: Vec<Dictionary> = dict(catalog, b"Names")
+        .and_then(|n| dict(&n, b"Dests"))
+        .into_iter()
+        .collect();
+    // Bounded so that a cyclic tree cannot loop forever.
+    for _ in 0..100_000 {
+        let Some(node) = open.pop() else { break };
+        let array = |key: &[u8]| {
+            node.get(key)
+                .ok()
+                .and_then(|o| resolve(doc, o).as_array().ok())
+        };
+        for pair in array(b"Names")
+            .map(|n| n.as_chunks::<2>().0.iter())
+            .into_iter()
+            .flatten()
+        {
+            if let (Ok(name), Some(page)) = (
+                resolve(doc, &pair[0]).as_str(),
+                destination_page(doc, &pair[1]),
+            ) {
+                map.insert(name.to_vec(), page);
+            }
+        }
+        for kid in array(b"Kids").into_iter().flatten() {
+            open.extend(resolve(doc, kid).as_dict().ok().cloned());
+        }
+    }
+    map
+}
+
+/// The document outline in reading order.
+///
+/// Read here rather than with lopdf's `get_toc`, which keys entries by title
+/// and so loses every bookmark whose title repeats.
+pub fn outline(doc: &Document) -> Vec<OutlineItem> {
+    let mut items = Vec::new();
+    let first =
+        |dict: &Dictionary, key: &[u8]| dict.get(key).ok().and_then(|o| o.as_reference().ok());
+    let root = doc
+        .catalog()
+        .ok()
+        .and_then(|c| c.get(b"Outlines").ok())
+        .and_then(|o| resolve(doc, o).as_dict().ok());
+    let mut open: Vec<(ObjectId, usize)> = root
+        .and_then(|r| first(r, b"First"))
+        .map(|id| (id, 1))
+        .into_iter()
+        .collect();
+    let mut seen = HashSet::new();
+    let mut named: Option<HashMap<Vec<u8>, ObjectId>> = None;
+    while let Some((id, level)) = open.pop() {
+        // `seen` guards against cyclic First/Next links.
+        let Ok(item) = doc.get_dictionary(id) else {
+            continue;
+        };
+        if !seen.insert(id) {
+            continue;
+        }
+        // The sibling goes on the stack first, so the children are visited before it.
+        open.extend(first(item, b"Next").map(|next| (next, level)));
+        open.extend(first(item, b"First").map(|child| (child, level + 1)));
+
+        let target = item.get(b"Dest").ok().or_else(|| {
+            let action = resolve(doc, item.get(b"A").ok()?).as_dict().ok()?;
+            (action.get(b"S").ok()?.as_name().ok()? == b"GoTo").then(|| action.get(b"D").ok())?
+        });
+        let page = target.and_then(|t| match resolve(doc, t) {
+            Object::Name(name) | Object::String(name, _) => named
+                .get_or_insert_with(|| named_destinations(doc))
+                .get(name)
+                .copied(),
+            other => destination_page(doc, other),
+        });
+        let title = item
+            .get(b"Title")
+            .ok()
+            .and_then(|t| text(resolve(doc, t)))
+            .unwrap_or_default();
+        items.push(OutlineItem { level, title, page });
+    }
+    items
+}
+
+/// Opens a PDF without parsing its objects up front; they are read on demand.
+///
+/// This is what read-only commands on large files want: opening costs a couple
+/// of milliseconds regardless of document size.
+pub fn open_lazy(path: &Path, password: Option<&str>) -> Result<(Pdf, bool)> {
+    let bytes = std::fs::read(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?;
+    let encrypted = trailer_has_encrypt(&bytes);
+    let pdf = Pdf::new_with_password(bytes, password.unwrap_or("")).map_err(|e| match e {
+        LoadPdfError::Decryption(_) => anyhow!(
+            "{} is encrypted: {}",
+            path.display(),
+            if password.is_some() {
+                "wrong password"
+            } else {
+                "pass a password"
+            }
+        ),
+        LoadPdfError::Invalid => anyhow!("cannot open {}: not a valid PDF", path.display()),
+    })?;
+    Ok((pdf, encrypted))
+}
+
+/// Whether the newest trailer names an encryption dictionary.
+///
+/// The lazy parser decrypts transparently and does not say whether it had to,
+/// so this reads the trailer the file's `startxref` points at.
+pub fn trailer_has_encrypt(bytes: &[u8]) -> bool {
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+    fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).rposition(|w| w == needle)
+    }
+    let tail = &bytes[bytes.len().saturating_sub(2048)..];
+    let Some(at) = rfind(tail, b"startxref") else {
+        return false;
+    };
+    let digits: String = tail[at + 9..]
+        .iter()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .take_while(|b| b.is_ascii_digit())
+        .map(|&b| b as char)
+        .collect();
+    let Some(section) = digits
+        .parse::<usize>()
+        .ok()
+        .and_then(|offset| bytes.get(offset..))
+    else {
+        return false;
+    };
+    // A classic table is followed by "trailer << ... >>"; a cross-reference stream
+    // keeps the same entries in its own dictionary, which ends where its data starts.
+    let trailer = if section.starts_with(b"xref") {
+        let start = find(section, b"trailer").unwrap_or(section.len());
+        let rest = &section[start..];
+        &rest[..find(rest, b"startxref").unwrap_or(rest.len())]
+    } else {
+        &section[..find(section, b"stream").unwrap_or(section.len().min(4096))]
+    };
+    find(trailer, b"/Encrypt").is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trailer_has_encrypt;
+
+    #[test]
+    fn detects_encrypt_in_classic_trailers_and_xref_streams() {
+        let classic = |trailer: &str| {
+            format!(
+                "%PDF-1.4\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< {trailer} >>\nstartxref\n9\n%%EOF"
+            )
+        };
+        assert!(trailer_has_encrypt(
+            classic("/Root 1 0 R /Encrypt 5 0 R").as_bytes()
+        ));
+        assert!(!trailer_has_encrypt(classic("/Root 1 0 R").as_bytes()));
+
+        let stream = |dict: &str| {
+            format!(
+                "%PDF-1.5\n7 0 obj\n<< /Type /XRef {dict} >>\nstream\n/Encrypt\nendstream\nendobj\nstartxref\n9\n%%EOF"
+            )
+        };
+        assert!(trailer_has_encrypt(stream("/Encrypt 5 0 R").as_bytes()));
+        // The word inside the stream data is not a dictionary entry.
+        assert!(!trailer_has_encrypt(stream("/Size 8").as_bytes()));
+
+        assert!(!trailer_has_encrypt(b"not a pdf"));
+        assert!(!trailer_has_encrypt(b"startxref\n99999\n%%EOF"));
+    }
 }

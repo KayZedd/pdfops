@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
-use crate::ops::{assemble, edit, forms, read, render};
+use crate::ops::{assemble, edit, forms, ocr, read, render};
 use crate::{mcp, tools};
 
 #[derive(Parser)]
@@ -32,11 +32,13 @@ enum Command {
     Text(read::TextArgs),
     /// Find text or a regular expression and return matching pages with context
     Search(read::SearchArgs),
+    /// Recognise text on scanned pages with OCR (needs the tesseract program)
+    Ocr(ocr::OcrArgs),
     /// List the outline (bookmarks / table of contents) with target pages
     Outline(read::OutlineArgs),
     /// Render pages to PNG files, e.g. to look at scans, charts or layout
     Render(render::RenderArgs),
-    /// Extract embedded images to files
+    /// Extract the images drawn on pages to files (JPEG and JPEG 2000 as stored, the rest as PNG)
     Images(render::ImagesArgs),
     /// Concatenate several PDFs into one
     Merge(assemble::MergeArgs),
@@ -46,11 +48,11 @@ enum Command {
     Split(assemble::SplitArgs),
     /// Rotate pages by a multiple of 90 degrees
     Rotate(edit::RotateArgs),
-    /// Draw a text watermark, header or footer (supports page numbers)
+    /// Draw a text watermark, header or footer in any script (supports page numbers)
     Stamp(edit::StampArgs),
     /// Set title, author, subject, keywords or creator
     SetMeta(edit::SetMetaArgs),
-    /// Shrink a PDF losslessly by recompressing streams and dropping unused objects
+    /// Shrink a PDF: lossless by default, optionally re-encoding and downscaling images
     Compress(edit::CompressArgs),
     /// Protect a PDF with AES-256 passwords and permissions
     Encrypt(edit::EncryptArgs),
@@ -79,6 +81,7 @@ fn run(command: Command) -> Result<Option<Value>> {
             value
         }
         Command::Search(a) => read::search(a)?,
+        Command::Ocr(a) => ocr::ocr(a)?,
         Command::Outline(a) => read::outline(a)?,
         Command::Render(a) => render::render(a)?,
         Command::Images(a) => render::images(a)?,

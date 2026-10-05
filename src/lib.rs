@@ -5,6 +5,7 @@
 
 pub mod cli;
 pub mod doc;
+pub mod font;
 pub mod mcp;
 pub mod ops;
 pub mod pagespec;

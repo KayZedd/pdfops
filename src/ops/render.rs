@@ -1,15 +1,21 @@
 //! Commands that produce images: render (pages to PNG) and images (embedded images).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use clap::Args;
-use hayro::hayro_interpret::InterpreterSettings;
-use hayro::hayro_syntax::Pdf;
+use hayro::hayro_interpret::font::GlyphRun;
+use hayro::hayro_interpret::util::TransformExt;
+use hayro::hayro_interpret::{
+    BlendMode, CacheKey, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageData,
+    ImageDrawProps, InterpreterCache, InterpreterSettings, LumaData, SoftMask, interpret_page,
+};
+use hayro::hayro_syntax::object::{Array, Dict, Name};
+use hayro::hayro_syntax::page::Page;
+use hayro::kurbo::{BezPath, Rect};
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{RenderCache, RenderSettings};
-use lopdf::{Document, Object, ObjectId, Stream};
 use rayon::prelude::*;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -52,21 +58,48 @@ pub struct ImagesArgs {
     pub pages: Option<String>,
     /// Skip images narrower or shorter than this many pixels (default: 1)
     #[arg(long)]
-    pub min_size: Option<i64>,
+    pub min_size: Option<u32>,
     /// Password, if the file is encrypted
     #[arg(long)]
     pub password: Option<String>,
 }
 
-pub fn render(a: RenderArgs) -> Result<Value> {
-    let dpi = a.dpi.unwrap_or(150.0);
+/// Rasterises one page and returns PNG bytes with the pixel size.
+pub fn page_png(
+    page: &Page<'_>,
+    settings: &InterpreterSettings,
+    dpi: f32,
+) -> Result<(Vec<u8>, u16, u16)> {
+    let (w, h) = page.render_dimensions();
+    let scale = (dpi / 72.0).min(MAX_EDGE / w.max(h).max(1.0));
+    let pixmap = hayro::render(
+        page,
+        &RenderCache::new(),
+        settings,
+        &RenderSettings::default(),
+        &hayro::PixmapSettings {
+            x_scale: scale,
+            y_scale: scale,
+            bg_color: WHITE,
+        },
+    );
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let png = pixmap
+        .into_png()
+        .map_err(|e| anyhow!("cannot encode page image: {e}"))?;
+    Ok((png, width, height))
+}
+
+pub fn check_dpi(dpi: f32) -> Result<f32> {
     if !dpi.is_finite() || dpi <= 0.0 {
         bail!("dpi must be positive");
     }
-    let bytes =
-        std::fs::read(&a.input).with_context(|| format!("cannot read {}", a.input.display()))?;
-    let pdf = Pdf::new_with_password(bytes, a.password.as_deref().unwrap_or(""))
-        .map_err(|e| anyhow!("cannot open {}: {e:?}", a.input.display()))?;
+    Ok(dpi)
+}
+
+pub fn render(a: RenderArgs) -> Result<Value> {
+    let dpi = check_dpi(a.dpi.unwrap_or(150.0))?;
+    let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
     let all = pdf.pages();
     let pages = pagespec::parse_or_all(a.pages.as_deref(), all.len() as u32)?;
     std::fs::create_dir_all(&a.out_dir)?;
@@ -75,25 +108,8 @@ pub fn render(a: RenderArgs) -> Result<Value> {
     let files: Vec<Value> = pages
         .par_iter()
         .map(|&n| {
-            let page = &all[n as usize - 1];
-            let (w, h) = page.render_dimensions();
-            let scale = (dpi / 72.0).min(MAX_EDGE / w.max(h).max(1.0));
-            let pixmap = hayro::render(
-                page,
-                &RenderCache::new(),
-                &settings,
-                &RenderSettings::default(),
-                &hayro::PixmapSettings {
-                    x_scale: scale,
-                    y_scale: scale,
-                    bg_color: WHITE,
-                },
-            );
-            let (width, height) = (pixmap.width(), pixmap.height());
+            let (png, width, height) = page_png(&all[n as usize - 1], &settings, dpi)?;
             let path = a.out_dir.join(format!("page-{n:04}.png"));
-            let png = pixmap
-                .into_png()
-                .map_err(|e| anyhow!("cannot encode page {n}: {e}"))?;
             std::fs::write(&path, png)
                 .with_context(|| format!("cannot write {}", path.display()))?;
             Ok(json!({"page": n, "file": path, "width": width, "height": height}))
@@ -102,151 +118,243 @@ pub fn render(a: RenderArgs) -> Result<Value> {
     Ok(json!({"dpi": dpi, "files": files}))
 }
 
-/// Image XObjects referenced directly by a page's resources.
-fn page_images(d: &Document, page: ObjectId) -> Vec<(ObjectId, &Stream)> {
-    let xobjects = doc::inherited(d, page, b"Resources")
-        .and_then(|r| r.as_dict().ok())
-        .and_then(|r| r.get(b"XObject").ok())
-        .and_then(|x| doc::resolve(d, x).as_dict().ok());
-    let Some(xobjects) = xobjects else {
-        return Vec::new();
-    };
-    xobjects
-        .iter()
-        .filter_map(|(_, v)| {
-            let id = v.as_reference().ok()?;
-            let stream = d.get_object(id).ok()?.as_stream().ok()?;
-            (stream.dict.get(b"Subtype").ok()?.as_name().ok()? == b"Image").then_some((id, stream))
-        })
-        .collect()
+/// An image's identity with its width and height in pixels.
+type Listed = (u128, u32, u32);
+
+/// What a page's content stream does with each image it draws.
+enum Mode<'m> {
+    /// Record identity and size, without decoding.
+    List(Vec<Listed>),
+    /// Decode and write the images this page was assigned.
+    Export {
+        wanted: &'m HashMap<u128, PathBuf>,
+        done: Vec<(u128, Result<PathBuf, String>)>,
+    },
 }
 
-fn filters(stream: &Stream) -> Vec<Vec<u8>> {
-    match stream.dict.get(b"Filter") {
-        Ok(Object::Name(n)) => vec![n.clone()],
-        Ok(Object::Array(a)) => a
-            .iter()
-            .filter_map(|o| o.as_name().ok().map(<[u8]>::to_vec))
-            .collect(),
-        _ => Vec::new(),
+/// A drawing target that ignores everything except images.
+///
+/// Running the real interpreter finds images wherever they are drawn from
+/// (page resources, nested forms, inline data) and decodes every filter and
+/// colour space the renderer supports.
+struct ImageSink<'m>(Mode<'m>);
+
+impl<'a> Device<'a> for ImageSink<'_> {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_glyph_run(&mut self, _: &GlyphRun<'_, 'a>, _: DrawProps<'a>, _: &DrawMode) {}
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+
+    fn draw_image(&mut self, image: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        let key = image.cache_key();
+        match &mut self.0 {
+            Mode::List(found) => {
+                if !found.iter().any(|f| f.0 == key) {
+                    found.push((key, image.width(), image.height()));
+                }
+            }
+            Mode::Export { wanted, done } => {
+                if let Some(stem) = wanted
+                    .get(&key)
+                    .filter(|_| !done.iter().any(|d| d.0 == key))
+                {
+                    done.push((key, export(&image, stem)));
+                }
+            }
+        }
     }
 }
 
-/// Writes one image and returns its file name, or why it cannot be exported.
-fn export(d: &Document, stream: &Stream, stem: &Path) -> Result<PathBuf, String> {
-    let filters = filters(stream);
-    // JPEG and JPEG 2000 payloads are complete files already; copy them untouched.
-    let passthrough = match filters.as_slice() {
-        [f] if f == b"DCTDecode" => Some("jpg"),
-        [f] if f == b"JPXDecode" => Some("jp2"),
-        _ => None,
-    };
-    let path;
-    let bytes;
-    if let Some(ext) = passthrough {
-        path = stem.with_extension(ext);
-        bytes = stream.content.clone();
-    } else {
-        let int = |key: &[u8]| {
-            stream
-                .dict
-                .get(key)
-                .ok()
-                .and_then(|o| doc::resolve(d, o).as_i64().ok())
-        };
-        let (w, h) = (int(b"Width").unwrap_or(0), int(b"Height").unwrap_or(0));
-        if int(b"BitsPerComponent") != Some(8) {
-            return Err("only 8-bit raw images are supported".into());
-        }
-        if w <= 0 || h <= 0 || w > u32::MAX as i64 || h > u32::MAX as i64 {
-            return Err("invalid image size".into());
-        }
-        let raw = if filters.is_empty() {
-            stream.content.clone()
-        } else {
-            stream
-                .decompressed_content()
-                .map_err(|e| format!("cannot decode: {e}"))?
-        };
-        let pixels = (w as usize)
-            .checked_mul(h as usize)
-            .ok_or("invalid image size")?;
-        // The channel count follows from the data length, which also covers ICC based spaces.
-        let (color, rgb) = match raw.len().checked_div(pixels) {
-            Some(1) => (png::ColorType::Grayscale, raw),
-            Some(3) => (png::ColorType::Rgb, raw),
-            Some(4) => (
-                png::ColorType::Rgb,
-                raw.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .flat_map(cmyk_to_rgb)
-                    .collect(),
-            ),
-            _ => return Err("unsupported colour space".into()),
-        };
-        let channels = if color == png::ColorType::Grayscale {
-            1
-        } else {
-            3
-        };
-        let mut out = Vec::new();
-        let mut encoder = png::Encoder::new(&mut out, w as u32, h as u32);
-        encoder.set_color(color);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-        writer
-            .write_image_data(&rgb[..pixels * channels])
-            .map_err(|e| e.to_string())?;
-        writer.finish().map_err(|e| e.to_string())?;
-        path = stem.with_extension("png");
-        bytes = out;
-    }
-    std::fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    Ok(path)
+fn interpret<'m>(page: &Page<'_>, mode: Mode<'m>) -> Mode<'m> {
+    let (w, h) = page.render_dimensions();
+    let cache = InterpreterCache::new();
+    let mut context = Context::new(
+        page.initial_transform(true).to_kurbo(),
+        Rect::new(0.0, 0.0, w as f64, h as f64),
+        &cache,
+        page.xref(),
+        InterpreterSettings::default(),
+    );
+    let mut sink = ImageSink(mode);
+    interpret_page(page, &mut context, &mut sink);
+    sink.0
 }
 
-fn cmyk_to_rgb(p: &[u8; 4]) -> [u8; 3] {
-    let k = 255 - p[3] as u32;
-    [0, 1, 2].map(|i| ((255 - p[i] as u32) * k / 255) as u8)
+fn write_png(
+    path: &Path,
+    width: u32,
+    height: u32,
+    color: png::ColorType,
+    data: &[u8],
+) -> Result<(), String> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(color);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+    writer.write_image_data(data).map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
+    std::fs::write(path, out).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Interleaves an alpha plane into colour samples of `channels` bytes per pixel.
+fn with_alpha(color: &[u8], channels: usize, alpha: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(color.len() + alpha.len());
+    for (pixel, a) in color.chunks_exact(channels).zip(alpha) {
+        out.extend_from_slice(pixel);
+        out.push(*a);
+    }
+    out
+}
+
+/// The stream's filter name, when it has exactly one.
+fn sole_filter(dict: &Dict<'_>) -> Option<Vec<u8>> {
+    if let Some(name) = dict.get::<Name<'_>>(b"Filter") {
+        return Some(name.as_ref().to_vec());
+    }
+    let mut names = dict.get::<Array<'_>>(b"Filter")?.iter::<Name<'_>>();
+    let first = names.next()?;
+    names.next().is_none().then(|| first.as_ref().to_vec())
+}
+
+/// Writes one image and returns its path, or why it cannot be exported.
+fn export(image: &Image<'_, '_>, stem: &Path) -> Result<PathBuf, String> {
+    let mut result = Err("cannot decode image data".to_string());
+    match image {
+        Image::Raster(raster) => {
+            let stream = raster.stream();
+            // JPEG and JPEG 2000 payloads are complete files already; copying keeps them lossless.
+            let passthrough = match sole_filter(stream.dict()).as_deref() {
+                Some(b"DCTDecode" | b"DCT") => Some("jpg"),
+                Some(b"JPXDecode") => Some("jp2"),
+                _ => None,
+            };
+            if let Some(ext) = passthrough {
+                let path = stem.with_extension(ext);
+                return std::fs::write(&path, stream.raw_data())
+                    .map(|_| path.clone())
+                    .map_err(|e| format!("cannot write {}: {e}", path.display()));
+            }
+            raster.with_rgba(
+                |data, alpha| {
+                    let (pixels, width, height, channels) = match &data {
+                        ImageData::Rgb(rgb) => (&rgb.data, rgb.width, rgb.height, 3),
+                        ImageData::Luma(luma) => (&luma.data, luma.width, luma.height, 1),
+                    };
+                    let count = width as usize * height as usize;
+                    if pixels.len() != count * channels {
+                        result = Err("unexpected image data size".to_string());
+                        return;
+                    }
+                    let alpha = alpha.filter(|a| {
+                        a.width == width && a.height == height && a.data.len() == count
+                    });
+                    let path = stem.with_extension("png");
+                    let written = match (channels, alpha) {
+                        (3, None) => write_png(&path, width, height, png::ColorType::Rgb, pixels),
+                        (3, Some(a)) => write_png(
+                            &path,
+                            width,
+                            height,
+                            png::ColorType::Rgba,
+                            &with_alpha(pixels, 3, &a.data),
+                        ),
+                        (_, None) => {
+                            write_png(&path, width, height, png::ColorType::Grayscale, pixels)
+                        }
+                        (_, Some(a)) => write_png(
+                            &path,
+                            width,
+                            height,
+                            png::ColorType::GrayscaleAlpha,
+                            &with_alpha(pixels, 1, &a.data),
+                        ),
+                    };
+                    result = written.map(|_| path);
+                },
+                None,
+            );
+        }
+        Image::Stencil(stencil) => stencil.with_stencil(
+            |LumaData {
+                 data,
+                 width,
+                 height,
+                 ..
+             },
+             _| {
+                let path = stem.with_extension("png");
+                result = if data.len() == width as usize * height as usize {
+                    write_png(&path, width, height, png::ColorType::Grayscale, &data).map(|_| path)
+                } else {
+                    Err("unexpected mask data size".to_string())
+                };
+            },
+            None,
+        ),
+    }
+    result
 }
 
 pub fn images(a: ImagesArgs) -> Result<Value> {
-    let d = doc::load(&a.input, a.password.as_deref())?;
-    let ids = doc::page_ids(&d);
-    let pages = pagespec::parse_or_all(a.pages.as_deref(), ids.len() as u32)?;
+    let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
+    let all = pdf.pages();
+    let pages = pagespec::parse_or_all(a.pages.as_deref(), all.len() as u32)?;
     let min = a.min_size.unwrap_or(1);
     std::fs::create_dir_all(&a.out_dir)?;
 
-    // An image reused on several pages is exported once, under its first page.
-    let mut seen = HashSet::new();
-    let mut jobs = Vec::new();
-    for &n in &pages {
-        for (id, stream) in page_images(&d, ids[n as usize - 1]) {
-            if seen.insert(id) {
-                jobs.push((n, id, stream));
+    let listed: Vec<(u32, Vec<Listed>)> = pages
+        .par_iter()
+        .map(
+            |&n| match interpret(&all[n as usize - 1], Mode::List(Vec::new())) {
+                Mode::List(found) => (n, found),
+                Mode::Export { .. } => unreachable!("interpret returns the mode it was given"),
+            },
+        )
+        .collect();
+
+    // An image drawn on several pages is exported once, under the first page that uses it.
+    let mut owner: HashMap<u128, (u32, u32, u32)> = HashMap::new();
+    let mut jobs: Vec<(u32, HashMap<u128, PathBuf>)> = Vec::new();
+    for (n, found) in listed {
+        let mut wanted = HashMap::new();
+        for (key, w, h) in found {
+            if w >= min && h >= min && !owner.contains_key(&key) {
+                owner.insert(key, (n, w, h));
+                wanted.insert(
+                    key,
+                    a.out_dir
+                        .join(format!("page-{n:04}-img-{:02}", wanted.len() + 1)),
+                );
             }
         }
+        if !wanted.is_empty() {
+            jobs.push((n, wanted));
+        }
     }
+
     let results: Vec<Value> = jobs
         .par_iter()
-        .filter_map(|&(n, id, stream)| {
-            let dim = |key: &[u8]| {
-                stream
-                    .dict
-                    .get(key)
-                    .ok()
-                    .and_then(|o| doc::resolve(&d, o).as_i64().ok())
-                    .unwrap_or(0)
+        .flat_map_iter(|(n, wanted)| {
+            let done = match interpret(
+                &all[*n as usize - 1],
+                Mode::Export {
+                    wanted,
+                    done: Vec::new(),
+                },
+            ) {
+                Mode::Export { done, .. } => done,
+                Mode::List(_) => unreachable!("interpret returns the mode it was given"),
             };
-            let (w, h) = (dim(b"Width"), dim(b"Height"));
-            if w < min || h < min {
-                return None;
-            }
-            let stem = a.out_dir.join(format!("page-{n:04}-img-{}", id.0));
-            Some(match export(&d, stream, &stem) {
-                Ok(path) => json!({"page": n, "file": path, "width": w, "height": h}),
-                Err(reason) => json!({"page": n, "width": w, "height": h, "skipped": reason}),
+            let owner = &owner;
+            done.into_iter().map(move |(key, outcome)| {
+                let (_, w, h) = owner[&key];
+                match outcome {
+                    Ok(path) => json!({"page": n, "file": path, "width": w, "height": h}),
+                    Err(reason) => json!({"page": n, "width": w, "height": h, "skipped": reason}),
+                }
             })
         })
         .collect();

@@ -59,8 +59,15 @@ fn skeleton(doc: &mut Document, pages_id: ObjectId, kids: Vec<Object>, extra: Di
 }
 
 fn text_page(doc: &mut Document, pages_id: ObjectId, text: &str) -> ObjectId {
-    let content = format!("BT /F1 18 Tf 72 720 Td ({text}) Tj ET");
-    let content = doc.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+    content_page(
+        doc,
+        pages_id,
+        &format!("BT /F1 18 Tf 72 720 Td ({text}) Tj ET"),
+    )
+}
+
+fn content_page(doc: &mut Document, pages_id: ObjectId, content: &str) -> ObjectId {
+    let content = doc.add_object(Stream::new(Dictionary::new(), content.as_bytes().to_vec()));
     doc.add_object(dictionary! { "Type" => "Page", "Parent" => pages_id, "Contents" => content })
 }
 
@@ -109,7 +116,11 @@ pub fn sample(dir: &Path, name: &str, pages: u32) -> PathBuf {
 pub fn form(dir: &Path) -> PathBuf {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
-    let page = text_page(&mut doc, pages_id, "Registration form");
+    let page = content_page(
+        &mut doc,
+        pages_id,
+        "BT /F1 18 Tf 72 720 Td (Registration form) Tj ET q 20 0 0 20 400 700 cm /Im1 Do Q",
+    );
 
     let image = doc.add_object(Stream::new(
         dictionary! {
@@ -174,4 +185,96 @@ pub fn form(dir: &Path) -> PathBuf {
     let path = dir.join("form.pdf");
     doc.save(&path).unwrap();
     path
+}
+
+/// One page drawing the given image streams side by side, each 100 points wide.
+pub fn with_images(dir: &Path, name: &str, images: Vec<Stream>) -> PathBuf {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let mut xobjects = Dictionary::new();
+    let mut content = String::new();
+    for (i, image) in images.into_iter().enumerate() {
+        let id = doc.add_object(image);
+        xobjects.set(format!("Im{i}"), id);
+        content += &format!("q 100 0 0 100 {} 600 cm /Im{i} Do Q\n", 50 + i * 120);
+    }
+    let page = content_page(&mut doc, pages_id, &content);
+    doc.get_dictionary_mut(page)
+        .unwrap()
+        .set("Resources", dictionary! { "XObject" => xobjects });
+    skeleton(&mut doc, pages_id, vec![page.into()], Dictionary::new());
+    let path = dir.join(name);
+    doc.save(&path).unwrap();
+    path
+}
+
+pub fn image_stream(
+    width: i64,
+    height: i64,
+    color_space: Object,
+    bits: i64,
+    data: Vec<u8>,
+) -> Stream {
+    Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => width, "Height" => height,
+            "ColorSpace" => color_space, "BitsPerComponent" => bits,
+        },
+        data,
+    )
+}
+
+/// A page that shows page 1 of `source` as a picture only, like a scanner would produce.
+pub fn scan(dir: &Path, source: &Path) -> PathBuf {
+    let v = call(
+        "pdf_render",
+        json!({"input": source, "out_dir": dir.join("scan"), "pages": "1", "dpi": 150}),
+    );
+    let bytes = std::fs::read(v["files"][0]["file"].as_str().unwrap()).unwrap();
+    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+        .read_info()
+        .unwrap();
+    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    let channels = buf.len() / (info.width * info.height) as usize;
+    let gray: Vec<u8> = buf.chunks(channels).map(|p| p[0]).collect();
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let image = doc.add_object(image_stream(
+        info.width as i64,
+        info.height as i64,
+        "DeviceGray".into(),
+        8,
+        gray,
+    ));
+    let page = content_page(&mut doc, pages_id, "q 612 0 0 792 0 0 cm /Im1 Do Q");
+    doc.get_dictionary_mut(page).unwrap().set(
+        "Resources",
+        dictionary! { "XObject" => dictionary! { "Im1" => image } },
+    );
+    skeleton(&mut doc, pages_id, vec![page.into()], Dictionary::new());
+    let path = dir.join("scan.pdf");
+    doc.save(&path).unwrap();
+    path
+}
+
+/// A tesseract language to test with, if the engine and any language data are installed.
+pub fn ocr_lang() -> Option<String> {
+    let out = std::process::Command::new("tesseract")
+        .arg("--list-langs")
+        .output()
+        .ok()?;
+    let text = String::from_utf8([out.stdout, out.stderr].concat()).ok()?;
+    let langs: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && *l != "osd")
+        .collect();
+    langs
+        .iter()
+        .find(|l| **l == "eng")
+        .or(langs.first())
+        .map(|l| l.to_string())
 }

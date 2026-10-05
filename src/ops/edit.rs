@@ -14,6 +14,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::font::TextFont;
+use crate::ops::lossy;
 use crate::{doc, pagespec};
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
@@ -112,6 +114,12 @@ pub struct CompressArgs {
     /// Where to write the result (may be the input file)
     #[arg(short, long)]
     pub output: PathBuf,
+    /// Lossy: re-encode photos as JPEG at this quality, 1-100 (default: off, or 75 when a maximum edge is given)
+    #[arg(long)]
+    pub image_quality: Option<u8>,
+    /// Lossy: downscale images so neither side exceeds this many pixels (default: off)
+    #[arg(long)]
+    pub max_image_edge: Option<u32>,
     /// Password, if the file is encrypted
     #[arg(long)]
     pub password: Option<String>,
@@ -162,6 +170,9 @@ pub struct StampArgs {
     /// Text colour as RRGGBB hex (default: 000000)
     #[arg(long)]
     pub color: Option<String>,
+    /// TrueType or OpenType font file to embed (default: Helvetica, or an installed font when the text needs one)
+    #[arg(long)]
+    pub font: Option<PathBuf>,
     /// Pages to stamp, e.g. "2-" (default: all)
     #[arg(short, long)]
     pub pages: Option<String>,
@@ -308,6 +319,19 @@ pub fn compress(a: CompressArgs) -> Result<Value> {
     let before = std::fs::metadata(&a.input)?.len();
     let mut d = doc::load(&a.input, a.password.as_deref())?;
     let removed = prune(&mut d);
+    let lossy = a.image_quality.is_some() || a.max_image_edge.is_some();
+    let quality = a.image_quality.unwrap_or(75);
+    if !(1..=100).contains(&quality) {
+        bail!("image quality must be between 1 and 100");
+    }
+    if a.max_image_edge == Some(0) {
+        bail!("maximum image edge must be at least 1");
+    }
+    let recompressed = if lossy {
+        lossy::recompress_images(&mut d, quality, a.max_image_edge)
+    } else {
+        0
+    };
     d.compress();
     let mut buf = Vec::new();
     d.save_modern(&mut buf)?;
@@ -325,6 +349,7 @@ pub fn compress(a: CompressArgs) -> Result<Value> {
         "size_after": after,
         "saved_percent": ((before.saturating_sub(after)) as f64 * 1000.0 / before.max(1) as f64).round() / 10.0,
         "unused_objects_removed": removed,
+        "images_recompressed": if smaller { recompressed } else { 0 },
         "rewritten": smaller,
     }))
 }
@@ -335,59 +360,6 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
-}
-
-/// Helvetica advance widths for ASCII 32..=126, in 1/1000 em (Adobe AFM).
-const HELVETICA: [u16; 95] = [
-    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
-    556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667,
-    611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667,
-    667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500,
-    222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
-];
-
-/// Width of WinAnsi `bytes` set in Helvetica at `size` points.
-pub fn helvetica_width(bytes: &[u8], size: f64) -> f64 {
-    let units: u32 = bytes
-        .iter()
-        .map(|&b| {
-            HELVETICA
-                .get((b as usize).wrapping_sub(32))
-                .copied()
-                .unwrap_or(556) as u32
-        })
-        .sum();
-    units as f64 * size / 1000.0
-}
-
-/// Encodes text for a WinAnsi font. Only Latin-1 is representable in the standard fonts.
-pub fn winansi(text: &str) -> Result<Vec<u8>> {
-    text.chars()
-        .map(|c| match c as u32 {
-            0x20..=0x7e | 0xa0..=0xff => Ok(c as u8),
-            _ => Err(anyhow!(
-                "character '{c}' is not supported by the built-in font (Latin-1 only)"
-            )),
-        })
-        .collect()
-}
-
-/// A PDF literal string, escaped.
-pub fn literal(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() + 2);
-    s.push('(');
-    for &b in bytes {
-        match b {
-            b'(' | b')' | b'\\' => {
-                s.push('\\');
-                s.push(b as char);
-            }
-            0x20..=0x7e => s.push(b as char),
-            _ => s.push_str(&format!("\\{b:03o}")),
-        }
-    }
-    s.push(')');
-    s
 }
 
 fn parse_color(hex: &str) -> Result<[f64; 3]> {
@@ -464,12 +436,9 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
     let total = ids.len() as u32;
     let pages = pagespec::parse_or_all(a.pages.as_deref(), total)?;
 
-    let mut font = Dictionary::new();
-    font.set("Type", Object::Name(b"Font".to_vec()));
-    font.set("Subtype", Object::Name(b"Type1".to_vec()));
-    font.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
-    font.set("Encoding", Object::Name(b"WinAnsiEncoding".to_vec()));
-    let font_id = d.add_object(font);
+    // Page numbers are substituted per page, so the font must cover digits too.
+    let font = TextFont::new(&mut d, &format!("{}0123456789", a.text), a.font.as_deref())?;
+    let font_id = font.id;
     let mut gs = Dictionary::new();
     gs.set("Type", Object::Name(b"ExtGState".to_vec()));
     gs.set("ca", opacity as f32);
@@ -478,14 +447,15 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
     let open_id = d.add_object(Stream::new(Dictionary::new(), b"q\n".to_vec()));
 
     let margin = 24.0;
-    let unique: HashSet<u32> = pages.iter().copied().collect();
+    let mut unique = pages.clone();
+    unique.sort_unstable();
+    unique.dedup();
     for &n in &unique {
         let id = ids[n as usize - 1];
-        let text = winansi(
-            &a.text
-                .replace("{pages}", &total.to_string())
-                .replace("{page}", &n.to_string()),
-        )?;
+        let text = a
+            .text
+            .replace("{pages}", &total.to_string())
+            .replace("{page}", &n.to_string());
         let (m, vw, vh) = visual_space(doc::page_box(&d, id), doc::rotation(&d, id));
 
         let mut res = doc::inherited(&d, id, b"Resources")
@@ -502,7 +472,7 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
         let size = if watermark {
             // Fit the text to 70% of the diagonal unless a size was requested.
             let size = a.size.unwrap_or_else(|| {
-                (0.7 * vw.hypot(vh) / helvetica_width(&text, 1.0).max(0.001)).clamp(8.0, 144.0)
+                (0.7 * vw.hypot(vh) / font.width(&text, 1.0).max(0.001)).clamp(8.0, 144.0)
             });
             let angle = (vh / vw).atan();
             let (sin, cos) = angle.sin_cos();
@@ -514,13 +484,13 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
             );
             ops += &format!(
                 "BT\n1 0 0 1 {:.2} {:.2} Tm\n",
-                -helvetica_width(&text, size) / 2.0,
+                -font.width(&text, size) / 2.0,
                 -size * 0.35
             );
             size
         } else {
             let size = a.size.unwrap_or(10.0);
-            let width = helvetica_width(&text, size);
+            let width = font.width(&text, size);
             let x = match align {
                 Align::Left => margin,
                 Align::Center => (vw - width) / 2.0,
@@ -536,7 +506,7 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
         };
         ops += &format!(
             "/{font_name} {size:.2} Tf\n{r:.3} {g:.3} {b:.3} rg\n{} Tj\nET\nQ\n",
-            literal(&text)
+            font.encode(&text)
         );
         let stream_id = d.add_object(Stream::new(Dictionary::new(), ops.into_bytes()));
 
@@ -553,7 +523,5 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
         page.set("Resources", res);
     }
     let size = doc::save(&mut d, &a.output)?;
-    let mut stamped: Vec<u32> = unique.into_iter().collect();
-    stamped.sort_unstable();
-    Ok(json!({"output": a.output, "stamped_pages": stamped, "size_bytes": size}))
+    Ok(json!({"output": a.output, "stamped_pages": unique, "size_bytes": size}))
 }
