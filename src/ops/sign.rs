@@ -411,6 +411,12 @@ pub fn sign(a: SignArgs) -> Result<Value> {
         update.new_document = addition;
         let mut bytes = Vec::new();
         update.save_to(&mut bytes)?;
+        // The appended section must point back at the one before it. Where the original
+        // cross-reference table was itself unreadable, it cannot, and readers would see
+        // only the appended objects.
+        if find(&bytes[original.len()..], b"/Prev").is_none() {
+            bail!("the original cross-reference section cannot be chained to");
+        }
         Ok(bytes)
     })();
     let (mut bytes, searched_from, kept) = match appended {
