@@ -1676,3 +1676,194 @@ fn a_signature_can_be_shown_on_the_page() {
     );
     assert!(e.contains("out of range"), "{e}");
 }
+
+/// A timestamp authority for one request: it states a fixed time about whatever digest
+/// it is sent. Returns its address.
+fn timestamp_authority(honest: bool, willing: bool) -> String {
+    use std::io::{Read, Write};
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        match content.len() {
+            n if n < 128 => out.push(n as u8),
+            n if n < 256 => out.extend([0x81, n as u8]),
+            n => out.extend([0x82, (n >> 8) as u8, n as u8]),
+        }
+        out.extend_from_slice(content);
+        out
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        // The request ends with the digest, a nonce and a flag: 32 + 10 + 3 bytes after "04 20".
+        let digest = loop {
+            let n = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..n]);
+            let found = request
+                .windows(2)
+                .rposition(|w| w == [0x04, 0x20])
+                .filter(|at| request.len() >= at + 2 + 32 + 13);
+            if let Some(at) = found {
+                break request[at + 2..at + 34].to_vec();
+            }
+            assert!(n > 0, "the request ended early");
+        };
+        let about = if honest { digest } else { vec![7; 32] };
+        let algorithm = [
+            0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+            0x00,
+        ];
+        let statement = tlv(
+            0x30,
+            &[
+                vec![0x02, 0x01, 0x01],
+                vec![0x06, 0x03, 0x2a, 0x03, 0x04],
+                tlv(0x30, &[algorithm.to_vec(), tlv(0x04, &about)].concat()),
+                vec![0x02, 0x01, 0x2a],
+                tlv(0x18, b"20300102030405Z"),
+            ]
+            .concat(),
+        );
+        let signed = tlv(
+            0x30,
+            &[
+                vec![0x02, 0x01, 0x03, 0x31, 0x00],
+                tlv(
+                    0x30,
+                    &[
+                        vec![
+                            0x06, 0x0b, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x01,
+                            0x04,
+                        ],
+                        tlv(0xa0, &tlv(0x04, &statement)),
+                    ]
+                    .concat(),
+                ),
+                vec![0x31, 0x00],
+            ]
+            .concat(),
+        );
+        let token = tlv(
+            0x30,
+            &[
+                vec![
+                    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02,
+                ],
+                tlv(0xa0, &signed),
+            ]
+            .concat(),
+        );
+        let body = if willing {
+            tlv(0x30, &[vec![0x30, 0x03, 0x02, 0x01, 0x00], token].concat())
+        } else {
+            // Status 2: rejection.
+            vec![0x30, 0x05, 0x30, 0x03, 0x02, 0x01, 0x02]
+        };
+        let mut reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/timestamp-reply\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        reply.extend_from_slice(&body);
+        stream.write_all(&reply).unwrap();
+    });
+    address
+}
+
+#[test]
+fn a_timestamp_authority_states_when_the_signature_was_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 1);
+    let (cert, key) = common::identity(dir.path(), "Ada Signer");
+    let signed = dir.path().join("signed.pdf");
+    let v = call(
+        "pdf_sign",
+        json!({"input": pdf, "output": signed, "cert": cert, "key": key, "tsa": timestamp_authority(true, true)}),
+    );
+    assert_eq!(v["timestamped"], true, "{v}");
+    let v = call("pdf_signatures", json!({"input": signed}));
+    let s = &v["details"][0];
+    assert_eq!(s["valid"], true, "{v}");
+    assert_eq!(s["timestamp"]["time"], "D:20300102030405Z", "{v}");
+    assert_eq!(s["timestamp"]["about_this_signature"], true, "{v}");
+
+    // A token about something else is not embedded, and nothing is written.
+    let other = dir.path().join("other.pdf");
+    let e = call_err(
+        "pdf_sign",
+        json!({"input": pdf, "output": other, "cert": cert, "key": key, "tsa": timestamp_authority(false, true)}),
+    );
+    assert!(e.contains("about something else"), "{e}");
+    assert!(!other.exists());
+    // Nor is the document signed without the timestamp when the authority declines.
+    let e = call_err(
+        "pdf_sign",
+        json!({"input": pdf, "output": other, "cert": cert, "key": key, "tsa": timestamp_authority(true, false)}),
+    );
+    assert!(e.contains("the request was refused"), "{e}");
+    assert!(!other.exists());
+}
+
+#[test]
+fn revoked_certificates_are_found_in_their_issuers_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 1);
+    let check = |revoked: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        // One server per case: its address goes into the certificate, its list comes after.
+        let (address, give) = common::serve_later();
+        let (cert, key, authority, lists) =
+            common::issued_identity_with_lists(dir.path(), "Ada Signer", Some(address));
+        give(lists[usize::from(revoked)].clone());
+        let signed = dir.path().join("signed.pdf");
+        call(
+            "pdf_sign",
+            json!({"input": pdf, "output": signed, "cert": cert, "key": key}),
+        );
+        call(
+            "pdf_signatures",
+            json!({"input": signed, "trust": authority, "revocation": true}),
+        )
+    };
+    let v = check(false);
+    let s = &v["details"][0];
+    assert_eq!(s["trusted"], true, "{v}");
+    assert!(
+        s["revocation"].as_str().unwrap().starts_with("none of"),
+        "{v}"
+    );
+    let v = check(true);
+    let s = &v["details"][0];
+    assert_eq!(
+        (&s["valid"], &s["trusted"]),
+        (&json!(true), &json!(false)),
+        "{v}"
+    );
+    assert_eq!(
+        s["revocation"], "the certificate of Ada Signer was revoked",
+        "{v}"
+    );
+
+    // A certificate that names no list leaves the question open, and says so.
+    let (cert, key, authority) = common::issued_identity(dir.path(), "Bob Signer");
+    let signed = dir.path().join("signed.pdf");
+    call(
+        "pdf_sign",
+        json!({"input": pdf, "output": signed, "cert": cert, "key": key}),
+    );
+    let v = call(
+        "pdf_signatures",
+        json!({"input": signed, "trust": authority, "revocation": true}),
+    );
+    let s = &v["details"][0];
+    assert_eq!(s["trusted"], true, "{v}");
+    assert!(
+        s["revocation"]
+            .as_str()
+            .unwrap()
+            .contains("names no revocation list"),
+        "{v}"
+    );
+}

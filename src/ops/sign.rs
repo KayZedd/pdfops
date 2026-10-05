@@ -62,6 +62,9 @@ pub struct SignArgs {
     /// Show the signature on a page, as a box with the signer's name, the date and the reason: "page:x0,y0,x1,y1" in the coordinates layout reports (default: the signature is not shown)
     #[arg(long)]
     pub visible: Option<String>,
+    /// Address of a timestamp authority (RFC 3161), e.g. "http://timestamp.digicert.com"; its signed statement of the time is embedded, so the signature can be shown to have existed then
+    #[arg(long)]
+    pub tsa: Option<String>,
 }
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
@@ -72,6 +75,10 @@ pub struct SignaturesArgs {
     /// PEM file of certificates you trust, such as your organisation's root; each signer's chain is checked against them
     #[arg(long)]
     pub trust: Option<PathBuf>,
+    /// Also download the revocation lists that the certificates of a trusted chain name, and check that none of them was revoked (needs network access)
+    #[arg(long)]
+    #[serde(default)]
+    pub revocation: bool,
     /// Password, if the file is encrypted
     #[arg(long)]
     pub password: Option<String>,
@@ -93,9 +100,92 @@ const RSA_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.11354
 const RSA_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
 const ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
 const BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
+const CRL_DISTRIBUTION_POINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.31");
+const TIMESTAMP_TOKEN: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.14");
 
 /// Room reserved in the file for the signature; the real one is padded to fit.
 const HOLE: usize = 16384;
+
+/// Room for the signature, with more where an authority's timestamp joins it.
+fn hole(a: &SignArgs) -> usize {
+    if a.tsa.is_some() { 2 * HOLE } else { HOLE }
+}
+
+/// A timestamp authority's token: when it says it was made, and the digest it is about.
+struct Timestamp {
+    /// Seconds since 1970.
+    time: u64,
+    about: Vec<u8>,
+}
+
+/// Reads a timestamp token. The authority's own signature on it is not checked.
+fn read_timestamp(token: &der::Any) -> Option<Timestamp> {
+    let info = token.decode_as::<ContentInfo>().ok()?;
+    let data = info.content.decode_as::<SignedData>().ok()?;
+    let statement = data.encap_content_info.econtent?;
+    // TSTInfo: version, policy, the digest it is about, serial number, time, ...
+    let fields = Vec::<der::Any>::from_der(statement.value()).ok()?;
+    let imprint = fields.get(2)?.decode_as::<Vec<der::Any>>().ok()?;
+    let time = fields
+        .get(4)?
+        .decode_as::<der::asn1::GeneralizedTime>()
+        .ok()?;
+    Some(Timestamp {
+        time: time.to_unix_duration().as_secs(),
+        about: imprint.get(1)?.value().to_vec(),
+    })
+}
+
+/// Asks a timestamp authority to state when `signature` existed. Returns its token.
+fn request_timestamp(url: &str, signature: &[u8]) -> Result<der::Any> {
+    let digest = Sha256::digest(signature);
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).map_err(|e| anyhow!("no random numbers: {e}"))?;
+    // A positive number of full length.
+    nonce[0] = nonce[0] & 0x7f | 0x40;
+    // TimeStampReq: version 1, SHA-256 digest, a nonce, and "send your certificate".
+    let mut request = vec![0x30, 0x43, 0x02, 0x01, 0x01, 0x30, 0x31, 0x30, 0x0d];
+    request.extend_from_slice(&[
+        0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+    ]);
+    request.extend_from_slice(&[0x05, 0x00, 0x04, 0x20]);
+    request.extend_from_slice(&digest);
+    request.extend_from_slice(&[0x02, 0x08]);
+    request.extend_from_slice(&nonce);
+    request.extend_from_slice(&[0x01, 0x01, 0xff]);
+
+    let failed = |why: String| anyhow!("no timestamp from {url}: {why}");
+    let mut response = ureq::post(url)
+        .header("Content-Type", "application/timestamp-query")
+        .send(&request[..])
+        .map_err(|e| failed(e.to_string()))?;
+    let reply = response
+        .body_mut()
+        .with_config()
+        .limit(1024 * 1024)
+        .read_to_vec()
+        .map_err(|e| failed(e.to_string()))?;
+    // TimeStampResp: a status, and the token when the status is "granted".
+    let parts = Vec::<der::Any>::from_der(&reply)
+        .map_err(|_| failed("the reply is not a timestamp response".into()))?;
+    let granted = parts
+        .first()
+        .and_then(|status| status.decode_as::<Vec<der::Any>>().ok())
+        .and_then(|status| status.first().map(|code| code.value().to_vec()))
+        .is_some_and(|code| code == [0] || code == [1]);
+    let token = parts
+        .get(1)
+        .filter(|_| granted)
+        .ok_or_else(|| failed("the request was refused".into()))?;
+    let stated = read_timestamp(token).ok_or_else(|| failed("the token cannot be read".into()))?;
+    if stated.about != digest[..] {
+        return Err(failed(
+            "the token is about something else than this signature".into(),
+        ));
+    }
+    Ok(token.clone())
+}
 /// What the byte range looks like before the real offsets are known. Each
 /// number is as wide as an offset can get, so the final text fits in its place.
 const RANGE_PLACEHOLDER: i64 = 9_999_999_999;
@@ -214,7 +304,7 @@ fn common_name(name: &x509_cert::name::Name) -> Option<String> {
 }
 
 /// Builds the detached CMS structure over a digest of the document.
-fn cms_signature(identity: &Identity, digest: &[u8]) -> Result<Vec<u8>> {
+fn cms_signature(identity: &Identity, digest: &[u8], tsa: Option<&str>) -> Result<Vec<u8>> {
     let content = EncapsulatedContentInfo {
         econtent_type: DATA,
         econtent: None,
@@ -260,7 +350,31 @@ fn cms_signature(identity: &Identity, digest: &[u8]) -> Result<Vec<u8>> {
                 .map_err(failed)?
         }
     };
-    Ok(signed.to_der()?)
+    let Some(tsa) = tsa else {
+        return Ok(signed.to_der()?);
+    };
+    // The authority's statement is about the signature value, and joins the signer's
+    // entry as an attribute that is not itself signed.
+    let mut data = signed.content.decode_as::<SignedData>()?;
+    let mut signers = data.signer_infos.0.into_vec();
+    let signer = signers
+        .first_mut()
+        .ok_or_else(|| anyhow!("cannot build the signature: no signer"))?;
+    let token = request_timestamp(tsa, signer.signature.as_bytes())?;
+    let mut values = der::asn1::SetOfVec::new();
+    values.insert(token)?;
+    let mut attributes = der::asn1::SetOfVec::new();
+    attributes.insert(x509_cert::attr::Attribute {
+        oid: TIMESTAMP_TOKEN,
+        values,
+    })?;
+    signer.unsigned_attrs = Some(attributes);
+    data.signer_infos = signers.try_into()?;
+    Ok(ContentInfo {
+        content_type: SIGNED_DATA,
+        content: der::Any::encode_from(&data)?,
+    }
+    .to_der()?)
 }
 
 /// Days since 1970-01-01 to a calendar date (proleptic Gregorian).
@@ -383,7 +497,7 @@ fn add_signature(
     );
     sig.set(
         "Contents",
-        Object::String(vec![0; HOLE], StringFormat::Hexadecimal),
+        Object::String(vec![0; hole(a)], StringFormat::Hexadecimal),
     );
     sig.set("M", Object::string_literal(pdf_date(now)));
     for (key, value) in [
@@ -550,7 +664,8 @@ pub fn sign(a: SignArgs) -> Result<Value> {
     };
 
     // Now that the file exists, find the hole and say which bytes are signed.
-    let hole = format!("/Contents<{}>", "0".repeat(HOLE * 2));
+    let room = hole(&a);
+    let hole = format!("/Contents<{}>", "0".repeat(room * 2));
     let at = searched_from
         + find(&bytes[searched_from..], hole.as_bytes())
             .ok_or_else(|| anyhow!("cannot locate the signature in the written file"))?;
@@ -567,8 +682,8 @@ pub fn sign(a: SignArgs) -> Result<Value> {
     let mut hasher = Sha256::new();
     hasher.update(&bytes[..start]);
     hasher.update(&bytes[end..]);
-    let cms = cms_signature(&identity, &hasher.finalize())?;
-    if cms.len() > HOLE {
+    let cms = cms_signature(&identity, &hasher.finalize(), a.tsa.as_deref())?;
+    if cms.len() > room {
         bail!(
             "the certificate chain is too large to embed ({} bytes)",
             cms.len()
@@ -585,6 +700,7 @@ pub fn sign(a: SignArgs) -> Result<Value> {
         "certificates_embedded": identity.certs.len(),
         "earlier_signatures": earlier,
         "earlier_signatures_kept": kept || earlier == 0,
+        "timestamped": a.tsa.is_some(),
         "size_bytes": bytes.len(),
     }))
 }
@@ -673,8 +789,22 @@ fn issued_by(cert: &Certificate, issuer: &Certificate) -> Option<bool> {
     if cert.tbs_certificate.issuer != issuer.tbs_certificate.subject {
         return Some(false);
     }
-    let message = cert.tbs_certificate.to_der().ok()?;
-    let signature = cert.signature.raw_bytes();
+    made_by(
+        &cert.tbs_certificate.to_der().ok()?,
+        cert.signature.raw_bytes(),
+        cert.signature_algorithm.oid,
+        issuer,
+    )
+}
+
+/// Whether the key of `issuer` made `signature` over `message`. `None` where the
+/// algorithm is not one that is checked.
+fn made_by(
+    message: &[u8],
+    signature: &[u8],
+    algorithm: ObjectIdentifier,
+    issuer: &Certificate,
+) -> Option<bool> {
     let spki = issuer
         .tbs_certificate
         .subject_public_key_info
@@ -682,29 +812,108 @@ fn issued_by(cert: &Certificate, issuer: &Certificate) -> Option<bool> {
         .ok()?;
     let rsa_key = || rsa::RsaPublicKey::from_public_key_der(&spki).ok();
     let rsa_signature = || rsa::pkcs1v15::Signature::try_from(signature).ok();
-    match cert.signature_algorithm.oid {
+    match algorithm {
         oid if oid == RSA_SHA256 => Some(
             rsa::pkcs1v15::VerifyingKey::<Sha256>::new(rsa_key()?)
-                .verify(&message, &rsa_signature()?)
+                .verify(message, &rsa_signature()?)
                 .is_ok(),
         ),
         oid if oid == RSA_SHA384 => Some(
             rsa::pkcs1v15::VerifyingKey::<Sha384>::new(rsa_key()?)
-                .verify(&message, &rsa_signature()?)
+                .verify(message, &rsa_signature()?)
                 .is_ok(),
         ),
         oid if oid == RSA_SHA512 => Some(
             rsa::pkcs1v15::VerifyingKey::<Sha512>::new(rsa_key()?)
-                .verify(&message, &rsa_signature()?)
+                .verify(message, &rsa_signature()?)
                 .is_ok(),
         ),
         oid if oid == ECDSA_SHA256 => {
             let key = p256::ecdsa::VerifyingKey::from_public_key_der(&spki).ok()?;
             let signature = p256::ecdsa::DerSignature::from_bytes(signature).ok()?;
-            Some(key.verify(&message, &signature).is_ok())
+            Some(key.verify(message, &signature).is_ok())
         }
         _ => None,
     }
+}
+
+/// Where a certificate says the list of its issuer's revoked certificates is kept.
+fn revocation_list_address(cert: &Certificate) -> Option<String> {
+    use x509_cert::ext::pkix::crl::dp::DistributionPoint;
+    use x509_cert::ext::pkix::name::{DistributionPointName, GeneralName};
+    let extension = cert
+        .tbs_certificate
+        .extensions
+        .iter()
+        .flatten()
+        .find(|extension| extension.extn_id == CRL_DISTRIBUTION_POINTS)?;
+    let points = Vec::<DistributionPoint>::from_der(extension.extn_value.as_bytes()).ok()?;
+    points
+        .into_iter()
+        .filter_map(|point| match point.distribution_point? {
+            DistributionPointName::FullName(names) => Some(names),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|name| match name {
+            GeneralName::UniformResourceIdentifier(address)
+                if address.as_str().starts_with("http") =>
+            {
+                Some(address.as_str().to_string())
+            }
+            _ => None,
+        })
+}
+
+/// Checks each certificate of a chain against the revocation list its issuer keeps.
+/// `Ok` when every list was read and names none of them.
+fn check_revocation(chain: &[(&Certificate, &Certificate)]) -> Result<(), String> {
+    let name = |cert: &Certificate| {
+        common_name(&cert.tbs_certificate.subject)
+            .unwrap_or_else(|| cert.tbs_certificate.subject.to_string())
+    };
+    for (cert, issuer) in chain {
+        let unknown = |why: String| format!("not established for {}: {why}", name(cert));
+        let address = revocation_list_address(cert)
+            .ok_or_else(|| unknown("its certificate names no revocation list".into()))?;
+        let bytes = ureq::get(&address)
+            .call()
+            .map_err(|e| e.to_string())
+            .and_then(|mut response| {
+                response
+                    .body_mut()
+                    .with_config()
+                    .limit(64 * 1024 * 1024)
+                    .read_to_vec()
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| unknown(format!("cannot download {address}: {e}")))?;
+        let list = x509_cert::crl::CertificateList::from_der(&bytes)
+            .map_err(|_| unknown(format!("{address} is not a revocation list")))?;
+        let genuine = list.tbs_cert_list.to_der().ok().and_then(|message| {
+            made_by(
+                &message,
+                list.signature.raw_bytes(),
+                list.signature_algorithm.oid,
+                issuer,
+            )
+        });
+        if genuine != Some(true) {
+            return Err(unknown(format!(
+                "the list at {address} is not signed by the issuer"
+            )));
+        }
+        let revoked = list
+            .tbs_cert_list
+            .revoked_certificates
+            .iter()
+            .flatten()
+            .any(|entry| entry.serial_number == cert.tbs_certificate.serial_number);
+        if revoked {
+            return Err(format!("the certificate of {} was revoked", name(cert)));
+        }
+    }
+    Ok(())
 }
 
 /// Whether a certificate says of itself that it may issue others.
@@ -723,13 +932,14 @@ fn may_issue(cert: &Certificate) -> bool {
 /// Follows the signer's certificate up through the embedded ones to a trusted one.
 ///
 /// Every certificate on the way must have been in date at `at`, seconds since 1970,
-/// and every one that issued another must be allowed to. Revocation is not looked up.
-fn chain_of_trust(
-    signer: &Certificate,
-    embedded: &[&Certificate],
-    trusted: &[Certificate],
+/// and every one that issued another must be allowed to. Returns the steps taken:
+/// each certificate with the one that issued it.
+fn chain_of_trust<'a>(
+    signer: &'a Certificate,
+    embedded: &[&'a Certificate],
+    trusted: &'a [Certificate],
     at: u64,
-) -> Result<(), String> {
+) -> Result<Vec<(&'a Certificate, &'a Certificate)>, String> {
     let name = |cert: &Certificate| {
         common_name(&cert.tbs_certificate.subject)
             .unwrap_or_else(|| cert.tbs_certificate.subject.to_string())
@@ -741,6 +951,7 @@ fn chain_of_trust(
             .contains(&at)
     };
     let mut current = signer;
+    let mut steps = Vec::new();
     for _ in 0..12 {
         if !in_date(current) {
             return Err(format!(
@@ -749,14 +960,15 @@ fn chain_of_trust(
             ));
         }
         if trusted.contains(current) {
-            return Ok(());
+            return Ok(steps);
         }
         if let Some(root) = trusted
             .iter()
             .find(|root| issued_by(current, root) == Some(true))
         {
             return if in_date(root) {
-                Ok(())
+                steps.push((current, root));
+                Ok(steps)
             } else {
                 Err(format!(
                     "the trusted certificate of {} was not in date when the document was signed",
@@ -770,7 +982,10 @@ fn chain_of_trust(
                 && issued_by(current, candidate) == Some(true)
         });
         match issuer {
-            Some(issuer) => current = issuer,
+            Some(issuer) => {
+                steps.push((current, *issuer));
+                current = issuer;
+            }
             None => {
                 return Err(format!(
                     "nothing leads from the certificate of {} to a trusted one",
@@ -788,6 +1003,7 @@ fn verify(
     contents: &[u8],
     file: &[u8],
     trusted: Option<&[Certificate]>,
+    revocation: bool,
 ) -> Value {
     let mut out = json!({
         "trust": "not checked: give the certificates you trust to have the signer's chain checked against them",
@@ -862,6 +1078,21 @@ fn verify(
         out["signed_at"] = json!(pdf_date(time.to_unix_duration().as_secs()));
     }
 
+    // What a timestamp authority stated, if one was asked: the time, and that its
+    // statement is about this very signature.
+    let stamp = info
+        .unsigned_attrs
+        .as_ref()
+        .and_then(|attrs| attrs.iter().find(|a| a.oid == TIMESTAMP_TOKEN))
+        .and_then(|a| a.values.iter().next())
+        .and_then(read_timestamp);
+    if let Some(stamp) = &stamp {
+        out["timestamp"] = json!({
+            "time": pdf_date(stamp.time),
+            "about_this_signature": stamp.about == Sha256::digest(info.signature.as_bytes())[..],
+            "authority": "not checked: the timestamp's own signature is taken as it is",
+        });
+    }
     let certificate = signer_certificate(&data, info);
     if let Some((signer, trusted)) = certificate.zip(trusted) {
         let embedded: Vec<&Certificate> = data
@@ -886,10 +1117,22 @@ fn verify(
             .unwrap_or(0);
         let chain = chain_of_trust(signer, &embedded, trusted, at);
         out["trusted"] = json!(chain.is_ok());
-        out["trust"] = json!(match chain {
-            Ok(()) => "the signer's certificate leads to one you trust; revocation is not checked"
-                .to_string(),
+        out["trust"] = json!(match &chain {
+            Ok(_) => "the signer's certificate leads to one you trust".to_string(),
             Err(why) => format!("not trusted: {why}"),
+        });
+        out["revocation"] = json!(match (&chain, revocation) {
+            (Ok(steps), true) => match check_revocation(steps) {
+                Ok(()) => "none of the certificates on the way is on its issuer's revocation list"
+                    .to_string(),
+                Err(why) => {
+                    if why.ends_with("was revoked") {
+                        out["trusted"] = json!(false);
+                    }
+                    why
+                }
+            },
+            _ => "not checked".to_string(),
         });
     }
     if let Some(cert) = certificate {
@@ -989,7 +1232,7 @@ pub fn signatures(a: SignaturesArgs) -> Result<Value> {
     let found: Vec<Value> = raw_signatures(&file)
         .into_iter()
         .map(|(range, contents)| {
-            let mut entry = verify(range, &contents, &file, trusted.as_deref());
+            let mut entry = verify(range, &contents, &file, trusted.as_deref(), a.revocation);
             let own = parsed.as_ref().zip(stated.iter().find(|(_, sig)| {
                 sig.get(b"ByteRange")
                     .ok()

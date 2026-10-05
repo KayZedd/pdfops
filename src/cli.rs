@@ -139,7 +139,7 @@ enum Command {
     Decrypt(edit::DecryptArgs),
     /// Sign a PDF digitally with a certificate and its private key
     ///
-    /// Signing appends to the file, so signatures already present stay valid. Keys are RSA or ECDSA P-256, from PEM files or a PKCS #12 file. The signature is not shown unless a place for it is given; then a box with the signer's name, the date and the reason is drawn there. There is no timestamp authority and no long-term validation data.
+    /// Signing appends to the file, so signatures already present stay valid. Keys are RSA or ECDSA P-256, from PEM files or a PKCS #12 file. The signature is not shown unless a place for it is given; then a box with the signer's name, the date and the reason is drawn there. With the address of a timestamp authority, its signed statement of the time is embedded; signing fails if the authority does not answer. No long-term validation data is added.
     ///
     /// A damaged file is rebuilt before it is signed, so signatures it carried do not survive.
     Sign(sign::SignArgs),
@@ -147,7 +147,7 @@ enum Command {
     ///
     /// Two things are established: the signed bytes are unchanged, and the signature was made by the embedded certificate's key. covers_whole_document is false when content was appended after signing, as a later signature legitimately does.
     ///
-    /// Whether the certificate deserves trust is checked only against certificates you give: the signer's chain must lead to one of them, with every certificate in date when the document was signed. Revocation is not looked up.
+    /// Whether the certificate deserves trust is checked only against certificates you give: the signer's chain must lead to one of them, with every certificate in date when the document was signed. On request the revocation list each certificate names is downloaded and checked; a certificate that names none leaves that question open, and the result says so. A timestamp is reported with its time and whether it is about this signature; the authority's own signature on it is not checked.
     Signatures(sign::SignaturesArgs),
     /// List form fields with their types, current values and options
     Forms(forms::FormsArgs),

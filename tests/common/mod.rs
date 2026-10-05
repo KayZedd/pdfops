@@ -315,6 +315,33 @@ pub fn serve(routes: Vec<(&'static str, Vec<u8>)>) -> String {
     base
 }
 
+/// A server whose address is known before what it serves is: returns the address and
+/// a function that hands it the body to answer every request with.
+pub fn serve_later() -> (String, impl FnOnce(Vec<u8>)) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}/list.crl", listener.local_addr().unwrap());
+    let (give, taken) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let Ok(body) = taken.recv() else { return };
+        for mut stream in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                request.push(byte[0]);
+            }
+            let mut reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            reply.extend_from_slice(&body);
+            let _ = stream.write_all(&reply);
+        }
+    });
+    (address, move |body| give.send(body).unwrap())
+}
+
 /// Dark pixel counts inside page rectangles given in PDF points, at 72 dpi.
 pub fn ink<const N: usize>(
     pdf: &std::path::Path,
@@ -390,12 +417,28 @@ pub fn words(path: &Path, page: u32) -> Vec<(String, [f64; 4])> {
 /// A signing identity issued by an authority made for it, as PEM files: the signer's
 /// certificate followed by nothing else, its private key, and the authority's certificate.
 pub fn issued_identity(dir: &Path, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let (cert, key, authority, _) = issued_identity_with_lists(dir, name, None);
+    (cert, key, authority)
+}
+
+/// The same, with the signer's certificate naming `list_address` as the place of the
+/// authority's revocation list. Also returns two such lists in DER form: one that names
+/// nobody, and one that names the signer's certificate.
+pub fn issued_identity_with_lists(
+    dir: &Path,
+    name: &str,
+    list_address: Option<String>,
+) -> (PathBuf, PathBuf, PathBuf, [Vec<u8>; 2]) {
     let authority_key = rcgen::KeyPair::generate().unwrap();
     let mut authority = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     authority
         .distinguished_name
         .push(rcgen::DnType::CommonName, format!("{name} Authority"));
     authority.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    authority.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
     let authority_cert = authority.self_signed(&authority_key).unwrap();
     let issuer = rcgen::Issuer::new(authority, authority_key);
 
@@ -404,7 +447,38 @@ pub fn issued_identity(dir: &Path, name: &str) -> (PathBuf, PathBuf, PathBuf) {
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, name);
+    let serial = rcgen::SerialNumber::from(vec![0x51, 0x07]);
+    params.serial_number = Some(serial.clone());
+    params.crl_distribution_points = list_address
+        .into_iter()
+        .map(|address| rcgen::CrlDistributionPoint {
+            uris: vec![address],
+        })
+        .collect();
     let cert = params.signed_by(&key, &issuer).unwrap();
+    let list = |revoked: Vec<rcgen::RevokedCertParams>| {
+        rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2026, 1, 1),
+            next_update: rcgen::date_time_ymd(2046, 1, 1),
+            crl_number: rcgen::SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: revoked,
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&issuer)
+        .unwrap()
+        .der()
+        .to_vec()
+    };
+    let lists = [
+        list(Vec::new()),
+        list(vec![rcgen::RevokedCertParams {
+            serial_number: serial,
+            revocation_time: rcgen::date_time_ymd(2026, 2, 2),
+            reason_code: None,
+            invalidity_date: None,
+        }]),
+    ];
     let stem = name.replace(' ', "-");
     let (cert_path, key_path, authority_path) = (
         dir.join(format!("{stem}.crt")),
@@ -414,7 +488,7 @@ pub fn issued_identity(dir: &Path, name: &str) -> (PathBuf, PathBuf, PathBuf) {
     std::fs::write(&cert_path, cert.pem()).unwrap();
     std::fs::write(&key_path, key.serialize_pem()).unwrap();
     std::fs::write(&authority_path, authority_cert.pem()).unwrap();
-    (cert_path, key_path, authority_path)
+    (cert_path, key_path, authority_path, lists)
 }
 
 /// A self-signed P-256 signing identity as PEM files: (certificate, private key).

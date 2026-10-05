@@ -187,6 +187,7 @@ pdfops sign in.pdf --p12 identity.p12 --p12-password secret --reason "Approved" 
 pdfops sign in.pdf --cert me.crt --key me.key --visible "1:360,700,560,760" -o signed.pdf
 pdfops signatures signed.pdf                            # valid, unchanged, who and when
 pdfops signatures signed.pdf --trust company-root.pem   # and whether the signer is one of yours
+pdfops sign in.pdf --p12 identity.p12 --tsa http://timestamp.digicert.com -o signed.pdf
 pdfops scan inbox/offer.pdf                             # what is in it, before reading it
 pdfops sanitize inbox/offer.pdf -o offer-clean.pdf      # scripts, actions, attachments removed
 ```
@@ -334,18 +335,18 @@ The short version. `pdfops <command> --help` has the detail for each command.
 - **Tables** with ruling lines are read cell by cell. Tables without are inferred from alignment
   (`detected_by: alignment`) and deserve a look.
 - **OCR** is tesseract's. `ocr -o` writes the recognised text into a copy as an invisible layer.
-- **Signatures.** `sign` appends, so earlier signatures stay valid, and can show the signature
-  on a page with `--visible`. `signatures` checks that the bytes are unchanged and who signed;
-  with `--trust` it also checks the signer's chain against certificates you name. Any other
-  change to a signed PDF invalidates its signatures, as it must.
+- **Signatures.** `sign` appends, so earlier signatures stay valid. It can show the signature on
+  a page (`--visible`) and embed a timestamp authority's statement of the time (`--tsa`).
+  `signatures` checks that the bytes are unchanged and who signed; with `--trust` it checks the
+  signer's chain against certificates you name, and with `--revocation` their revocation lists.
+  Any other change to a signed PDF invalidates its signatures, as it must.
 - **Merging and page work** keep bookmarks and links that lead to pages in the output, and
   rename the form fields of later inputs `doc2.<name>` so equal names do not share a value.
 - **Damaged files** are repaired for reading and rebuilt for writing; the result then carries
   `repaired_inputs`. **Protected files stay protected** when edited; only `decrypt` removes it.
 - **Limits.** 4 GiB and 300 seconds per command by default: `--max-memory`, `--timeout`, or
   `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`; 0 lifts a limit. Rasters are capped at 64 megapixels.
-- **Not there:** HTML or CSS in `create`, moving text between lines in `replace`, a timestamp
-  authority and revocation checks for signatures, editing text inside form fields and
+- **Not there:** HTML or CSS in `create`, moving text between lines in `replace`, editing text inside form fields and
   annotations with `replace`.
 
 ## Development
