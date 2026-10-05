@@ -313,10 +313,10 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
 ## Behaviour worth knowing
 
 - **Text outside Latin-1.** `stamp`, `fill`, `replace` and `create` embed a subset of a font that
-  has the glyphs: the one given with `stamp --font`, otherwise one found on the system. Latin-1 text uses the built-in
-  Helvetica and embeds nothing. Embedded text is shaped: Arabic is joined, Hebrew and Arabic run
-  from the right, Indic and Thai clusters are formed and their marks placed, and Latin gets its
-  ligatures and kerning. Three limits: one font must cover all the text of a style, `create` lays
+  has the glyphs: the one given with `stamp --font`, otherwise one found on the system. Latin-1
+  text uses the built-in Helvetica and embeds nothing. Embedded text is shaped: Arabic is joined,
+  Hebrew and Arabic run from the right, Indic and Thai clusters are formed and their marks placed,
+  and Latin gets its ligatures and kerning. Three limits: one font must cover all the text of a style, `create` lays
   out word by word, so punctuation next to a right-to-left word may land on its other side and such
   lines keep their left edge, and reading the text back gives it in drawing order, right-to-left
   words reversed and some Indic and Thai clusters with their characters regrouped.
@@ -352,10 +352,13 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
   the picture is reported with its page, box, reason and text, whether it is in the invisible text
   mode, in the colour of its background, under a flat shape, clipped away, smaller than 1.5 points
   or off the page. The judgement is made from pdfops' own rendering, and is withheld where that
-  cannot be relied on: under translucent or blended drawing, and for fonts it cannot draw. Rendering runs in a process of its own, so a file built to exhaust memory or
-  time costs this one check and is reported as `resource_exhaustion`; the rest of the result stands. Invisible text over visible content, which scanned pages with recognised text
-  have, is reported apart as `invisible_text_layer` with severity `info`. Text under a picture that
-  is not a flat colour is not detected, and neither is text inside annotations and form fields. The boxes can be passed to `redact --rect`.
+  cannot be relied on: under translucent or blended drawing, and for fonts it cannot draw.
+  Rendering runs in a process of its own, so a file built to exhaust memory or time costs this one
+  check and is reported as `resource_exhaustion`; the rest of the result stands. Invisible text
+  over visible content, which scanned pages with recognised text have, is reported apart as
+  `invisible_text_layer` with severity `info`. Text under a picture that is not a flat colour is
+  not detected, and neither is text inside annotations and form fields. The boxes can be passed to
+  `redact --rect`.
 - **Sanitize** removes JavaScript, actions that run by themselves or start programs, send form
   data or open other files, embedded files, XFA forms and media annotations; `--keep` leaves a
   group in place. Ordinary web links stay, and hidden text is not touched. The result is scanned
@@ -421,8 +424,8 @@ scripts/bench.py --help                   # regenerate the benchmark table
 ```
 
 Built on [lopdf](https://github.com/J-F-Liu/lopdf) (object model),
-[pdf-extract](https://github.com/jrmuizel/pdf-extract) (text),
-[hayro](https://github.com/LaurenzV/hayro) (rendering, positions and image decoding),
+[hayro](https://github.com/LaurenzV/hayro) (text, rendering, positions and image decoding),
+[rustybuzz](https://github.com/harfbuzz/rustybuzz) (text shaping),
 [subsetter](https://github.com/typst/subsetter) (font embedding) and
 [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark) (Markdown).
 
