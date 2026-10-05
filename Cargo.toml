@@ -1,6 +1,6 @@
 [package]
 name = "pdfops"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Fast PDF operations with JSON output for AI agents: CLI, MCP server and library"
