@@ -249,36 +249,45 @@ binary whose tools an agent can call directly.
 ## Benchmarks
 
 Best of 3 whole-process runs, start-up included, since that is what one tool call costs an agent.
-Document: a 357 page, 1.4 MB manual; `images` on a 4.6 MB manual with pictures; forms on a one page
-form. Machine: 4 core Intel i5-4460. Versions: poppler 26.08, qpdf 12.4, PyMuPDF 1.28, pypdf 6.19,
-pdfplumber 0.11, pyHanko 0.5 (CLI), tesseract 5.5. The fastest entry of each row is bold.
+Document: the NASM 2.16 manual, 308 pages and 1.2 MB; `images` on a 352 page, 2.6 MB book with
+pictures; forms on a one page form. Machine: 8 core AMD Ryzen 7 9800X3D, Windows 11. Versions:
+poppler 25.07, qpdf 12.4, PyMuPDF 1.28, pypdf 6.19, pdfplumber 0.11, pyHanko 0.37 (CLI 0.5),
+tesseract 5.5. The fastest entry of each row is bold; `n/a` marks a tool that was installed and
+did not complete the task. PyMuPDF's entry for `sanitize` is its `scrub`.
 
 | Task | pdfops | command line tool | PyMuPDF | pypdf | pdfplumber |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `info` | **5 ms** | `pdfinfo` 13 ms | 211 ms | 454 ms | 371 ms |
-| `text`, all pages | **483 ms** | `pdftotext` 541 ms | 641 ms | 4146 ms | 34.5 s |
-| `search`, all pages | **430 ms** | - | 627 ms | - | - |
-| `layout`, every word with its box | **548 ms** | - | 758 ms | - | 33.0 s |
-| `tables`, 50 pages | **52 ms** | - | 4422 ms | - | 4133 ms |
-| `outline` | **20 ms** | - | 201 ms | 353 ms | - |
-| `render`, 20 pages at 150 dpi | **195 ms** | `pdftoppm` 5962 ms | 1229 ms | - | - |
-| `ocr`, one page (render, then tesseract) | 2338 ms | `tesseract` **1511 ms** | - | - | - |
-| `images`, all embedded images | **391 ms** | `pdfimages` 3897 ms | 675 ms | 5232 ms | - |
-| `create`, 100 sections of Markdown | **10 ms** | - | - | - | - |
-| `merge`, three copies | **123 ms** | `qpdf` 254 ms | 1183 ms | 3825 ms | - |
-| `pages`, keep 10 | **21 ms** | `qpdf` 122 ms | 204 ms | 419 ms | - |
-| `split`, one file per page | **54 ms** | `pdfseparate` over 60 s | 877 ms | 2492 ms | - |
-| `rotate`, all pages | **47 ms** | `qpdf` 152 ms | 252 ms | 1309 ms | - |
-| `stamp`, text on every page | **33 ms** | - | 610 ms | - | - |
-| `stamp`, QR code on every page | **180 ms** | - | - | - | - |
-| `redact`, a word on every page | 2144 ms | - | **1532 ms** | - | - |
-| `replace`, a word on every page | **1736 ms** | - | - | - | - |
-| `set-meta` | **60 ms** | - | 269 ms | 1416 ms | - |
-| `compress` | **65 ms** | `qpdf` 274 ms | 1109 ms | - | - |
-| `encrypt`, AES-256 | **49 ms** | `qpdf` 160 ms | 253 ms | 1715 ms | - |
-| `decrypt` | **76 ms** | `qpdf` 178 ms | 397 ms | 2418 ms | - |
-| `forms`, list fields | **15 ms** | - | 391 ms | 236 ms | - |
-| `fill`, one field | **7 ms** | - | 509 ms | 433 ms | - |
+| `info` | **7 ms** | `pdfinfo` 12 ms | 129 ms | 203 ms | 222 ms |
+| `text`, all pages | **53 ms** | `pdftotext` 540 ms | 297 ms | 1273 ms | 11.3 s |
+| `search`, all pages | **53 ms** | - | 326 ms | - | - |
+| `layout`, every word with its box | **194 ms** | - | 346 ms | - | 10.9 s |
+| `tables`, 50 pages | **20 ms** | - | 1558 ms | - | 1629 ms |
+| `outline` | **15 ms** | - | 128 ms | 221 ms | - |
+| `render`, 20 pages at 150 dpi | **41 ms** | `pdftoppm` 2677 ms | 593 ms | - | - |
+| `ocr`, one page | 1087 ms | `tesseract` **759 ms** | - | - | - |
+| `images`, all embedded images | **230 ms** | `pdfimages` 5621 ms | 1297 ms | 1553 ms | - |
+| `create`, 100 sections of Markdown | **12 ms** | - | - | - | - |
+| `merge`, three copies | **57 ms** | `qpdf` 204 ms | 401 ms | 2037 ms | - |
+| `pages`, keep 10 | **17 ms** | `qpdf` 138 ms | 138 ms | 285 ms | - |
+| `split`, one file per page | **156 ms** | `pdfseparate` 46.0 s | 437 ms | 2513 ms | - |
+| `rotate`, all pages | **20 ms** | `qpdf` 144 ms | 147 ms | 769 ms | - |
+| `stamp`, text on every page | **21 ms** | - | 279 ms | - | - |
+| `stamp`, QR code on every page | **121 ms** | - | - | - | - |
+| `annotations`, list | **18 ms** | - | 227 ms | - | 309 ms |
+| `annotate`, highlight a word on every page | **291 ms** | - | 700 ms | - | - |
+| `redact`, a word on every page | **564 ms** | - | 1926 ms | - | - |
+| `replace`, a word on every page | **575 ms** | - | - | - | - |
+| `scan`, structure and hidden text | **232 ms** | - | - | - | - |
+| `scan`, structure only | **16 ms** | - | - | - | - |
+| `sanitize` | **32 ms** | - | 2072 ms | - | - |
+| `set-meta` | **19 ms** | - | 140 ms | 771 ms | - |
+| `compress` | **31 ms** | `qpdf` 179 ms | 378 ms | - | - |
+| `encrypt`, AES-256 | **25 ms** | `qpdf` 174 ms | 150 ms | 825 ms | - |
+| `decrypt` | **38 ms** | `qpdf` 170 ms | 158 ms | 875 ms | - |
+| `sign`, RSA-2048 | **23 ms** | `pyhanko` 615 ms | - | - | - |
+| `signatures`, verify | **16 ms** | `pdfsig` n/a | - | - | - |
+| `forms`, list fields | **7 ms** | - | 121 ms | 169 ms | - |
+| `fill`, one field | **9 ms** | - | 130 ms | 198 ms | - |
 
 Reproduce with `scripts/bench.py` on any document.
 
