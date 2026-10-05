@@ -3,6 +3,7 @@ mod common;
 use common::{
     call, call_err, content_of, custom, form, image_stream, ink, sample, texts, with_images, words,
 };
+use lopdf::dictionary;
 use serde_json::json;
 
 /// A 3x3 grid of ruled cells: one text per cell, the top-left cell holding two lines.
@@ -1183,4 +1184,273 @@ fn replace_draws_a_line_together_to_keep_it_in_its_column() {
         over > 20.0 && (end - edge - over).abs() < 1.0,
         "{over} {end} {edge}"
     );
+}
+
+fn unhex(hex: &str) -> Vec<u8> {
+    (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
+}
+
+/// The colour of a page at a point given from its top-left corner, rendered at 72 dpi.
+fn colour_at(pdf: &std::path::Path, dir: &std::path::Path, x: usize, y: usize) -> [u8; 3] {
+    let v = call(
+        "pdf_render",
+        json!({"input": pdf, "out_dir": dir, "dpi": 72}),
+    );
+    let page = image::open(v["files"][0]["file"].as_str().unwrap())
+        .unwrap()
+        .to_rgb8();
+    page.get_pixel(x as u32, y as u32).0
+}
+
+/// A 16x16 JPEG in CMYK, written the way Adobe's software does, with every value inverted.
+const CMYK_JPEG: &str = "ffd8ffee000e41646f626500640000000000ffdb0043000302020302020303030304030304050805050404050a070706080c0a0c0c0b0a0b0b0d0e12100d0e110e0b0b1016101113141515150c0f171816141812141514ffc000140800100010044311004d11005911004b1100ffc4001f0000010501010101010100000000000000000102030405060708090a0bffc400b5100002010303020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a636465666768696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda000e0443004d0059004b00003f00fd53af8f2be3cafd53a28a28a28a28a28a28afffd9";
+/// A 16x16 JPEG 2000 image of one colour.
+const JPEG_2000: &str = "0000000c6a5020200d0a870a00000014667479706a703220000000006a7032200000002d6a703268000000166968647200000010000000100003070700000000000f636f6c7201000000000010000000ad6a703263ff4fff51002f000000000010000000100000000000000000000000100000001000000000000000000003070101070101070101ff52000c00000001000404040001ff5c00104040484850484850484850484850ff640025000143726561746564206279204f70656e4a5045472076657273696f6e20322e352e34ff90000a0000000000290001ff93cfb408044fc3e704096fcfb40806cf808080808080808080808080ffd9";
+/// The same with a fourth channel that makes it opaque everywhere.
+const JPEG_2000_ALPHA: &str = "0000000c6a5020200d0a870a00000014667479706a703220000000006a7032200000004f6a703268000000166968647200000010000000100004070700000000000f636f6c720100000000001000000022636465660004000000000001000100000002000200000003000300010000000000b86a703263ff4fff510032000000000010000000100000000000000000000000100000001000000000000000000004070101070101070101070101ff52000c00000001000404040001ff5c00104040484850484850484850484850ff640025000143726561746564206279204f70656e4a5045472076657273696f6e20322e352e34ff90000a0000000000310001ff93cfb408044fc3e704096fcfb40806cfcfb4040080808080808080808080808080808080ffd9";
+
+#[test]
+fn redact_blanks_cmyk_jpeg_and_jpeg_2000_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let packed = |filter: &str, extra: lopdf::Dictionary, hex: &str| {
+        let mut dict = dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 16, "Height" => 16,
+            "Filter" => filter,
+        };
+        dict.extend(&extra);
+        lopdf::Stream::new(dict, unhex(hex)).with_compression(false)
+    };
+    let inverted: Vec<lopdf::Object> = [1, 0, 1, 0, 1, 0, 1, 0].map(Into::into).to_vec();
+    // Drawn side by side, each 100 points wide, at x = 50, 170 and 290.
+    let pdf = with_images(
+        dir.path(),
+        "packed.pdf",
+        vec![
+            packed(
+                "DCTDecode",
+                dictionary! {
+                    "ColorSpace" => "DeviceCMYK", "BitsPerComponent" => 8, "Decode" => inverted,
+                },
+                CMYK_JPEG,
+            ),
+            // JPEG 2000 may leave the colour model and depth to the data.
+            packed("JPXDecode", lopdf::Dictionary::new(), JPEG_2000),
+            packed(
+                "JPXDecode",
+                dictionary! { "SMaskInData" => 1 },
+                JPEG_2000_ALPHA,
+            ),
+        ],
+    );
+    let out = dir.path().join("out.pdf");
+    // The left half of every image.
+    let v = call(
+        "pdf_redact",
+        json!({"input": pdf, "output": out, "rects": [
+            "1:50,92,100,192", "1:170,92,220,192", "1:290,92,340,192",
+        ]}),
+    );
+    assert_eq!(v["pages"][0]["images_blanked"], 3, "{v}");
+
+    // What is left of each image looks as it did.
+    for x in [125, 245, 365] {
+        let before = colour_at(&pdf, &dir.path().join("before"), x, 142);
+        let after = colour_at(&out, &dir.path().join("after"), x, 142);
+        assert!(before != [255, 255, 255], "nothing drawn at {x}");
+        assert!(
+            before.iter().zip(after).all(|(a, b)| a.abs_diff(b) <= 2),
+            "at {x}: {before:?} became {after:?}"
+        );
+    }
+    // The pixels under the areas are gone from the data, not just covered.
+    let doc = lopdf::Document::load(&out).unwrap();
+    let mut seen = 0;
+    for object in doc.objects.values() {
+        let Ok(stream) = object.as_stream() else {
+            continue;
+        };
+        if !stream.dict.has(b"Width") {
+            continue;
+        }
+        assert!(
+            stream.dict.get(b"Filter").unwrap().as_name().unwrap() == b"FlateDecode"
+                && !stream.dict.has(b"SMaskInData"),
+            "{:?}",
+            stream.dict
+        );
+        let data = stream.decompressed_content().unwrap();
+        let sample = data.len() / (16 * 16);
+        for row in data.chunks(16 * sample) {
+            assert!(row[..8 * sample].iter().all(|&b| b == 0), "{row:?}");
+            assert!(row[8 * sample..].iter().any(|&b| b != 0), "{row:?}");
+        }
+        seen += 1;
+    }
+    // Three images and the mask that the transparency of the last one became.
+    assert_eq!(seen, 4);
+}
+
+#[test]
+fn redact_blanks_fax_coded_masks_as_one_bit_data() {
+    let dir = tempfile::tempdir().unwrap();
+    // Sixteen all-white rows in Group 4 coding: one "same as the row above" code each.
+    let mask = lopdf::Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 16, "Height" => 16,
+            "ImageMask" => true, "Filter" => "CCITTFaxDecode",
+            "DecodeParms" => dictionary! { "K" => -1, "Columns" => 16, "Rows" => 16 },
+        },
+        vec![0xFF, 0xFF],
+    )
+    .with_compression(false);
+    let pdf = with_images(dir.path(), "fax.pdf", vec![mask]);
+    let out = dir.path().join("out.pdf");
+    let v = call(
+        "pdf_redact",
+        json!({"input": pdf, "output": out, "rects": ["1:50,92,100,192"]}),
+    );
+    assert_eq!(v["pages"][0]["images_blanked"], 1, "{v}");
+    let doc = lopdf::Document::load(&out).unwrap();
+    let stream = doc
+        .objects
+        .values()
+        .filter_map(|o| o.as_stream().ok())
+        .find(|s| s.dict.has(b"ImageMask"))
+        .unwrap();
+    // Still one bit a pixel, two bytes a row: the left byte cleared, the right one as it was.
+    let data = stream.decompressed_content().unwrap();
+    assert_eq!(data, [0x00, 0xFF].repeat(16), "{:?}", stream.dict);
+}
+
+#[test]
+fn redact_and_replace_work_on_pages_with_inline_images() {
+    let dir = tempfile::tempdir().unwrap();
+    // A 4x4 grey image written into the content itself, hex coded, at (50,600)-(150,700).
+    // "EI" also occurs in the text that follows.
+    let page = format!(
+        "q 100 0 0 100 50 600 cm BI /W 4 /H 4 /CS /RGB /BPC 8 /F /AHx ID {}> EI Q \
+         BT /F1 12 Tf 72 500 Td (SEIZE THE BI DAY EI) Tj 0 -20 Td (Account 6110) Tj ET",
+        "c8".repeat(4 * 4 * 3)
+    );
+    let pdf = custom(dir.path(), "inline.pdf", &[&page]);
+    let out = dir.path().join("out.pdf");
+
+    // Under an area, the image loses those pixels.
+    let v = call(
+        "pdf_redact",
+        json!({"input": pdf, "output": out, "rects": ["1:50,92,100,192"]}),
+    );
+    assert_eq!(v["pages"][0]["images_blanked"], 1, "{v}");
+    let img = call(
+        "pdf_images",
+        json!({"input": out, "out_dir": dir.path().join("cut")}),
+    );
+    let rgb = image::open(img["images"][0]["file"].as_str().unwrap())
+        .unwrap()
+        .to_rgb8();
+    assert!((0..4).all(|y| (0..2).all(|x| rgb.get_pixel(x, y).0 == [0, 0, 0])));
+    assert!((0..4).all(|y| (2..4).all(|x| rgb.get_pixel(x, y).0 == [200, 200, 200])));
+    assert!(texts(&out)[0].contains("SEIZE THE BI DAY EI"));
+
+    // Elsewhere on the page, text goes and the image stays whole.
+    let v = call(
+        "pdf_redact",
+        json!({"input": pdf, "output": out, "texts": ["6110"]}),
+    );
+    assert_eq!(v["pages"][0]["images_blanked"], 0, "{v}");
+    let text = &texts(&out)[0];
+    assert!(text.contains("Account") && !text.contains("6110"), "{text}");
+    let img = call(
+        "pdf_images",
+        json!({"input": out, "out_dir": dir.path().join("whole")}),
+    );
+    let rgb = image::open(img["images"][0]["file"].as_str().unwrap())
+        .unwrap()
+        .to_rgb8();
+    assert!(rgb.pixels().all(|p| p.0 == [200, 200, 200]));
+
+    call(
+        "pdf_replace",
+        json!({"input": pdf, "output": out, "find": "Account", "with": "Number"}),
+    );
+    assert!(texts(&out)[0].contains("Number 6110"));
+    assert_eq!(
+        colour_at(&out, &dir.path().join("page"), 100, 142),
+        [200, 200, 200]
+    );
+}
+
+#[test]
+fn create_lays_out_lines_that_mix_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pdf");
+    // "shalom olam" inside an English sentence with a comma after it, then alone
+    // as a paragraph of its own that ends in a full stop.
+    let hebrew = "\u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{5e2}\u{5d5}\u{5dc}\u{5dd}";
+    let made = pdfops::tools::call(
+        "pdf_create",
+        json!({"markdown": format!("He said {hebrew}, then left.\n\n{hebrew}."), "output": out}),
+    );
+    if let Err(e) = &made {
+        assert!(e.to_string().contains("no installed font"), "{e:#}");
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let found = words(&out, 1);
+    let top = found.iter().map(|w| w.1[1]).fold(f64::MAX, f64::min);
+    let (first, second): (Vec<_>, Vec<_>) = found.iter().partition(|w| w.1[1] < top + 5.0);
+    let with = |line: &[&(String, [f64; 4])], c: char| {
+        line.iter()
+            .find(|w| w.0.contains(c))
+            .unwrap_or_else(|| panic!("{c} not in {line:?}"))
+            .1
+    };
+    // In the sentence the Hebrew is read from its right end, and the comma follows it
+    // where the sentence goes on: after the first Hebrew word's right-hand neighbour.
+    let (said, olam, shalom, then) = (
+        with(&first, 'd'),
+        with(&first, '\u{5e2}'),
+        with(&first, '\u{5e9}'),
+        with(&first, 'h'),
+    );
+    assert!(
+        said[2] < olam[0] && olam[2] < shalom[0] && shalom[2] < then[0],
+        "{first:?}"
+    );
+    assert_eq!(with(&first, ','), shalom, "{first:?}");
+    // The paragraph that runs from the right stands against the right margin, its
+    // first word there and its full stop at the far left.
+    let (olam, shalom) = (with(&second, '\u{5e2}'), with(&second, '\u{5e9}'));
+    assert!(olam[2] < shalom[0], "{second:?}");
+    assert!((shalom[2] - (595.28 - 56.0)).abs() < 2.0, "{second:?}");
+    assert_eq!(with(&second, '.'), olam, "{second:?}");
+}
+
+#[test]
+fn create_draws_scripts_that_no_single_font_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pdf");
+    // Polish, Chinese and Devanagari in one paragraph.
+    let text =
+        "Za\u{17c}\u{f3}\u{142}\u{107} \u{4f60}\u{597d}\u{4e16}\u{754c} \u{915}\u{92e}\u{932} end";
+    let made = pdfops::tools::call("pdf_create", json!({"markdown": text, "output": out}));
+    if let Err(e) = &made {
+        assert!(e.to_string().contains("no installed font"), "{e:#}");
+        eprintln!("skipped: {e}");
+        return;
+    }
+    // Every word reads back, whichever font drew it.
+    assert_eq!(texts(&out)[0], text);
+    // Fonts that stand in are separate font objects, each with what it draws.
+    let doc = lopdf::Document::load(&out).unwrap();
+    let page = doc.get_pages()[&1];
+    let fonts = doc.get_page_fonts(page).unwrap();
+    let bases: std::collections::HashSet<Vec<u8>> = fonts
+        .values()
+        .map(|f| f.get(b"BaseFont").unwrap().as_name().unwrap()[7..].to_vec())
+        .collect();
+    assert_eq!(bases.len(), fonts.len(), "{bases:?}");
+    eprintln!("{} fonts drew the paragraph", fonts.len());
 }

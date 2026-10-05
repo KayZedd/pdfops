@@ -103,7 +103,7 @@ pdfops ocr-install --engine          # install tesseract itself where that needs
 | | `signatures` | Digital signatures: who signed, and whether the document changed since |
 | | `render` | Pages to PNG, to look at charts, scans and layout |
 | | `images` | The images drawn on pages, as files |
-| | `ocr` | Recognised text of scanned pages |
+| | `ocr` | Recognised text of scanned pages, optionally written into a searchable copy |
 | | `scan` | Scripts, automatic actions, attachments, disguised content and hidden text, by severity |
 | **Build** | `create` | A new PDF from Markdown |
 | | `merge` | Several PDFs into one |
@@ -151,6 +151,7 @@ pdfops tables report.pdf --pages 4 --format markdown
 pdfops layout report.pdf --pages 4 --level words        # bbox, font and size per word
 pdfops render report.pdf --pages 1-3 --dpi 150 -o out/  # look at charts and layout
 pdfops --stream ocr scan.pdf --lang pol                 # a line per page as it finishes
+pdfops ocr scan.pdf --lang pol -o searchable.pdf        # the same file, with text to search
 pdfops images report.pdf -o images/
 ```
 
@@ -316,16 +317,21 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
   has the glyphs: the one given with `stamp --font`, otherwise one found on the system. Latin-1
   text uses the built-in Helvetica and embeds nothing. Embedded text is shaped: Arabic is joined,
   Hebrew and Arabic run from the right, Indic and Thai clusters are formed and their marks placed,
-  and Latin gets its ligatures and kerning. Three limits: one font must cover all the text of a style, `create` lays
-  out word by word, so punctuation next to a right-to-left word may land on its other side and such
-  lines keep their left edge, and reading the text back gives it in drawing order, right-to-left
-  words reversed and some Indic and Thai clusters with their characters regrouped.
-- **Redaction** deletes what is under the areas from the page content: glyphs, image pixels
-  (including scanned pages), drawings lying wholly inside an area, and annotations with the form
-  values they show. Text around it does not move. The result is read back by a second, independent
-  interpreter, and nothing is written unless every area is empty. When a page is built in a way that
-  cannot be rewritten with certainty (inline images, JPEG 2000 or CMYK JPEG under an area), the
-  command fails instead of guessing. It does not rewrite document metadata, bookmarks or attached
+  and Latin gets its ligatures and kerning. Where no one font has every character, several share
+  the text: a usual sans-serif draws what it can and others stand in for the rest, so Polish,
+  Chinese and Hindi can sit in one line. `create` lays a line out as a whole, so a comma after a
+  Hebrew word in an English sentence lands where the sentence goes on, and a paragraph that runs
+  from the right is set against the right margin. One limit: reading the text back gives it in
+  drawing order, right-to-left words reversed and some Indic and Thai clusters with their
+  characters regrouped.
+- **Redaction** deletes what is under the areas from the page content: glyphs, image pixels,
+  drawings lying wholly inside an area, and annotations with the form values they show. Images are
+  blanked whatever they are stored as (scans in fax or JBIG2 coding, JPEG in any colour model,
+  JPEG 2000, images written into the page content itself) and are stored without loss afterwards.
+  Text around it does not move. The result is read back by a second, independent interpreter, and
+  nothing is written unless every area is empty. Where an image cannot be decoded, or text is
+  drawn in a way that cannot be taken apart with certainty, the command fails instead of guessing.
+  It does not rewrite document metadata, bookmarks or attached
   files, and it removes the accessibility structure tree, which can repeat page text.
 - **Replace** writes the new text with the codes the document's own font already uses for those
   characters on that page, so style is kept exactly. If the font (usually a subset) lacks a needed
@@ -384,8 +390,10 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
 - **Images** are the ones a page actually draws, including inline images and images inside forms.
   JPEG and JPEG 2000 are written as stored; everything else (Flate, LZW, CCITT fax, JBIG2, palette,
   masks) is decoded to PNG.
-- **OCR** quality and languages are tesseract's. Recognised text is returned, not written into the
-  PDF. When a language is missing, the error names the `ocr-install` call that fixes it, so an agent
+- **OCR** quality and languages are tesseract's. Recognised text is returned; with `-o` it is also
+  written into a copy of the PDF as an invisible layer over the picture of each word, so the copy
+  can be searched and selected in any viewer. Pages that have text of their own are left as they
+  are. When a language is missing, the error names the `ocr-install` call that fixes it, so an agent
   can recover on its own. Data comes from the `tessdata_fast` repository (`--best` for the larger
   models) and is kept in `~/.local/share/pdfops/tessdata`, or `PDFOPS_TESSDATA` if set. Installing
   tesseract itself uses the system package manager; where that needs a password, the command to

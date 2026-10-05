@@ -3,6 +3,9 @@
 //! Recognition is delegated to the `tesseract` program: it covers over a
 //! hundred languages, and linking an OCR engine and its models into the binary
 //! would cost every user who never needs it.
+//!
+//! The words come back with their places on the page, so they can also be written
+//! into a copy of the file as text nobody sees but every viewer can search and select.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,11 +15,14 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use clap::Args;
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
+use lopdf::{Dictionary, Document, ObjectId, Stream};
 use rayon::prelude::*;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::font::TextFont;
+use crate::ops::edit::{add_resource, append_content, own_resources, visual_space};
 use crate::ops::render::{check_dpi, page_png};
 use crate::progress::Progress;
 use crate::{doc, pagespec};
@@ -37,6 +43,9 @@ pub struct OcrArgs {
     /// Resolution pages are rasterised at before recognition (default: 300)
     #[arg(long)]
     pub dpi: Option<f32>,
+    /// Where to write a copy of the PDF with the recognised text added as an invisible layer, so that it can be searched and selected (may be the input file)
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
     /// Password, if the file is encrypted
     #[arg(long)]
     pub password: Option<String>,
@@ -372,7 +381,122 @@ pub fn ocr_install(a: OcrInstallArgs) -> Result<Value> {
     }))
 }
 
-fn recognise_png(png: &[u8], lang: &str, dpi: f32, data: Option<&Path>) -> Result<String, String> {
+/// A recognised line of text: where it is on the raster, in pixels from the top-left
+/// corner, and its words with their places.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Line {
+    /// Left, top, right, bottom.
+    pub bbox: [f64; 4],
+    pub words: Vec<(String, [f64; 4])>,
+    /// Lines of one paragraph share this.
+    pub paragraph: (u32, u32),
+}
+
+/// Reads tesseract's table of what it found: one row per block, paragraph, line and word.
+pub fn parse_tsv(tsv: &str) -> Vec<Line> {
+    let mut lines: Vec<Line> = Vec::new();
+    for row in tsv.lines().skip(1) {
+        let cells: Vec<&str> = row.splitn(12, '\t').collect();
+        let number = |at: usize| cells.get(at).and_then(|c| c.trim().parse::<f64>().ok());
+        let (Some(level), Some(block), Some(paragraph)) = (number(0), number(2), number(3)) else {
+            continue;
+        };
+        let (Some(left), Some(top), Some(width), Some(height)) =
+            (number(6), number(7), number(8), number(9))
+        else {
+            continue;
+        };
+        let bbox = [left, top, left + width, top + height];
+        let text = cells.get(11).map_or("", |t| t.trim());
+        if level == 4.0 {
+            lines.push(Line {
+                bbox,
+                words: Vec::new(),
+                paragraph: (block as u32, paragraph as u32),
+            });
+        } else if level == 5.0
+            && !text.is_empty()
+            && let Some(line) = lines.last_mut()
+        {
+            line.words.push((text.to_string(), bbox));
+        }
+    }
+    lines.retain(|line| !line.words.is_empty());
+    lines
+}
+
+/// The text of recognised lines: a line each, and an empty one between paragraphs.
+fn plain(lines: &[Line]) -> String {
+    let mut out = String::new();
+    for (at, line) in lines.iter().enumerate() {
+        if at > 0 {
+            out.push('\n');
+            if lines[at - 1].paragraph != line.paragraph {
+                out.push('\n');
+            }
+        }
+        let words: Vec<&str> = line.words.iter().map(|w| w.0.as_str()).collect();
+        out += &words.join(" ");
+    }
+    out
+}
+
+/// Writes recognised lines onto a page as text that is not drawn. Returns how many words.
+///
+/// `dpi` is the resolution of the raster the lines were found on. Every word is
+/// stretched to the width of what it was read from, so a selection covers the picture
+/// of the word. `open` is a stream holding just `q`, as `append_content` wants it.
+pub fn add_text_layer(
+    d: &mut Document,
+    page: ObjectId,
+    lines: &[Line],
+    dpi: f32,
+    font: &TextFont,
+    open: ObjectId,
+) -> Result<usize> {
+    let (m, _, height) = visual_space(doc::page_box(d, page), doc::rotation(d, page));
+    let mut resources = own_resources(d, page);
+    let names: Vec<String> = font
+        .ids()
+        .into_iter()
+        .map(|id| add_resource(d, &mut resources, "Font", "PdfopsOcr", id))
+        .collect();
+    let point = 72.0 / dpi as f64;
+    let mut ops = format!(
+        "q\n{} {} {} {} {} {} cm\nBT\n3 Tr\n",
+        m[0], m[1], m[2], m[3], m[4], m[5]
+    );
+    let mut words = 0;
+    for line in lines {
+        // A line's box runs from the top of its tall letters to the bottom of its
+        // descenders; the baseline lies about a fifth of the way up.
+        let size = ((line.bbox[3] - line.bbox[1]) * point).max(1.0);
+        let baseline = height - line.bbox[3] * point + 0.2 * size;
+        for (text, bbox) in &line.words {
+            let natural = font.width(text, size);
+            if natural <= 0.0 {
+                continue;
+            }
+            let stretch = ((bbox[2] - bbox[0]) * point / natural * 100.0).clamp(1.0, 1000.0);
+            ops += &format!(
+                "{stretch:.1} Tz\n1 0 0 1 {:.2} {baseline:.2} Tm\n{}\n",
+                bbox[0] * point,
+                font.show_named(&names, text, size)
+            );
+            words += 1;
+        }
+    }
+    append_content(d, page, open, ops + "ET\nQ\n", resources)?;
+    Ok(words)
+}
+
+fn recognise_png(
+    png: &[u8],
+    lang: &str,
+    dpi: f32,
+    data: Option<&Path>,
+    places: bool,
+) -> Result<String, String> {
     let mut command = Command::new(PROGRAM);
     if let Some(dir) = data {
         command.arg("--tessdata-dir").arg(dir);
@@ -386,6 +510,8 @@ fn recognise_png(png: &[u8], lang: &str, dpi: f32, data: Option<&Path>) -> Resul
             "--dpi",
             &format!("{}", dpi.round() as u32),
         ])
+        // The table of words with their places, in place of the plain text.
+        .args(places.then_some("tsv"))
         // Pages already run in parallel; one thread each avoids oversubscribing the CPU.
         .env("OMP_THREAD_LIMIT", "1")
         .stdin(Stdio::piped())
@@ -410,12 +536,24 @@ fn recognise_png(png: &[u8], lang: &str, dpi: f32, data: Option<&Path>) -> Resul
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Recognises the text of each requested page, in parallel.
+/// Recognises the text of each requested page.
 pub fn recognise(
     pdf: &Pdf,
     pages: &[u32],
     lang: &str,
     dpi: f32,
+) -> Result<Vec<(u32, Result<String, String>)>> {
+    run(pdf, pages, lang, dpi, false)
+}
+
+/// Runs tesseract over each requested page, in parallel, for its text or for its
+/// table of words with their places.
+fn run(
+    pdf: &Pdf,
+    pages: &[u32],
+    lang: &str,
+    dpi: f32,
+    places: bool,
 ) -> Result<Vec<(u32, Result<String, String>)>> {
     let engine = Engine::probe();
     let data = engine.data_dir(lang)?;
@@ -427,7 +565,7 @@ pub fn recognise(
         .map(|&n| {
             let text = page_png(&all[n as usize - 1], &settings, dpi)
                 .map_err(|e| e.to_string())
-                .and_then(|(png, ..)| recognise_png(&png, lang, dpi, data));
+                .and_then(|(png, ..)| recognise_png(&png, lang, dpi, data, places));
             progress.tick(json!({"page": n, "recognised": text.is_ok()}));
             (n, text)
         })
@@ -440,12 +578,65 @@ pub fn ocr(a: OcrArgs) -> Result<Value> {
     let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
     let total = pdf.pages().len() as u32;
     let pages = pagespec::parse_or_all(a.pages.as_deref(), total)?;
-    let out: Vec<Value> = recognise(&pdf, &pages, lang, dpi)?
+    let Some(output) = &a.output else {
+        let out: Vec<Value> = recognise(&pdf, &pages, lang, dpi)?
+            .into_iter()
+            .map(|(n, text)| match text {
+                Ok(t) => json!({"page": n, "text": super::read::tidy(&t)}),
+                Err(e) => json!({"page": n, "error": e}),
+            })
+            .collect();
+        return Ok(json!({"file": a.input, "total_pages": total, "lang": lang, "pages": out}));
+    };
+
+    let read: Vec<(u32, Result<Vec<Line>, String>)> = run(&pdf, &pages, lang, dpi, true)?
         .into_iter()
-        .map(|(n, text)| match text {
-            Ok(t) => json!({"page": n, "text": super::read::tidy(&t)}),
-            Err(e) => json!({"page": n, "error": e}),
-        })
+        .map(|(n, table)| (n, table.map(|table| parse_tsv(&table))))
         .collect();
-    Ok(json!({"file": a.input, "total_pages": total, "lang": lang, "pages": out}))
+    // A page that has text of its own keeps it; a second copy would be found twice.
+    let own: std::collections::HashSet<u32> = super::read::page_texts(&pdf, &pages)
+        .into_iter()
+        .filter(|(_, text)| text.as_ref().is_ok_and(|t| !t.trim().is_empty()))
+        .map(|(n, _)| n)
+        .collect();
+    let mut d = doc::load(&a.input, a.password.as_deref())?;
+    let ids = doc::page_ids(&d);
+    let wanted: String = read
+        .iter()
+        .filter(|(n, _)| !own.contains(n))
+        .filter_map(|(_, lines)| lines.as_ref().ok())
+        .flatten()
+        .flat_map(|line| line.words.iter().map(|w| w.0.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let font = TextFont::new(&mut d, &wanted, None).context("cannot write the text layer")?;
+    let open = d.add_object(Stream::new(Dictionary::new(), b"q\n".to_vec()));
+    let mut out = Vec::new();
+    let mut done: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for (n, lines) in read {
+        out.push(match lines {
+            Ok(lines) => {
+                let mut page = json!({"page": n, "text": super::read::tidy(&plain(&lines))});
+                if own.contains(&n) {
+                    page["text_layer"] = json!("kept: the page has text of its own");
+                } else if done.insert(n) {
+                    let words =
+                        add_text_layer(&mut d, ids[n as usize - 1], &lines, dpi, &font, open)?;
+                    page["text_layer"] = json!("added");
+                    page["words"] = json!(words);
+                }
+                page
+            }
+            Err(e) => json!({"page": n, "error": e}),
+        });
+    }
+    let size = doc::save(&mut d, output)?;
+    Ok(json!({
+        "file": a.input,
+        "total_pages": total,
+        "lang": lang,
+        "pages": out,
+        "output": output,
+        "size_bytes": size,
+    }))
 }

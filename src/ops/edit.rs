@@ -424,7 +424,7 @@ pub(crate) fn visual_space(page_box: [f64; 4], rotation: i64) -> ([f64; 6], f64,
 ///
 /// The name is chosen to be unused, so stamping an already stamped page does not
 /// redirect the resources its earlier stamps refer to.
-fn add_resource(
+pub(crate) fn add_resource(
     d: &Document,
     res: &mut Dictionary,
     category: &str,
@@ -666,7 +666,11 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
                 ops += &qr_ops(content, x, y, side)?;
             }
             Mark::Text(font, template) => {
-                let font_name = add_resource(&d, &mut res, "Font", "PdfopsF", font.id);
+                let names: Vec<String> = font
+                    .ids()
+                    .into_iter()
+                    .map(|id| add_resource(&d, &mut res, "Font", "PdfopsF", id))
+                    .collect();
                 let text = template
                     .replace("{pages}", &total.to_string())
                     .replace("{page}", &n.to_string());
@@ -705,8 +709,8 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
                     size
                 };
                 ops += &format!(
-                    "/{font_name} {size:.2} Tf\n{r:.3} {g:.3} {b:.3} rg\n{}\nET\n",
-                    font.show(&text, size)
+                    "{r:.3} {g:.3} {b:.3} rg\n{}\nET\n",
+                    font.show_named(&names, &text, size)
                 );
             }
         }

@@ -1078,6 +1078,73 @@ fn compress_can_downscale_and_reencode_images() {
     );
 }
 
+#[test]
+fn recognised_words_become_an_invisible_text_layer() {
+    use pdfops::ops::ocr::{add_text_layer, parse_tsv};
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = common::custom(dir.path(), "blank.pdf", &["0.9 g 0 0 612 792 re f"]);
+    // What tesseract reports for a letter page at 144 dpi, two pixels to the point.
+    let rows = [
+        "level page_num block_num par_num line_num word_num left top width height conf text",
+        "1 1 0 0 0 0 0 0 1224 1584 -1 ",
+        "2 1 1 0 0 0 200 300 480 140 -1 ",
+        "3 1 1 1 0 0 200 300 480 40 -1 ",
+        "4 1 1 1 1 0 200 300 480 40 -1 ",
+        "5 1 1 1 1 1 200 300 220 40 96.1 Invoice",
+        "5 1 1 1 1 2 440 300 240 40 95.3 4471",
+        "3 1 1 2 0 0 200 400 160 40 -1 ",
+        "4 1 1 2 1 0 200 400 160 40 -1 ",
+        "5 1 1 2 1 1 200 400 160 40 91.0 Total",
+        "5 1 1 2 1 2 380 400 10 40 20.0  ",
+    ];
+    let lines = parse_tsv(&rows.map(|row| row.replace(' ', "	")).join(
+        "
+",
+    ));
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].words.len(), 2);
+    assert_eq!(
+        lines[1].words,
+        [("Total".to_string(), [200.0, 400.0, 360.0, 440.0])]
+    );
+    assert_ne!(lines[0].paragraph, lines[1].paragraph);
+
+    let mut doc = lopdf::Document::load(&pdf).unwrap();
+    let page = doc.get_pages()[&1];
+    let font = pdfops::font::TextFont::new(&mut doc, "Invoice 4471 Total", None).unwrap();
+    let open = doc.add_object(lopdf::Stream::new(
+        lopdf::Dictionary::new(),
+        b"q
+"
+        .to_vec(),
+    ));
+    assert_eq!(
+        add_text_layer(&mut doc, page, &lines, 144.0, &font, open).unwrap(),
+        3
+    );
+    let out = dir.path().join("layered.pdf");
+    doc.save(&out).unwrap();
+
+    // The words read back from where they were seen, each as wide as its picture.
+    assert_eq!(texts(&out)[0], "Invoice 4471\n\nTotal");
+    let found = common::words(&out, 1);
+    let place = |word: &str| found.iter().find(|w| w.0 == word).unwrap().1;
+    for (word, left, right, top, bottom) in [
+        ("Invoice", 100.0, 210.0, 150.0, 170.0),
+        ("4471", 220.0, 340.0, 150.0, 170.0),
+        ("Total", 100.0, 180.0, 200.0, 220.0),
+    ] {
+        let b = place(word);
+        assert!(
+            (b[0] - left).abs() < 1.5 && (b[2] - right).abs() < 1.5,
+            "{word}: {b:?}"
+        );
+        assert!(b[1] > top - 6.0 && b[3] < bottom + 6.0, "{word}: {b:?}");
+    }
+    // Nothing of it is drawn.
+    assert_eq!(ink(&out, dir.path(), [[0, 0, 612, 792]]), [0]);
+}
+
 // Drives the external tesseract program, which takes seconds: run with `cargo test -- --ignored`.
 #[test]
 #[ignore = "needs tesseract; slow"]
@@ -1110,6 +1177,36 @@ fn ocr_reads_pages_without_a_text_layer() {
             .to_lowercase()
             .contains("sample")
     );
+
+    // With an output, the text is written into a copy, where it is found without recognition.
+    let out = dir.path().join("searchable.pdf");
+    let v = call(
+        "pdf_ocr",
+        json!({"input": pdf, "lang": lang, "output": out}),
+    );
+    assert_eq!(v["pages"][0]["text_layer"], "added", "{v}");
+    assert!(v["pages"][0]["words"].as_u64().unwrap() >= 5, "{v}");
+    let text = texts(&out)[0].to_lowercase();
+    assert!(
+        text.contains("sample") && text.contains("keyword"),
+        "{text}"
+    );
+    let found = call("pdf_search", json!({"input": out, "query": "sample"}));
+    assert_eq!(found["total_matches"], 1, "{found}");
+    // A page that has text is left as it is.
+    let again = dir.path().join("again.pdf");
+    let v = call(
+        "pdf_ocr",
+        json!({"input": out, "lang": lang, "output": again}),
+    );
+    assert!(
+        v["pages"][0]["text_layer"]
+            .as_str()
+            .unwrap()
+            .starts_with("kept"),
+        "{v}"
+    );
+    assert_eq!(texts(&again)[0].to_lowercase().matches("sample").count(), 1);
 
     let e = call_err("pdf_ocr", json!({"input": pdf, "lang": "zzz"}));
     assert!(

@@ -2,9 +2,11 @@
 //!
 //! Latin-1 text uses the built-in Helvetica, which costs no space. Anything
 //! else needs real glyphs, so a font file is subsetted to the characters used
-//! and embedded as a composite font with a ToUnicode map.
+//! and embedded as a composite font with a ToUnicode map. Where no one font has
+//! all the characters, several share the text between them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -68,6 +70,50 @@ pub struct TextFont {
     embedded: Option<Embedded>,
     /// Which built-in metrics apply when nothing is embedded.
     builtin: Style,
+    /// The fonts that stand in where this one has no glyph, in the order they are tried.
+    stand_ins: Vec<TextFont>,
+}
+
+/// Shares `text` out among `fonts` fonts, of which `has` tells whether one can draw a
+/// character. The pieces come in the order they are drawn, from left to right.
+///
+/// A character goes to the first font that has it. Within a word, and for what is
+/// not a letter, the font in use carries on while it can: an accent stays with its
+/// letter, a comma with the word before it.
+fn share(
+    text: &str,
+    fonts: usize,
+    has: &dyn Fn(usize, char) -> bool,
+) -> Vec<(usize, Range<usize>)> {
+    if fonts <= 1 {
+        return vec![(0, 0..text.len())];
+    }
+    let mut out = Vec::new();
+    let bidi = unicode_bidi::BidiInfo::new(text, None);
+    for paragraph in &bidi.paragraphs {
+        let (levels, runs) = bidi.visual_runs(paragraph, paragraph.range.clone());
+        for run in runs {
+            let mut pieces: Vec<(usize, Range<usize>)> = Vec::new();
+            let (mut current, mut in_word) = (0, false);
+            for (at, c) in text[run.clone()].char_indices() {
+                let at = run.start + at;
+                let carries_on = has(current, c) && (in_word || !c.is_alphabetic());
+                if !carries_on {
+                    current = (0..fonts).find(|&k| has(k, c)).unwrap_or(current);
+                }
+                in_word = c.is_alphabetic();
+                match pieces.last_mut() {
+                    Some((font, range)) if *font == current => range.end = at + c.len_utf8(),
+                    _ => pieces.push((current, at..at + c.len_utf8())),
+                }
+            }
+            if levels[run.start].is_rtl() {
+                pieces.reverse();
+            }
+            out.extend(pieces);
+        }
+    }
+    out
 }
 
 /// What it takes to lay text out in an embedded font.
@@ -238,28 +284,33 @@ impl TextFont {
                 id: doc.add_object(helvetica()),
                 embedded: None,
                 builtin: Style::default(),
+                stand_ins: Vec::new(),
             });
         }
         wanted.sort_unstable();
         wanted.dedup();
-        let (data, index) = match file {
+        let fonts = match file {
             Some(path) => {
                 let data = std::fs::read(path)
                     .with_context(|| format!("cannot read font {}", path.display()))?;
                 let missing = missing(&data, 0, &wanted)
                     .ok_or_else(|| anyhow!("{} is not a usable font", path.display()))?;
+                // What the given font lacks, installed ones draw.
+                let mut fonts = vec![(data, 0)];
                 if !missing.is_empty() {
-                    bail!(
-                        "font {} has no glyph for: {}",
-                        path.display(),
-                        missing.iter().collect::<String>()
-                    );
+                    fonts.extend(system_fonts(&missing, Style::default()).with_context(|| {
+                        format!(
+                            "font {} has no glyph for: {}",
+                            path.display(),
+                            missing.iter().collect::<String>()
+                        )
+                    })?);
                 }
-                (data, 0)
+                fonts
             }
-            None => system_font(&wanted)?,
+            None => system_fonts(&wanted, Style::default())?,
         };
-        embed(doc, data, index, &wanted, text)
+        embed_all(doc, fonts, &wanted, text)
     }
 
     /// Adds a font of the given style for `text`: a built-in one (Helvetica or Courier)
@@ -283,16 +334,58 @@ impl TextFont {
                 id: doc.add_object(font),
                 embedded: None,
                 builtin: style,
+                stand_ins: Vec::new(),
             });
         }
         wanted.sort_unstable();
         wanted.dedup();
-        let (data, index) = styled_system_font(&wanted, style)?;
-        embed(doc, data, index, &wanted, text)
+        let fonts = system_fonts(&wanted, style)?;
+        embed_all(doc, fonts, &wanted, text)
     }
 
-    /// The elements of a `TJ` array showing `text`: strings of glyphs, and between them
-    /// the movements that kerning and shaping ask for.
+    /// The font objects that draw this font's text: its own, then those standing in
+    /// for it. `show_named` wants a resource name for each.
+    pub fn ids(&self) -> Vec<ObjectId> {
+        let mut ids = vec![self.id];
+        ids.extend(self.stand_ins.iter().map(|font| font.id));
+        ids
+    }
+
+    fn has(&self, c: char) -> bool {
+        match &self.embedded {
+            Some(embedded) => embedded.nominal.contains_key(&c),
+            None => winansi(c.encode_utf8(&mut [0; 4])).is_some(),
+        }
+    }
+
+    /// `text` shared out among this font and those standing in for it: for each piece,
+    /// in the order they are drawn, which font of `ids` draws it. Each font is to be
+    /// used through `show`, `elements` and `own_width`, which speak for it alone.
+    pub fn pieces<'a>(&'a self, text: &'a str) -> Vec<(usize, &'a TextFont, &'a str)> {
+        let font = |k: usize| match k {
+            0 => self,
+            k => &self.stand_ins[k - 1],
+        };
+        share(text, 1 + self.stand_ins.len(), &|k, c| font(k).has(c))
+            .into_iter()
+            .map(|(k, range)| (k, font(k), &text[range]))
+            .collect()
+    }
+
+    /// The operators that show `text` at `size` points, each piece of it in the font
+    /// that has its glyphs. `names` are the resource names of `ids`, in that order.
+    pub fn show_named(&self, names: &[String], text: &str, size: f64) -> String {
+        self.pieces(text)
+            .into_iter()
+            .map(|(k, font, piece)| {
+                format!("/{} {size:.2} Tf\n{}", names[k], font.show(piece, size))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The elements of a `TJ` array showing `text` in this font alone: strings of glyphs,
+    /// and between them the movements that kerning and shaping ask for.
     ///
     /// A `TJ` array cannot raise or lower a glyph, so marks that the font places above
     /// or below their base stay on the baseline here; `show` places them.
@@ -332,9 +425,9 @@ impl TextFont {
         out
     }
 
-    /// The operators that show `text` at `size` points: one `Tj` for plain text, a `TJ`
-    /// with kerning where the font has any, and changes of text rise around marks that
-    /// sit above or below their base.
+    /// The operators that show `text` at `size` points in this font alone: one `Tj` for
+    /// plain text, a `TJ` with kerning where the font has any, and changes of text rise
+    /// around marks that sit above or below their base.
     pub fn show(&self, text: &str, size: f64) -> String {
         let Some(embedded) = &self.embedded else {
             return format!("{} Tj", literal(&winansi(text).unwrap_or_default()));
@@ -407,7 +500,19 @@ impl TextFont {
         self.embedded.is_some()
     }
 
+    /// How wide `text` is at `size` points, each piece of it in the font that draws it.
     pub fn width(&self, text: &str, size: f64) -> f64 {
+        if self.stand_ins.is_empty() {
+            return self.own_width(text, size);
+        }
+        self.pieces(text)
+            .into_iter()
+            .map(|(_, font, piece)| font.own_width(piece, size))
+            .sum()
+    }
+
+    /// How wide `text` is at `size` points in this font alone.
+    pub fn own_width(&self, text: &str, size: f64) -> f64 {
         match &self.embedded {
             None => {
                 let bytes = winansi(text).unwrap_or_default();
@@ -470,22 +575,19 @@ const USUAL_FONTS: [&str; 9] = [
     "C:\\Windows\\Fonts\\arial.ttf",
 ];
 
-/// Finds an installed font of the given style covering `wanted`.
-///
-/// Falls back to any covering font: wrong emphasis beats missing letters.
-fn styled_system_font(wanted: &[char], style: Style) -> Result<(Vec<u8>, u32)> {
+/// Where the usual fonts would be in the given style. The usual families name their
+/// variants predictably, which avoids indexing all fonts.
+fn usual_fonts(style: Style) -> Vec<std::path::PathBuf> {
     if style == Style::default() {
-        return system_font(wanted);
+        return USUAL_FONTS.iter().map(Into::into).collect();
     }
-    let covers =
-        |data: &[u8], index: u32| missing(data, index, wanted).is_some_and(|m| m.is_empty());
-    // The usual families name their variants predictably, which avoids indexing all fonts.
     let variant = match (style.bold, style.italic) {
         (false, false) => ["", "-Regular"],
         (true, false) => ["-Bold", "-Bold"],
         (false, true) => ["-Oblique", "-Italic"],
         (true, true) => ["-BoldOblique", "-BoldItalic"],
     };
+    let mut out = Vec::new();
     for path in USUAL_FONTS {
         let path = Path::new(path);
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -497,13 +599,37 @@ fn styled_system_font(wanted: &[char], style: Style) -> Result<(Vec<u8>, u32)> {
             (true, family) => format!("{family}Mono"),
             (false, family) => family.to_string(),
         };
-        for suffix in variant {
-            let candidate = path.with_file_name(format!("{family}{suffix}.ttf"));
-            if let Ok(data) = std::fs::read(&candidate)
-                && covers(&data, 0)
-            {
-                return Ok((data, 0));
-            }
+        // Windows names its Arial variants by letter.
+        let short = match (stem, style.bold, style.italic, style.mono) {
+            ("arial", true, false, false) => Some("arialbd"),
+            ("arial", false, true, false) => Some("ariali"),
+            ("arial", true, true, false) => Some("arialbi"),
+            _ => None,
+        };
+        out.extend(short.map(|name| path.with_file_name(format!("{name}.ttf"))));
+        out.extend(
+            variant
+                .iter()
+                .map(|suffix| path.with_file_name(format!("{family}{suffix}.ttf"))),
+        );
+    }
+    out
+}
+
+/// Finds an installed font of the given style covering `wanted`.
+///
+/// Falls back to any covering font: wrong emphasis beats missing letters.
+fn styled_system_font(wanted: &[char], style: Style) -> Result<(Vec<u8>, u32)> {
+    if style == Style::default() {
+        return system_font(wanted);
+    }
+    let covers =
+        |data: &[u8], index: u32| missing(data, index, wanted).is_some_and(|m| m.is_empty());
+    for candidate in usual_fonts(style) {
+        if let Ok(data) = std::fs::read(&candidate)
+            && covers(&data, 0)
+        {
+            return Ok((data, 0));
         }
     }
     let mut db = fontdb::Database::new();
@@ -540,6 +666,144 @@ fn styled_system_font(wanted: &[char], style: Style) -> Result<(Vec<u8>, u32)> {
     }
 }
 
+/// Installed fonts in the order they are preferred: a regular sans-serif first, then
+/// plain upright text faces, so that a stamp does not come out bold, italic or monospaced.
+fn by_preference(db: &fontdb::Database) -> Vec<&fontdb::FaceInfo> {
+    let preferred = db.query(&fontdb::Query {
+        families: &[fontdb::Family::SansSerif],
+        ..Default::default()
+    });
+    let mut faces: Vec<&fontdb::FaceInfo> = db.faces().collect();
+    faces.sort_by_key(|f| {
+        (
+            Some(f.id) != preferred,
+            f.style != fontdb::Style::Normal,
+            f.weight != fontdb::Weight::NORMAL,
+            f.stretch != fontdb::Stretch::Normal,
+            f.monospaced,
+            f.post_script_name.clone(),
+        )
+    });
+    faces
+}
+
+/// Finds installed fonts that between them cover `wanted`.
+///
+/// A usual font of the given style that has everything is the whole answer. One that
+/// has the letters of some of the text draws those, and others stand in for the rest:
+/// Latin next to Chinese stays in the face a reader expects, not in the Latin of a
+/// Chinese font. Failing both, any one font that has everything will do, and then as
+/// few as it takes, each chosen for covering the most of what is still missing.
+fn system_fonts(wanted: &[char], style: Style) -> Result<Vec<(Vec<u8>, u32)>> {
+    let mut usual: Option<(usize, Vec<u8>)> = None;
+    for path in usual_fonts(style) {
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        let Some(missing) = missing(&data, 0, wanted) else {
+            continue;
+        };
+        if missing.is_empty() {
+            return Ok(vec![(data, 0)]);
+        }
+        let letters = wanted
+            .iter()
+            .filter(|c| c.is_alphabetic() && !missing.contains(c))
+            .count();
+        if letters > usual.as_ref().map_or(0, |u| u.0) {
+            usual = Some((letters, data));
+        }
+    }
+    let mut out = Vec::new();
+    let mut left = wanted.to_vec();
+    match usual {
+        Some((_, data)) => {
+            left = missing(&data, 0, wanted).unwrap_or_default();
+            out.push((data, 0));
+        }
+        None => {
+            if let Ok(one) = styled_system_font(wanted, style) {
+                return Ok(vec![one]);
+            }
+        }
+    }
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    let faces = by_preference(&db);
+    while !left.is_empty() {
+        let mut best: Option<(usize, fontdb::ID)> = None;
+        for face in &faces {
+            let covered = db
+                .with_face_data(face.id, |data, index| missing(data, index, &left))
+                .flatten()
+                .map_or(0, |missing| left.len() - missing.len());
+            if covered > best.map_or(0, |b| b.0) {
+                best = Some((covered, face.id));
+                if covered == left.len() {
+                    break;
+                }
+            }
+        }
+        let found =
+            best.and_then(|(_, id)| db.with_face_data(id, |data, index| (data.to_vec(), index)));
+        let Some((data, index)) = found else {
+            bail!(
+                "no installed font can draw '{}'; pass a font file that can",
+                left.iter().collect::<String>()
+            );
+        };
+        left = missing(&data, index, &left).unwrap_or_default();
+        out.push((data, index));
+    }
+    Ok(out)
+}
+
+/// Embeds fonts that between them draw `text`: the first as the font itself, the
+/// others standing in where it has no glyph. Each carries what it is going to draw.
+fn embed_all(
+    doc: &mut Document,
+    mut fonts: Vec<(Vec<u8>, u32)>,
+    wanted: &[char],
+    text: &str,
+) -> Result<TextFont> {
+    if fonts.len() == 1 {
+        let (data, index) = fonts.remove(0);
+        return embed(doc, data, index, wanted, text);
+    }
+    let has: Vec<HashSet<char>> = fonts
+        .iter()
+        .map(|(data, index)| {
+            let missing = missing(data, *index, wanted).unwrap_or_else(|| wanted.to_vec());
+            wanted
+                .iter()
+                .copied()
+                .filter(|c| !missing.contains(c))
+                .collect()
+        })
+        .collect();
+    // What each font draws of the text, a piece to the line: shaping never reaches
+    // from one piece into the next.
+    let mut drawn = vec![String::new(); fonts.len()];
+    for line in text.split(char::is_control) {
+        for (k, range) in share(line, fonts.len(), &|k, c| has[k].contains(&c)) {
+            drawn[k] += &line[range];
+            drawn[k].push('\n');
+        }
+    }
+    let mut embedded = Vec::new();
+    for (k, ((data, index), drawn)) in fonts.into_iter().zip(drawn).enumerate() {
+        let mut chars: Vec<char> = drawn.chars().filter(|c| !c.is_control()).collect();
+        chars.sort_unstable();
+        chars.dedup();
+        if k == 0 || !chars.is_empty() {
+            embedded.push(embed(doc, data, index, &chars, &drawn)?);
+        }
+    }
+    let mut font = embedded.remove(0);
+    font.stand_ins = embedded;
+    Ok(font)
+}
+
 /// Finds an installed font covering `wanted`, preferring a regular sans-serif.
 fn system_font(wanted: &[char]) -> Result<(Vec<u8>, u32)> {
     // Indexing every installed font takes seconds on a cold cache, so the usual
@@ -553,23 +817,7 @@ fn system_font(wanted: &[char]) -> Result<(Vec<u8>, u32)> {
     }
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
-    let preferred = db.query(&fontdb::Query {
-        families: &[fontdb::Family::SansSerif],
-        ..Default::default()
-    });
-    let mut faces: Vec<&fontdb::FaceInfo> = db.faces().collect();
-    // Plain upright text faces first, so a stamp does not come out bold, italic or monospaced.
-    faces.sort_by_key(|f| {
-        (
-            Some(f.id) != preferred,
-            f.style != fontdb::Style::Normal,
-            f.weight != fontdb::Weight::NORMAL,
-            f.stretch != fontdb::Stretch::Normal,
-            f.monospaced,
-            f.post_script_name.clone(),
-        )
-    });
-    for face in faces {
+    for face in by_preference(&db) {
         let found = db.with_face_data(face.id, |data, index| {
             missing(data, index, wanted)
                 .is_some_and(|m| m.is_empty())
@@ -794,6 +1042,7 @@ fn embed(
             nominal,
         }),
         builtin: Style::default(),
+        stand_ins: Vec::new(),
     })
 }
 
@@ -970,5 +1219,83 @@ mod tests {
             "{moved} {apart} {together}"
         );
         assert_eq!(font.elements("AVAVAV").len(), shown.split(' ').count() - 1);
+    }
+
+    #[test]
+    fn text_is_shared_out_among_fonts_by_what_each_can_draw() {
+        let pieces = |text: &str, has: &dyn Fn(usize, char) -> bool| -> Vec<(usize, String)> {
+            share(text, 2, has)
+                .into_iter()
+                .map(|(font, range)| (font, text[range].to_string()))
+                .collect()
+        };
+        let own = |pieces: &[(usize, &str)]| -> Vec<(usize, String)> {
+            pieces.iter().map(|(k, s)| (*k, s.to_string())).collect()
+        };
+        // The second font takes over where the first has nothing, keeps the comma and
+        // the space that follow, and hands back at the next word the first can draw.
+        let latin_first = |font: usize, c: char| font == 1 || c.is_ascii();
+        assert_eq!(
+            pieces("ab \u{4f60}\u{597d}, cd", &latin_first),
+            own(&[(0, "ab "), (1, "\u{4f60}\u{597d}, "), (0, "cd")])
+        );
+        // An accent stays in the font of its letter, though the first font has it too.
+        let accent = |font: usize, c: char| match font {
+            0 => c.is_ascii() || c == '\u{301}',
+            _ => c == '\u{436}' || c == '\u{301}',
+        };
+        assert_eq!(
+            pieces("\u{436}\u{301}a", &accent),
+            own(&[(1, "\u{436}\u{301}"), (0, "a")])
+        );
+        // Pieces come as they are drawn: in a line that runs from the right, the
+        // piece that is read first comes last.
+        let scripts = |font: usize, c: char| match font {
+            0 => c == ' ' || ('\u{5d0}'..='\u{5ea}').contains(&c),
+            _ => ('\u{600}'..='\u{6ff}').contains(&c),
+        };
+        assert_eq!(
+            pieces(
+                "\u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{633}\u{644}\u{627}\u{645}",
+                &scripts
+            ),
+            own(&[
+                (1, "\u{633}\u{644}\u{627}\u{645}"),
+                (0, "\u{5e9}\u{5dc}\u{5d5}\u{5dd} ")
+            ])
+        );
+        // One font takes everything, whatever it has.
+        assert_eq!(share("a\u{4f60}", 1, &|_, _| false), [(0, 0..4)]);
+    }
+
+    #[test]
+    fn several_fonts_draw_what_no_single_one_has() {
+        // Polish, Hebrew, Chinese and Devanagari: installed fonts rarely have all four.
+        let text = "Za\u{17c}\u{f3}\u{142}\u{107} \u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{4f60}\u{597d} \u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947}";
+        let Some((doc, font)) = embedded(text) else {
+            return;
+        };
+        let ids = font.ids();
+        let names: Vec<String> = (0..ids.len()).map(|k| format!("F{k}")).collect();
+        let pieces = font.pieces(text);
+        // Every character is drawn by a font that has it, and every font is put to use.
+        for (_, piece_font, piece) in &pieces {
+            assert!(
+                piece.chars().all(|c| piece_font.has(c)),
+                "{piece} is not covered"
+            );
+        }
+        let used: HashSet<usize> = pieces.iter().map(|p| p.0).collect();
+        assert_eq!(used.len(), ids.len());
+        assert!(ids.iter().all(|id| doc.get_dictionary(*id).is_ok()));
+        // The width is the sum of the pieces, and each piece is shown in its own font.
+        let sum: f64 = pieces
+            .iter()
+            .map(|(_, piece_font, piece)| piece_font.own_width(piece, 10.0))
+            .sum();
+        assert!((font.width(text, 10.0) - sum).abs() < 1e-9);
+        let shown = font.show_named(&names, text, 10.0);
+        assert_eq!(shown.matches(" Tf").count(), pieces.len(), "{shown}");
+        eprintln!("{} fonts share the sample", ids.len());
     }
 }

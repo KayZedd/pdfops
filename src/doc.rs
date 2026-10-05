@@ -157,6 +157,15 @@ fn convert(object: &LazyObject<'_>, open: &mut Vec<ObjectId>, depth: u32) -> Res
     })
 }
 
+/// A dictionary that refers to no other object, as an inline image has it, in the
+/// writing model's terms.
+pub(crate) fn direct_dictionary(dict: &Dict<'_>) -> Result<Dictionary> {
+    match convert(&LazyObject::Dict(dict.clone()), &mut Vec::new(), 0)? {
+        Object::Dictionary(dict) => Ok(dict),
+        _ => bail!("not a dictionary"),
+    }
+}
+
 /// Builds a document from what the repairing reader sees of a damaged file.
 ///
 /// Everything the catalog and the pages reach is carried over as it is read; the

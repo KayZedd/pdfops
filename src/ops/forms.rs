@@ -369,10 +369,17 @@ fn text_appearance(
         (h - 4.0).clamp(4.0, 12.0)
     };
 
-    let (font_name, fonts) = if font.is_embedded() {
+    let (names, fonts) = if font.is_embedded() {
         let mut fonts = Dictionary::new();
-        fonts.set("PdfopsF", font.id);
-        ("PdfopsF".to_string(), fonts)
+        let names: Vec<String> = (0..)
+            .map(|k| format!("PdfopsF{k}"))
+            .zip(font.ids())
+            .map(|(name, id)| {
+                fonts.set(name.as_str(), id);
+                name
+            })
+            .collect();
+        (names, fonts)
     } else {
         let mut fonts = acroform(d)
             .and_then(|f| doc::resolve(d, f.get(b"DR").ok()?).as_dict().ok())
@@ -382,8 +389,9 @@ fn text_appearance(
         if !fonts.has(asked_font.as_bytes()) {
             fonts.set(asked_font.as_str(), font.id);
         }
-        (asked_font, fonts)
+        (vec![asked_font], fonts)
     };
+    let font_name = &names[0];
     let mut resources = Dictionary::new();
     resources.set("Font", fonts);
 
@@ -400,7 +408,10 @@ fn text_appearance(
             (h - size) / 2.0 + size * 0.22,
         )
     };
-    let shown: Vec<String> = lines.iter().map(|line| font.show(line, size)).collect();
+    let shown: Vec<String> = lines
+        .iter()
+        .map(|line| font.show_named(&names, line, size))
+        .collect();
     let content = format!(
         "/Tx BMC\nq\n1 1 {:.2} {:.2} re W n\nBT\n/{font_name} {size:.2} Tf\n{color}\n{leading:.2} TL\n2 {baseline:.2} Td\n{}\nET\nQ\nEMC\n",
         (w - 2.0).max(0.0),

@@ -274,7 +274,7 @@ struct PageBuffer {
 
 struct Writer {
     d: Document,
-    fonts: HashMap<Style, (TextFont, String)>,
+    fonts: HashMap<Style, (TextFont, Vec<String>)>,
     images: HashMap<String, (ObjectId, String, f64, f64)>,
     pages: Vec<PageBuffer>,
     height: f64,
@@ -311,7 +311,7 @@ impl Writer {
         }
     }
 
-    fn font(&self, style: Style) -> &(TextFont, String) {
+    fn font(&self, style: Style) -> &(TextFont, Vec<String>) {
         self.fonts
             .get(&style)
             .or_else(|| self.fonts.get(&Style::default()))
@@ -346,70 +346,111 @@ impl Writer {
             x += w;
         }
         lines.retain(|l| !l.is_empty());
+        // The paragraph runs the way of its first letter that has a direction.
+        let from_the_right = tokens
+            .iter()
+            .flat_map(|t| t.text.chars())
+            .find_map(|c| match unicode_bidi::bidi_class(c) {
+                unicode_bidi::BidiClass::L => Some(false),
+                unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL => Some(true),
+                _ => None,
+            })
+            .unwrap_or(false);
         for line in &mut lines {
-            self.reorder(line, size);
+            self.reorder(line, size, from_the_right, width);
         }
         lines
     }
 
-    /// Puts the words of a line holding right-to-left text where they are read: a run
-    /// of such words is laid out from its right end. The line keeps its left edge.
-    fn reorder(&self, line: &mut Vec<(f64, Token)>, size: f64) {
+    /// Puts a line holding right-to-left text in the order it is read in.
+    ///
+    /// The line is taken as a whole, so that a comma after a Hebrew word in an English
+    /// sentence lands where the sentence continues: words are cut where the direction
+    /// changes, and each stretch of one direction is laid out from its own end. A
+    /// paragraph that runs from the right is set against the right edge of `width`.
+    fn reorder(&self, line: &mut Vec<(f64, Token)>, size: f64, from_the_right: bool, width: f64) {
         use unicode_bidi::BidiClass::{AL, R};
         let right_to_left = |c: char| matches!(unicode_bidi::bidi_class(c), R | AL);
         if !line.iter().any(|(_, t)| t.text.chars().any(right_to_left)) {
             return;
         }
-        // The line as one string, with where each word starts in it.
+        // The line as one string, with where each word lies in it.
         let mut text = String::new();
-        let mut starts = Vec::with_capacity(line.len());
+        let mut places = Vec::with_capacity(line.len());
         for (i, (_, token)) in line.iter().enumerate() {
-            if i > 0 {
+            if i > 0 && token.spaced {
                 text.push(' ');
             }
-            starts.push(text.len());
+            places.push(text.len()..text.len() + token.text.len());
             text.push_str(&token.text);
         }
-        let bidi = unicode_bidi::BidiInfo::new(&text, None);
+        let level = if from_the_right {
+            unicode_bidi::Level::rtl()
+        } else {
+            unicode_bidi::Level::ltr()
+        };
+        let bidi = unicode_bidi::BidiInfo::new(&text, Some(level));
         let Some(paragraph) = bidi.paragraphs.first() else {
             return;
         };
         let (levels, runs) = bidi.visual_runs(paragraph, paragraph.range.clone());
-        let mut order: Vec<usize> = Vec::with_capacity(line.len());
+        // The parts of words in the order they are drawn, and the spaces between
+        // words (`None`) where their own direction puts them.
+        let mut parts: Vec<(usize, Option<Token>)> = Vec::with_capacity(line.len());
         for run in runs {
-            let mut words: Vec<usize> = (0..line.len())
-                .filter(|&i| run.contains(&starts[i]))
-                .collect();
-            if levels[run.start].is_rtl() {
-                words.reverse();
+            let mut inside: Vec<(usize, Option<Token>)> = Vec::new();
+            for (i, place) in places.iter().enumerate() {
+                let token = &line[i].1;
+                if i > 0 && token.spaced && run.contains(&(place.start - 1)) {
+                    inside.push((i, None));
+                }
+                let (from, to) = (place.start.max(run.start), place.end.min(run.end));
+                if from >= to {
+                    continue;
+                }
+                inside.push((
+                    i,
+                    Some(Token {
+                        text: text[from..to].to_string(),
+                        style: token.style,
+                        link: token.link.clone(),
+                        spaced: token.spaced && from == place.start,
+                        breaks: token.breaks && from == place.start,
+                    }),
+                ));
             }
-            order.extend(words);
-        }
-        if order.len() != line.len() {
-            return;
+            if levels[run.start].is_rtl() {
+                inside.reverse();
+            }
+            parts.extend(inside);
         }
         let mut x = line[0].0;
-        let mut placed = Vec::with_capacity(line.len());
-        for (n, &i) in order.iter().enumerate() {
-            let token = line[i].1.clone();
-            // Neighbours on the page are apart if the later of the two had a space before it.
-            if n > 0 && line[i.max(order[n - 1])].1.spaced {
-                x += self.font(token.style).0.width(" ", size);
+        let mut placed = Vec::with_capacity(parts.len());
+        for (i, part) in parts {
+            match part {
+                None => x += self.font(line[i].1.style).0.width(" ", size),
+                Some(part) => {
+                    let wide = self.measure(&part, size);
+                    placed.push((x, part));
+                    x += wide;
+                }
             }
-            let width = self.measure(&token, size);
-            placed.push((x, token));
-            x += width;
+        }
+        if from_the_right && width.is_finite() {
+            let spare = (width - x).max(0.0);
+            for part in &mut placed {
+                part.0 += spare;
+            }
         }
         *line = placed;
     }
 
     fn draw_line(&mut self, line: &[(f64, Token)], x0: f64, baseline: f64, size: f64) {
         for (offset, token) in line {
-            let (font, name) = self.font(token.style);
-            let (text, width, name) = (
-                font.show(&token.text, size),
+            let (font, names) = self.font(token.style);
+            let (text, width) = (
+                font.show_named(names, &token.text, size),
                 font.width(&token.text, size),
-                name.clone(),
             );
             let x = x0 + offset;
             let color = if token.link.is_some() {
@@ -417,9 +458,7 @@ impl Writer {
             } else {
                 "0 g"
             };
-            let op = format!(
-                "BT\n/{name} {size:.2} Tf\n{color}\n1 0 0 1 {x:.2} {baseline:.2} Tm\n{text}\nET\n"
-            );
+            let op = format!("BT\n{color}\n1 0 0 1 {x:.2} {baseline:.2} Tm\n{text}\nET\n");
             let link = token.link.clone();
             let page = self.page();
             page.ops += &op;
@@ -491,10 +530,11 @@ impl Writer {
                     .collect();
                 for line in &lines {
                     self.need(line_height);
-                    let (top, name) = (self.y, self.font(style).1.clone());
-                    let text = self.font(style).0.show(line, size);
+                    let top = self.y;
+                    let (font, names) = self.font(style);
+                    let text = font.show_named(names, line, size);
                     self.page().ops += &format!(
-                        "0.95 g\n{x0:.2} {:.2} {width:.2} {line_height:.2} re\nf\nBT\n/{name} {size:.2} Tf\n0 g\n1 0 0 1 {:.2} {:.2} Tm\n{text}\nET\n",
+                        "0.95 g\n{x0:.2} {:.2} {width:.2} {line_height:.2} re\nf\nBT\n0 g\n1 0 0 1 {:.2} {:.2} Tm\n{text}\nET\n",
                         top - line_height,
                         x0 + 6.0,
                         top - size
@@ -805,9 +845,22 @@ pub fn create(a: CreateArgs) -> Result<Value> {
             mono: *mono,
         };
         let font = TextFont::styled(&mut d, text, style)?;
-        let name = format!("F{i}");
-        resources_fonts.set(name.as_str(), font.id);
-        fonts.insert(style, (font, name));
+        // The font of a style, and behind it those standing in where it has no glyph.
+        let names: Vec<String> = font
+            .ids()
+            .into_iter()
+            .enumerate()
+            .map(|(k, id)| {
+                let name = if k == 0 {
+                    format!("F{i}")
+                } else {
+                    format!("F{i}S{k}")
+                };
+                resources_fonts.set(name.as_str(), id);
+                name
+            })
+            .collect();
+        fonts.insert(style, (font, names));
     }
     let mut images = HashMap::new();
     let mut xobjects = Dictionary::new();

@@ -18,6 +18,9 @@ use hayro::hayro_interpret::{
     InterpreterCache, InterpreterSettings, SoftMask, interpret_page,
 };
 use hayro::hayro_syntax::Pdf;
+use hayro::hayro_syntax::content::TypedIter;
+use hayro::hayro_syntax::content::ops::TypedInstruction;
+use hayro::hayro_syntax::object::stream::{ImageColorSpace, ImageDecodeParams};
 use hayro::hayro_syntax::object::{ObjectIdentifier, Stream as LazyStream};
 use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, BezPath, Point, Rect};
@@ -362,6 +365,8 @@ struct Pass {
     path: Option<(usize, Area, bool)>,
     /// Open marked-content sections, as positions in `out` (None when they carry no properties).
     marked: Vec<Option<usize>>,
+    /// The inline images of this stream, drawn as image objects in `out`.
+    inline: Vec<Lifted>,
 }
 
 /// How a replacement was written.
@@ -413,105 +418,411 @@ fn zero_bits(row: &mut [u8], from: usize, count: usize, bits: usize) {
     }
 }
 
+/// An inline image taken out of a content stream, to be drawn as an image object instead.
+struct Lifted {
+    name: Vec<u8>,
+    /// The image as it stood in the content, from `BI` to `EI`.
+    source: Vec<u8>,
+    image: Stream,
+}
+
+fn unreadable_inline_image() -> anyhow::Error {
+    anyhow!("the page has an inline image that cannot be read with certainty; nothing was written")
+}
+
+/// The inline image that `content` starts with.
+fn inline_image(content: &[u8]) -> Option<LazyStream<'_>> {
+    match TypedIter::new(content).next()? {
+        TypedInstruction::InlineImage(image) => Some(image.0.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a byte can be part of a number, a name or an operator.
+fn is_regular(byte: u8) -> bool {
+    !matches!(
+        byte,
+        0 | 9
+            | 10
+            | 12
+            | 13
+            | 32
+            | b'('
+            | b')'
+            | b'<'
+            | b'>'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'/'
+            | b'%'
+    )
+}
+
+/// The long form of what an inline image may abbreviate in a colour space or a filter.
+fn spelled_out(name: &[u8]) -> Option<&'static str> {
+    Some(match name {
+        b"G" => "DeviceGray",
+        b"RGB" => "DeviceRGB",
+        b"CMYK" => "DeviceCMYK",
+        b"I" => "Indexed",
+        b"AHx" => "ASCIIHexDecode",
+        b"A85" => "ASCII85Decode",
+        b"LZW" => "LZWDecode",
+        b"Fl" => "FlateDecode",
+        b"RL" => "RunLengthDecode",
+        b"CCF" => "CCITTFaxDecode",
+        b"DCT" => "DCTDecode",
+        _ => return None,
+    })
+}
+
+/// An inline image as the image object that draws the same.
+fn image_object(
+    d: &Document,
+    image: &LazyStream<'_>,
+    data: &[u8],
+    resources: &Dictionary,
+) -> Result<Stream> {
+    let name = |name: &[u8]| match spelled_out(name) {
+        Some(long) => Object::Name(long.into()),
+        None => Object::Name(name.to_vec()),
+    };
+    let mut dict = Dictionary::new();
+    dict.set("Type", Object::Name(b"XObject".to_vec()));
+    dict.set("Subtype", Object::Name(b"Image".to_vec()));
+    for (key, value) in doc::direct_dictionary(image.dict())?.iter() {
+        let key: &[u8] = match key.as_slice() {
+            b"BPC" => b"BitsPerComponent",
+            b"CS" => b"ColorSpace",
+            b"D" => b"Decode",
+            b"DP" => b"DecodeParms",
+            b"F" => b"Filter",
+            b"H" => b"Height",
+            b"IM" => b"ImageMask",
+            b"I" => b"Interpolate",
+            b"W" => b"Width",
+            b"L" | b"Length" => continue,
+            other => other,
+        };
+        let value = match (key, value) {
+            // Any other name stands for a colour space among the resources.
+            (b"ColorSpace", Object::Name(n)) if spelled_out(n).is_none() => resources
+                .get(b"ColorSpace")
+                .ok()
+                .and_then(|spaces| doc::resolve(d, spaces).as_dict().ok())
+                .and_then(|spaces| spaces.get(n).ok())
+                .cloned()
+                .unwrap_or_else(|| value.clone()),
+            (b"ColorSpace" | b"Filter", Object::Name(n)) => name(n),
+            (b"ColorSpace" | b"Filter", Object::Array(items)) => Object::Array(
+                items
+                    .iter()
+                    .map(|item| match item {
+                        Object::Name(n) => name(n),
+                        other => other.clone(),
+                    })
+                    .collect(),
+            ),
+            _ => value.clone(),
+        };
+        dict.set(key, value);
+    }
+    Ok(Stream::new(dict, data.to_vec()))
+}
+
+/// Takes the inline images out of a content stream. Each becomes the drawing of an
+/// image object, which is returned with the name it is drawn by.
+///
+/// lopdf, which rewrites the content, reads only the plainest inline images and drops
+/// the rest, so none is left to it: where one ends is decided by the reader that
+/// also renders the page.
+fn lift_inline_images(
+    d: &Document,
+    content: &[u8],
+    resources: &Dictionary,
+) -> Result<(Vec<u8>, Vec<Lifted>)> {
+    let mut lifted = Vec::new();
+    let mut out = Vec::new();
+    if !content.windows(2).any(|w| w == b"BI") {
+        return Ok((out, lifted));
+    }
+    let taken = resources
+        .get(b"XObject")
+        .ok()
+        .and_then(|x| doc::resolve(d, x).as_dict().ok());
+    let mut number = 0;
+    let (mut at, mut copied) = (0, 0);
+    while at < content.len() {
+        let rest = &content[at..];
+        at += match rest[0] {
+            b'%' => rest
+                .iter()
+                .position(|b| matches!(b, b'\n' | b'\r'))
+                .unwrap_or(rest.len()),
+            b'(' => {
+                let (mut depth, mut end) = (0, 0);
+                while end < rest.len() {
+                    match rest[end] {
+                        b'\\' => end += 1,
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    end += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                end
+            }
+            b'<' if rest.get(1) != Some(&b'<') => rest
+                .iter()
+                .position(|&b| b == b'>')
+                .map_or(rest.len(), |end| end + 1),
+            b'/' => 1 + rest[1..].iter().take_while(|&&b| is_regular(b)).count(),
+            byte if is_regular(byte) => {
+                let len = rest.iter().take_while(|&&b| is_regular(b)).count();
+                if &rest[..len] == b"BI" {
+                    let image = inline_image(rest).ok_or_else(unreadable_inline_image)?;
+                    let std::borrow::Cow::Borrowed(data) = image.raw_data() else {
+                        return Err(unreadable_inline_image());
+                    };
+                    // The data is a part of `rest`, and `EI` follows it.
+                    let end = (data.as_ptr() as usize + data.len())
+                        .checked_sub(rest.as_ptr() as usize)
+                        .filter(|&end| rest.get(end..end + 2) == Some(b"EI"))
+                        .ok_or_else(unreadable_inline_image)?
+                        + 2;
+                    let name = loop {
+                        number += 1;
+                        let name = format!("Inline{number}").into_bytes();
+                        if taken.is_none_or(|taken| !taken.has(&name)) {
+                            break name;
+                        }
+                    };
+                    out.extend_from_slice(&content[copied..at]);
+                    out.extend_from_slice(b" /");
+                    out.extend_from_slice(&name);
+                    out.extend_from_slice(b" Do ");
+                    copied = at + end;
+                    lifted.push(Lifted {
+                        name,
+                        source: rest[..end].to_vec(),
+                        image: image_object(d, &image, data, resources)?,
+                    });
+                    end
+                } else {
+                    len
+                }
+            }
+            _ => 1,
+        };
+    }
+    if !lifted.is_empty() {
+        out.extend_from_slice(&content[copied.min(content.len())..]);
+    }
+    Ok((out, lifted))
+}
+
+/// Whether a colour space is indexed, and how many components a sample has in it,
+/// where that can be told without reading further.
+fn components(d: &Document, space: &Object) -> (bool, Option<u8>) {
+    let by_name = |name: &[u8]| match name {
+        b"DeviceGray" | b"CalGray" | b"Separation" => Some(1),
+        b"DeviceRGB" | b"CalRGB" | b"Lab" => Some(3),
+        b"DeviceCMYK" => Some(4),
+        _ => None,
+    };
+    match space {
+        Object::Name(name) => (false, by_name(name)),
+        Object::Array(items) => {
+            let family = items.first().and_then(|n| n.as_name().ok()).unwrap_or(b"");
+            let detail = items.get(1).map(|o| doc::resolve(d, o));
+            match family {
+                b"Indexed" => (true, Some(1)),
+                b"ICCBased" => (
+                    false,
+                    detail
+                        .and_then(|profile| profile.as_stream().ok())
+                        .and_then(|profile| profile.dict.get(b"N").ok())
+                        .and_then(|n| doc::resolve(d, n).as_i64().ok())
+                        .and_then(|n| u8::try_from(n).ok()),
+                ),
+                b"DeviceN" => (
+                    false,
+                    detail
+                        .and_then(|names| names.as_array().ok())
+                        .and_then(|names| u8::try_from(names.len()).ok()),
+                ),
+                _ => (false, by_name(family)),
+            }
+        }
+        _ => (false, None),
+    }
+}
+
+/// Sets to zero the samples of a packed raster that fall into the areas.
+fn zero_areas(
+    data: &mut [u8],
+    (width, height): (usize, usize),
+    sample_bits: usize,
+    to_image: Matrix,
+    areas: &[Area],
+) {
+    let row_bytes = data.len() / height;
+    for area in areas {
+        let corners = [
+            (area[0], area[1]),
+            (area[2], area[1]),
+            (area[0], area[3]),
+            (area[2], area[3]),
+        ];
+        // Image space is the unit square with the first row of samples at the top.
+        let b = bounds(corners.map(|(x, y)| apply(to_image, x, y)));
+        let x0 = ((b[0].clamp(0.0, 1.0) * width as f64).floor() as usize).min(width);
+        let x1 = ((b[2].clamp(0.0, 1.0) * width as f64).ceil() as usize).min(width);
+        let y0 = (((1.0 - b[3].clamp(0.0, 1.0)) * height as f64).floor() as usize).min(height);
+        let y1 = (((1.0 - b[1].clamp(0.0, 1.0)) * height as f64).ceil() as usize).min(height);
+        for row in data.chunks_mut(row_bytes).take(y1).skip(y0) {
+            zero_bits(row, x0, x1.saturating_sub(x0), sample_bits);
+        }
+    }
+}
+
 impl Rewriter<'_> {
-    /// Blanks the pixels of an image that fall into an area. Returns the replacement image.
-    fn image(&mut self, d: &mut Document, id: ObjectId, ctm: Matrix) -> Result<Option<ObjectId>> {
+    /// The areas an image drawn with this matrix reaches into.
+    fn covered(&self, ctm: Matrix) -> Vec<Area> {
         let placed =
             bounds([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(x, y)| apply(ctm, x, y)));
-        let hits: Vec<&Area> = self
-            .user_areas
+        self.user_areas
             .iter()
             .filter(|a| intersects(a, &placed))
-            .collect();
+            .copied()
+            .collect()
+    }
+
+    /// Blanks the pixels of an image object that fall into an area. Returns the replacement image.
+    fn image(&mut self, d: &mut Document, id: ObjectId, ctm: Matrix) -> Result<Option<ObjectId>> {
+        let hits = self.covered(ctm);
         if hits.is_empty() {
             return Ok(None);
         }
-        let stream = d.get_object(id)?.as_stream()?.clone();
+        let dict = d.get_object(id)?.as_stream()?.dict.clone();
+        let source: LazyStream<'_> = self
+            .pdf
+            .xref()
+            .get(ObjectIdentifier::new(id.0 as i32, id.1 as i32))
+            .ok_or_else(|| anyhow!("cannot redact unreadable images; nothing was written"))?;
+        let blanked = self.blank(d, &dict, &source, ctm, &hits)?;
+        Ok(Some(d.add_object(blanked)))
+    }
+
+    /// An image with the pixels in the areas set to zero, stored without loss.
+    ///
+    /// The samples are taken as the renderer decodes them, whatever they are packed
+    /// with: fax and JBIG2 as scanners write them, JPEG in any colour model, JPEG 2000.
+    fn blank(
+        &mut self,
+        d: &mut Document,
+        dict: &Dictionary,
+        source: &LazyStream<'_>,
+        ctm: Matrix,
+        hits: &[Area],
+    ) -> Result<Stream> {
+        let unsupported = |what: &str| anyhow!("cannot redact {what} images; nothing was written");
         let int = |key: &[u8]| {
-            stream
-                .dict
-                .get(key)
+            dict.get(key)
                 .ok()
                 .and_then(|o| doc::resolve(d, o).as_i64().ok())
         };
-        let (width, height) = (
+        let mask = dict
+            .get(b"ImageMask")
+            .is_ok_and(|m| doc::resolve(d, m).as_bool().unwrap_or(false));
+        let stated_bits = if mask {
+            Some(1)
+        } else {
+            int(b"BitsPerComponent")
+        };
+        let space = dict.get(b"ColorSpace").ok().map(|s| doc::resolve(d, s));
+        let (indexed, in_a_sample) = space.map_or((false, None), |s| components(d, s));
+        let mut size = (
             int(b"Width").unwrap_or(0) as usize,
             int(b"Height").unwrap_or(0) as usize,
         );
-        let mask = stream
-            .dict
-            .get(b"ImageMask")
-            .is_ok_and(|m| doc::resolve(d, m).as_bool().unwrap_or(false));
-        let bits = if mask {
-            1
-        } else {
-            int(b"BitsPerComponent").unwrap_or(8) as usize
-        };
-        let filters: Vec<Vec<u8>> =
-            match stream.dict.get(b"Filter").ok().map(|f| doc::resolve(d, f)) {
-                Some(Object::Name(n)) => vec![n.clone()],
-                Some(Object::Array(a)) => a
-                    .iter()
-                    .filter_map(|o| o.as_name().ok().map(<[u8]>::to_vec))
-                    .collect(),
-                _ => Vec::new(),
-            };
-        let unsupported = |what: &str| anyhow!("cannot redact {what} images; nothing was written");
-        let mut data = if filters.iter().any(|f| f == b"JPXDecode") {
-            return Err(unsupported("JPEG 2000"));
-        } else if filters.iter().any(|f| f == b"DCTDecode" || f == b"DCT") {
-            if filters.len() != 1 {
-                return Err(unsupported("doubly encoded JPEG"));
+        let inside = int(b"SMaskInData").unwrap_or(0) != 0;
+        let decoded = source
+            .decoded_image(&ImageDecodeParams {
+                // Bilevel data is wanted as its packed bits, which this asks for.
+                is_indexed: indexed || stated_bits == Some(1),
+                bpc: stated_bits.and_then(|bits| u8::try_from(bits).ok()),
+                num_components: in_a_sample,
+                target_dimension: None,
+                width: size.0 as u32,
+                height: size.1 as u32,
+            })
+            .map_err(|_| unsupported("undecodable"))?;
+        let mut bits = stated_bits.unwrap_or(8) as usize;
+        let mut new = dict.clone();
+        let mut alpha = None;
+        // Formats that carry their own description are taken at their word.
+        if let Some(found) = decoded.image_data {
+            size = (found.width as usize, found.height as usize);
+            new.set("Width", found.width as i64);
+            new.set("Height", found.height as i64);
+            if !mask {
+                bits = found.bits_per_component as usize;
+                new.set("BitsPerComponent", bits as i64);
+                if space.is_none() {
+                    let space = match found.color_space {
+                        Some(ImageColorSpace::Gray) => "DeviceGray",
+                        Some(ImageColorSpace::Rgb) => "DeviceRGB",
+                        Some(ImageColorSpace::Cmyk) => "DeviceCMYK",
+                        _ => return Err(unsupported("JPEG 2000 of an unknown colour model")),
+                    };
+                    new.set("ColorSpace", Object::Name(space.into()));
+                }
             }
-            match image::load_from_memory_with_format(&stream.content, image::ImageFormat::Jpeg) {
-                Ok(image::DynamicImage::ImageLuma8(g)) => g.into_raw(),
-                Ok(image::DynamicImage::ImageRgb8(c)) => c.into_raw(),
-                _ => return Err(unsupported("CMYK JPEG")),
-            }
-        } else {
-            // hayro decodes every lossless filter, including the fax and JBIG2 ones scanners use.
-            let lazy: LazyStream<'_> = self
-                .pdf
-                .xref()
-                .get(ObjectIdentifier::new(id.0 as i32, id.1 as i32))
-                .ok_or_else(|| unsupported("unreadable"))?;
-            lazy.decoded()
-                .map_err(|_| unsupported("undecodable"))?
-                .into_owned()
-        };
+            alpha = found.alpha;
+        }
+        let mut data = decoded.data.into_owned();
+        let (width, height) = size;
         if width == 0 || height == 0 || bits == 0 || data.len() % height != 0 {
             return Err(unsupported("malformed"));
         }
-        let row_bytes = data.len() / height;
-        let components = row_bytes * 8 / (width * bits);
-        if components == 0 {
+        let in_a_sample = data.len() / height * 8 / (width * bits);
+        if in_a_sample == 0 {
             return Err(unsupported("malformed"));
         }
         let to_image = invert(ctm).ok_or_else(|| unsupported("degenerate"))?;
-        for area in hits {
-            let corners = [
-                (area[0], area[1]),
-                (area[2], area[1]),
-                (area[0], area[3]),
-                (area[2], area[3]),
-            ];
-            // Image space is the unit square with the first row of samples at the top.
-            let b = bounds(corners.map(|(x, y)| apply(to_image, x, y)));
-            let x0 = ((b[0].clamp(0.0, 1.0) * width as f64).floor() as usize).min(width);
-            let x1 = ((b[2].clamp(0.0, 1.0) * width as f64).ceil() as usize).min(width);
-            let y0 = (((1.0 - b[3].clamp(0.0, 1.0)) * height as f64).floor() as usize).min(height);
-            let y1 = (((1.0 - b[1].clamp(0.0, 1.0)) * height as f64).ceil() as usize).min(height);
-            for row in data.chunks_mut(row_bytes).take(y1).skip(y0) {
-                zero_bits(row, x0, x1.saturating_sub(x0), bits * components);
+        zero_areas(&mut data, size, bits * in_a_sample, to_image, hits);
+        // Transparency stored inside JPEG 2000 data becomes a mask of its own, blank
+        // in the same places: its shape could show what was there.
+        new.remove(b"SMaskInData");
+        if let Some(mut alpha) = alpha.filter(|_| inside) {
+            let alpha_bits = alpha.len() / height * 8 / width;
+            if alpha.len() % height != 0 || alpha_bits == 0 {
+                return Err(unsupported("malformed"));
             }
+            zero_areas(&mut alpha, size, alpha_bits, to_image, hits);
+            let mut soft = Dictionary::new();
+            soft.set("Type", Object::Name(b"XObject".to_vec()));
+            soft.set("Subtype", Object::Name(b"Image".to_vec()));
+            soft.set("Width", width as i64);
+            soft.set("Height", height as i64);
+            soft.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+            soft.set("BitsPerComponent", alpha_bits as i64);
+            let mut soft = Stream::new(soft, alpha);
+            let _ = soft.compress();
+            new.set("SMask", d.add_object(soft));
         }
-        let mut dict = stream.dict.clone();
-        dict.remove(b"Filter");
-        dict.remove(b"DecodeParms");
-        let mut replacement = Stream::new(dict, data);
+        new.remove(b"Filter");
+        new.remove(b"DecodeParms");
+        let mut replacement = Stream::new(new, data);
         let _ = replacement.compress();
         self.stats.images += 1;
-        Ok(Some(d.add_object(replacement)))
+        Ok(replacement)
     }
 
     /// Rewrites one content stream. Returns the new content and resources if anything changed.
@@ -526,6 +837,12 @@ impl Rewriter<'_> {
         if depth > 16 {
             bail!("forms are nested too deeply to redact safely; nothing was written");
         }
+        let (without_inline, inline) = lift_inline_images(d, content, resources)?;
+        let content = if inline.is_empty() {
+            content
+        } else {
+            &without_inline
+        };
         let operations = Content::decode(content)
             .map_err(|e| anyhow!("cannot parse page content: {e}"))?
             .operations;
@@ -545,6 +862,7 @@ impl Rewriter<'_> {
             fonts: Vec::new(),
             path: None,
             marked: Vec::new(),
+            inline,
         };
 
         for op in operations {
@@ -582,9 +900,7 @@ impl Rewriter<'_> {
                 "EMC" => {
                     pass.marked.pop();
                 }
-                "BI" => bail!(
-                    "the page has an inline image, which cannot be redacted safely; nothing was written"
-                ),
+                "BI" => return Err(unreadable_inline_image()),
                 _ => {}
             }
 
@@ -648,6 +964,19 @@ impl Rewriter<'_> {
         }
         if !pass.changed {
             return Ok(None);
+        }
+        if !pass.inline.is_empty() {
+            let mut xobjects = pass
+                .resources
+                .get(b"XObject")
+                .ok()
+                .and_then(|x| doc::resolve(d, x).as_dict().ok())
+                .cloned()
+                .unwrap_or_default();
+            for lifted in pass.inline {
+                xobjects.set(lifted.name, d.add_object(lifted.image));
+            }
+            pass.resources.set("XObject", xobjects);
         }
         let encoded = Content {
             operations: pass.out,
@@ -1015,24 +1344,28 @@ impl Rewriter<'_> {
                         .and_then(|f| doc::resolve(d, f).as_dict().ok())
                         .cloned()
                         .unwrap_or_default();
-                    let key = (1..)
-                        .map(|i| format!("PdfopsR{i}"))
-                        .find(|k| !fonts.has(k.as_bytes()))
-                        .expect("an unbounded range always yields a free name");
-                    fonts.set(key.as_str(), font.id);
+                    // One font, or several where no one has all the characters.
+                    let mut keys = Vec::new();
+                    for id in font.ids() {
+                        let key = (1..)
+                            .map(|i| format!("PdfopsR{i}"))
+                            .find(|k| !fonts.has(k.as_bytes()))
+                            .expect("an unbounded range always yields a free name");
+                        fonts.set(key.as_str(), id);
+                        keys.push(key);
+                    }
                     pass.resources.set("Font", fonts);
+                    let pieces = font.pieces(text);
                     // Word spacing applies to single-byte spaces only, which an embedded font has none of.
-                    let spaces = if font.is_embedded() {
-                        0
-                    } else {
-                        text.matches(' ').count()
-                    };
+                    let spaces: usize = pieces
+                        .iter()
+                        .filter(|(_, font, _)| !font.is_embedded())
+                        .map(|(_, _, piece)| piece.matches(' ').count())
+                        .sum();
                     let spacing = pass.state.char_spacing * text.chars().count() as f64
                         + pass.state.word_spacing * spaces as f64;
                     let units = font.width(text, 1000.0) + spacing * 1000.0 / pass.state.font_size;
                     new = units * size / 1000.0;
-                    let mut shown = font.elements(text);
-                    shown.push(Object::Real(units as f32));
                     if !rebuilt.is_empty() {
                         pass.out.push(Operation::new(
                             "TJ",
@@ -1040,12 +1373,20 @@ impl Rewriter<'_> {
                         ));
                     }
                     let size = Object::Real(pass.state.font_size as f32);
-                    pass.out.push(Operation::new(
-                        "Tf",
-                        vec![Object::Name(key.into_bytes()), size.clone()],
-                    ));
-                    pass.out
-                        .push(Operation::new("TJ", vec![Object::Array(shown)]));
+                    let last = pieces.len() - 1;
+                    for (n, (k, font, piece)) in pieces.into_iter().enumerate() {
+                        let mut shown = font.elements(piece);
+                        // After the last piece the pen goes back over all of it.
+                        if n == last {
+                            shown.push(Object::Real(units as f32));
+                        }
+                        pass.out.push(Operation::new(
+                            "Tf",
+                            vec![Object::Name(keys[k].clone().into_bytes()), size.clone()],
+                        ));
+                        pass.out
+                            .push(Operation::new("TJ", vec![Object::Array(shown)]));
+                    }
                     pass.out
                         .push(Operation::new("Tf", vec![Object::Name(original), size]));
                 }
@@ -1069,6 +1410,23 @@ impl Rewriter<'_> {
         pass: &mut Pass,
         depth: u32,
     ) -> Result<()> {
+        let lifted = op
+            .operands
+            .first()
+            .and_then(|n| n.as_name().ok())
+            .and_then(|n| pass.inline.iter().position(|lifted| lifted.name == n));
+        if let Some(lifted) = lifted {
+            let hits = self.covered(pass.state.ctm);
+            if !hits.is_empty() && self.replacements.is_empty() && !self.collect_only {
+                let image = &pass.inline[lifted];
+                let source = inline_image(&image.source).ok_or_else(unreadable_inline_image)?;
+                let blanked = self.blank(d, &image.image.dict, &source, pass.state.ctm, &hits)?;
+                pass.inline[lifted].image = blanked;
+                pass.changed = true;
+            }
+            pass.out.push(op);
+            return Ok(());
+        }
         let target = op
             .operands
             .first()
