@@ -1,0 +1,8 @@
+//! One module per group of commands. Every command takes its argument struct
+//! and returns a JSON value, so the CLI and the MCP server share one code path.
+
+pub mod assemble;
+pub mod edit;
+pub mod forms;
+pub mod read;
+pub mod render;
