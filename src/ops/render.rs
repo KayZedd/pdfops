@@ -25,6 +25,9 @@ use crate::{doc, pagespec};
 
 /// Largest raster edge in pixels; the rasteriser addresses pixels with 16 bits.
 const MAX_EDGE: f32 = 16000.0;
+/// Largest raster in pixels. A page can claim to be kilometres wide; 64 megapixels
+/// (256 MB of RGBA) is beyond what any reader of the image needs.
+const MAX_PIXELS: f32 = 64.0e6;
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
 #[serde(deny_unknown_fields)]
@@ -64,6 +67,15 @@ pub struct ImagesArgs {
     pub password: Option<String>,
 }
 
+/// Pixels per point for a page of `w` by `h` points: the requested resolution,
+/// lowered as far as the size caps demand.
+fn raster_scale(w: f32, h: f32, dpi: f32) -> f32 {
+    let (w, h) = (w.max(1.0), h.max(1.0));
+    (dpi / 72.0)
+        .min(MAX_EDGE / w.max(h))
+        .min((MAX_PIXELS / (w * h)).sqrt())
+}
+
 /// Rasterises one page and returns PNG bytes with the pixel size.
 pub fn page_png(
     page: &Page<'_>,
@@ -71,7 +83,7 @@ pub fn page_png(
     dpi: f32,
 ) -> Result<(Vec<u8>, u16, u16)> {
     let (w, h) = page.render_dimensions();
-    let scale = (dpi / 72.0).min(MAX_EDGE / w.max(h).max(1.0));
+    let scale = raster_scale(w, h, dpi);
     let pixmap = hayro::render(
         page,
         &RenderCache::new(),
@@ -360,4 +372,21 @@ pub fn images(a: ImagesArgs) -> Result<Value> {
         .collect();
     let exported = results.iter().filter(|r| r.get("file").is_some()).count();
     Ok(json!({"exported": exported, "images": results}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::raster_scale;
+
+    #[test]
+    fn rasters_keep_the_requested_resolution_until_a_cap_applies() {
+        // A4 at 150 dpi is far below every cap.
+        assert!((raster_scale(595.0, 842.0, 150.0) - 150.0 / 72.0).abs() < 1e-6);
+        // A page 20000 points square is held to 64 megapixels.
+        let scale = raster_scale(20000.0, 20000.0, 600.0);
+        assert!((20000.0 * scale).powi(2) <= 64.0e6 * 1.001 && 20000.0 * scale > 7900.0);
+        // A long strip is held to the longest edge the rasteriser can address.
+        assert!(100000.0 * raster_scale(100000.0, 10.0, 600.0) <= 16000.0 * 1.001);
+        assert!(raster_scale(0.0, 0.0, 72.0).is_finite());
+    }
 }

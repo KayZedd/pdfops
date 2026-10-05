@@ -80,7 +80,9 @@ def examine(pdfops, path, scratch):
     for name, args in commands.items():
         if os.path.exists(out):
             os.remove(out)
-        code, stderr = run([pdfops] + args)
+        # pdfops' own limits sit below the runner's, so a hostile file shows up as a
+        # refusal with a reason, not as a kill.
+        code, stderr = run([pdfops, "--max-memory", "1024", "--timeout", "30"] + args)
         message = stderr.decode("utf-8", "replace").strip()[:200]
         if code is None:
             findings.append((name, "timeout", ""))

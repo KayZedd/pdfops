@@ -22,6 +22,12 @@ pub struct Cli {
     /// Indent the JSON output
     #[arg(long, global = true)]
     pretty: bool,
+    /// Memory a command may hold, in MiB; 0 for no limit
+    #[arg(long, global = true, env = "PDFOPS_MAX_MEMORY", default_value_t = 4096)]
+    max_memory: usize,
+    /// Seconds a command may run; 0 for no limit
+    #[arg(long, global = true, env = "PDFOPS_TIMEOUT", default_value_t = 300)]
+    timeout: u64,
 }
 
 #[derive(Subcommand)]
@@ -82,11 +88,19 @@ enum Command {
         #[arg(long)]
         root: Option<std::path::PathBuf>,
     },
+    /// Run one tool with JSON arguments from stdin; the MCP server runs each call this way
+    #[command(hide = true)]
+    Call {
+        /// Tool name, e.g. pdf_text
+        name: String,
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
     /// Print JSON tool definitions (name, description, input schema) for function calling
     Tools,
 }
 
-fn run(command: Command) -> Result<Option<Value>> {
+fn run(command: Command, limits: (usize, u64)) -> Result<Option<Value>> {
     Ok(Some(match command {
         Command::Info(a) => read::info(a)?,
         Command::Text(a) => {
@@ -122,11 +136,18 @@ fn run(command: Command) -> Result<Option<Value>> {
         Command::Forms(a) => forms::forms(a)?,
         Command::Fill(a) => forms::fill(a)?,
         Command::Mcp { root } => {
-            if let Some(root) = root {
-                crate::sandbox::set_root(&root)?;
+            if let Some(root) = &root {
+                crate::sandbox::set_root(root)?;
             }
-            mcp::serve()?;
+            mcp::serve(root.as_deref(), limits.0, limits.1)?;
             return Ok(None);
+        }
+        Command::Call { name, root } => {
+            if let Some(root) = &root {
+                crate::sandbox::set_root(root)?;
+            }
+            let args = serde_json::from_reader(std::io::stdin().lock())?;
+            tools::call(&name, args)?
         }
         Command::Tools => Value::Array(tools::definitions()),
     }))
@@ -137,7 +158,13 @@ pub fn main() -> ExitCode {
     // Parser panics are reported as JSON errors below, not as backtraces.
     std::panic::set_hook(Box::new(|_| {}));
     let pretty = cli.pretty;
-    let outcome = std::panic::catch_unwind(|| run(cli.command)).unwrap_or_else(|_| {
+    let limits = (cli.max_memory, cli.timeout);
+    // The server itself is long-lived and small; its limits apply to each call it starts.
+    if !matches!(cli.command, Command::Mcp { .. }) {
+        crate::limits::set_max_memory(limits.0);
+        crate::limits::set_timeout(limits.1);
+    }
+    let outcome = std::panic::catch_unwind(|| run(cli.command, limits)).unwrap_or_else(|_| {
         Err(anyhow::anyhow!(
             "internal error: the PDF could not be processed"
         ))

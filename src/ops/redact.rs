@@ -1286,9 +1286,8 @@ pub fn redact(a: RedactArgs) -> Result<Value> {
         catalog.remove(b"MarkInfo");
     }
     prune(&mut d);
-    doc::protect_again(&mut d)?;
+    doc::seal(&mut d)?;
     let mut bytes = Vec::new();
-    d.max_id = d.objects.keys().map(|id| id.0).max().unwrap_or(0);
     d.save_to(&mut bytes)?;
 
     // Proof before delivery: read the result back and look inside every area.

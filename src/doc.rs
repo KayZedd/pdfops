@@ -13,14 +13,14 @@ pub const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Ro
 
 /// Loads a PDF, decrypting it when it is encrypted.
 pub fn load(path: &Path, password: Option<&str>) -> Result<Document> {
+    let bytes = std::sync::Arc::new(
+        std::fs::read(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?,
+    );
     let doc = match password {
-        Some(p) => Document::load_with_password(path, p),
-        None => Document::load(path),
+        Some(p) => Document::load_mem_with_options(&bytes, lopdf::LoadOptions::with_password(p)),
+        None => Document::load_mem(&bytes),
     }
-    .map_err(|e| match e {
-        lopdf::Error::IO(io) => anyhow!("cannot read {}: {io}", path.display()),
-        other => anyhow!("cannot open {}: {other}", path.display()),
-    })?;
+    .map_err(|e| anyhow!("cannot open {}: {e}", path.display()))?;
     if doc.is_encrypted() {
         bail!(
             "{} is encrypted: {}",
@@ -32,7 +32,62 @@ pub fn load(path: &Path, password: Option<&str>) -> Result<Document> {
             }
         );
     }
+    if let Some(reason) = damage(&doc, bytes, password) {
+        bail!(
+            "{} is damaged ({reason}). It can be read but not rewritten safely; repair it first, e.g. with `qpdf in.pdf repaired.pdf`",
+            path.display()
+        );
+    }
     Ok(doc)
+}
+
+/// Why this document must not be written back, if it was not read in full.
+///
+/// The object model used for writing follows the file's cross-reference table to
+/// the letter, while the reader used for everything else repairs broken files.
+/// Where the two disagree, saving would silently drop what the first one missed.
+fn damage(
+    doc: &Document,
+    bytes: std::sync::Arc<Vec<u8>>,
+    password: Option<&str>,
+) -> Option<String> {
+    let pages = doc.get_pages();
+    let seen = Pdf::new_with_password(bytes, password.unwrap_or(""))
+        .map(|pdf| pdf.pages().len())
+        .ok();
+    if pages.is_empty() {
+        return Some("its page tree could not be read".to_string());
+    }
+    if seen.is_some_and(|n| n != pages.len()) {
+        return Some(format!(
+            "{} of its {} pages could be read",
+            pages.len(),
+            seen.unwrap_or(0)
+        ));
+    }
+    for (number, id) in pages {
+        let Ok(page) = doc.get_dictionary(id) else {
+            return Some(format!("page {number} is missing"));
+        };
+        // A page whose content or resources cannot be found would come out blank.
+        for key in [&b"Contents"[..], b"Resources"] {
+            let target = page.get(key).ok();
+            let missing = |o: &Object| o.as_reference().is_ok_and(|r| !doc.has_object(r));
+            let lost = target.is_some_and(|o| match o {
+                Object::Array(items) => items.iter().any(missing),
+                other => missing(other),
+            });
+            if lost {
+                return Some(format!("objects of page {number} are missing"));
+            }
+        }
+    }
+    // Without a length the extent of a stream is a guess, and its data is not read.
+    let unsized_stream = doc
+        .objects
+        .values()
+        .any(|o| o.as_stream().is_ok_and(|s| !s.dict.has(b"Length")));
+    unsized_stream.then(|| "a stream has no length".to_string())
 }
 
 /// Writes `doc` to `path` through a temp file, so `path` may be the input file.
@@ -43,9 +98,7 @@ pub fn save(doc: &mut Document, path: &Path) -> Result<u64> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".tmp{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    protect_again(doc)?;
-    // lopdf derives the trailer /Size from `max_id`, which goes stale when objects are removed.
-    doc.max_id = doc.objects.keys().map(|id| id.0).max().unwrap_or(0);
+    seal(doc)?;
     let written = (|| -> Result<()> {
         let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
         doc.save_to(&mut w)?;
@@ -59,16 +112,85 @@ pub fn save(doc: &mut Document, path: &Path) -> Result<u64> {
     Ok(std::fs::metadata(path)?.len())
 }
 
+/// Makes a document ready to be serialised. Returns whether it is encrypted.
+///
+/// Every path that writes a document goes through here, so that numbering,
+/// the object count and protection are settled in one place.
+pub fn seal(doc: &mut Document) -> Result<bool> {
+    let highest = |doc: &Document| doc.objects.keys().map(|id| id.0).max().unwrap_or(0);
+    // Object numbers far beyond the number of objects are legal, but readers that
+    // guard against corrupt files reject them. Numbering goes first: older ciphers
+    // mix the object number into each object's key.
+    if highest(doc) as usize > doc.objects.len() * 2 + 100 {
+        doc.renumber_objects();
+    }
+    let encrypted = protect_again(doc)?;
+    // lopdf derives the trailer /Size from `max_id`, which goes stale when objects are removed.
+    doc.max_id = highest(doc);
+    Ok(encrypted)
+}
+
+/// Gives the trailer a file identifier if it lacks a usable one.
+pub fn ensure_id(doc: &mut Document) -> Result<()> {
+    let usable = doc
+        .trailer
+        .get(b"ID")
+        .ok()
+        .and_then(|id| id.as_array().ok())
+        .is_some_and(|parts| {
+            parts.len() == 2
+                && parts
+                    .iter()
+                    .all(|p| p.as_str().is_ok_and(|s| !s.is_empty()))
+        });
+    if !usable {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).map_err(|e| anyhow!("no system randomness: {e}"))?;
+        let part = Object::String(bytes.to_vec(), lopdf::StringFormat::Hexadecimal);
+        doc.trailer.set("ID", vec![part.clone(), part]);
+    }
+    Ok(())
+}
+
 /// Encrypts the document again with the passwords and permissions it was opened with.
 ///
 /// Loading decrypts in memory; without this, editing a protected file would
 /// silently hand back an unprotected one. Returns whether it is encrypted now.
-pub fn protect_again(doc: &mut Document) -> Result<bool> {
-    if let Some(state) = doc.encryption_state.clone().filter(|_| !doc.is_encrypted()) {
-        doc.encrypt(&state)
-            .map_err(|e| anyhow!("cannot keep the document's encryption: {e}"))?;
+fn protect_again(doc: &mut Document) -> Result<bool> {
+    let Some(state) = doc.encryption_state.clone().filter(|_| !doc.is_encrypted()) else {
+        return Ok(doc.is_encrypted());
+    };
+    doc.encrypt(&state)
+        .map_err(|e| anyhow!("cannot keep the document's encryption: {e}"))?;
+    // Some files name crypt filters they never define. Re-encrypting those would write
+    // a dictionary no reader can use, around content that is not encrypted at all.
+    let dict = doc
+        .get_encrypted()
+        .map_err(|e| anyhow!("cannot keep the document's encryption: {e}"))?;
+    let version = dict
+        .get(b"V")
+        .ok()
+        .and_then(|v| v.as_i64().ok())
+        .unwrap_or(0);
+    let defined = |key: &[u8]| {
+        let name = dict
+            .get(key)
+            .ok()
+            .and_then(|n| n.as_name().ok())
+            .unwrap_or(b"Identity");
+        name == b"Identity"
+            || dict
+                .get(b"CF")
+                .ok()
+                .and_then(|cf| cf.as_dict().ok())
+                .is_some_and(|cf| cf.has(name))
+    };
+    if version >= 4 && !(defined(b"StmF") && defined(b"StrF")) {
+        bail!(
+            "this document's encryption cannot be reproduced; remove it first with the decrypt command"
+        );
     }
-    Ok(doc.is_encrypted())
+    Ok(true)
 }
 
 /// Writes finished bytes to `path` through a temp file, so `path` may be the input file.

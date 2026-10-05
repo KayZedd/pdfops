@@ -630,6 +630,85 @@ fn forms_lists_and_fills_fields() {
 }
 
 #[test]
+fn damaged_files_are_read_but_not_rewritten() {
+    let dir = tempfile::tempdir().unwrap();
+    // A valid file, except that its content stream does not state its length.
+    let mut body = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for object in [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+        "4 0 obj\n<< >>\nstream\nBT /F1 18 Tf 72 720 Td (Fragile text) Tj ET\nendstream\nendobj\n",
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    ] {
+        offsets.push(body.len());
+        body.push_str(object);
+    }
+    let xref = body.len();
+    body.push_str("xref\n0 6\n0000000000 65535 f \n");
+    for offset in offsets {
+        body.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    body.push_str(&format!(
+        "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+    ));
+    let pdf = dir.path().join("fragile.pdf");
+    std::fs::write(&pdf, body).unwrap();
+
+    // Reading goes through the repairing parser and works.
+    assert!(texts(&pdf)[0].contains("Fragile text"));
+    // Writing would save the page without its content, so it is refused, with the way out named.
+    let out = dir.path().join("out.pdf");
+    for (tool, args) in [
+        (
+            "pdf_rotate",
+            json!({"input": pdf, "output": out, "angle": 90}),
+        ),
+        ("pdf_merge", json!({"inputs": [pdf, pdf], "output": out})),
+        ("pdf_compress", json!({"input": pdf, "output": out})),
+    ] {
+        let e = call_err(tool, args);
+        assert!(
+            e.contains("is damaged") && e.contains("qpdf"),
+            "{tool}: {e}"
+        );
+    }
+    assert!(!out.exists());
+}
+
+#[test]
+fn sparse_object_numbers_are_compacted_on_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 1);
+    let mut doc = lopdf::Document::load(&pdf).unwrap();
+    // Move the page far away in the numbering, as some producers and fuzzers do.
+    let page = doc.get_pages()[&1];
+    let far = (90_000, 0);
+    let dict = doc.objects.remove(&page).unwrap();
+    doc.objects.insert(far, dict);
+    for object in doc.objects.values_mut() {
+        if let Ok(d) = object.as_dict_mut()
+            && let Ok(kids) = d.get_mut(b"Kids").and_then(|k| k.as_array_mut())
+        {
+            kids.iter_mut()
+                .for_each(|k| *k = lopdf::Object::Reference(far));
+        }
+    }
+    doc.max_id = 90_000;
+    doc.save(&pdf).unwrap();
+
+    let out = dir.path().join("out.pdf");
+    call(
+        "pdf_stamp",
+        json!({"input": pdf, "output": out, "text": "X", "position": "footer"}),
+    );
+    let written = lopdf::Document::load(&out).unwrap();
+    assert!(written.objects.keys().map(|id| id.0).max().unwrap() < 100);
+    assert!(texts(&out)[0].contains("alpha-1"));
+}
+
+#[test]
 fn bad_inputs_produce_clear_errors() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.pdf");

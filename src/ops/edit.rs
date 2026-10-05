@@ -284,6 +284,8 @@ pub fn encrypt(a: EncryptArgs) -> Result<Value> {
                 | Permissions::ASSEMBLABLE,
         );
     }
+    // Readers expect an encrypted file to carry an identifier.
+    doc::ensure_id(&mut d)?;
     let mut key = [0u8; 32];
     getrandom::fill(&mut key).map_err(|e| anyhow!("no system randomness: {e}"))?;
     let filter: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
@@ -366,7 +368,7 @@ pub fn compress(a: CompressArgs) -> Result<Value> {
     d.compress();
     let mut buf = Vec::new();
     // Object streams would wrap already encrypted objects, so a protected file keeps the classic layout.
-    if doc::protect_again(&mut d)? {
+    if doc::seal(&mut d)? {
         d.save_to(&mut buf)?;
     } else {
         d.save_modern(&mut buf)?;

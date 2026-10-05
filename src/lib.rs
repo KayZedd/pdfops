@@ -6,6 +6,7 @@
 pub mod cli;
 pub mod doc;
 pub mod font;
+pub mod limits;
 pub mod mcp;
 pub mod ops;
 pub mod pagespec;

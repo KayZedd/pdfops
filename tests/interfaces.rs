@@ -353,3 +353,93 @@ fn mcp_root_confines_every_path() {
             && !root.join("m.pdf").exists()
     );
 }
+
+#[test]
+fn cli_fails_cleanly_at_the_memory_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    // A page that claims to be 20000 points square.
+    let huge = common::custom(dir.path(), "huge.pdf", &["0 0 20000 20000 re f"]);
+    let mut doc = lopdf::Document::load(&huge).unwrap();
+    let page = doc.get_pages()[&1];
+    let media: Vec<lopdf::Object> = vec![0.into(), 0.into(), 20000.into(), 20000.into()];
+    doc.get_dictionary_mut(page).unwrap().set("MediaBox", media);
+    doc.save(&huge).unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_pdfops"))
+            .args(args)
+            .arg(&huge)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let out_dir = dir.path().join("png");
+    let out_dir = out_dir.to_str().unwrap();
+
+    // Under a small memory cap the same request fails cleanly instead of being killed.
+    let (code, stderr, _) = run(&[
+        "--max-memory",
+        "64",
+        "render",
+        "--dpi",
+        "600",
+        "-o",
+        out_dir,
+    ]);
+    assert_eq!(code, Some(1));
+    let v: Value = serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
+    assert!(
+        v["error"].as_str().unwrap().contains("memory limit"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn mcp_server_survives_a_call_that_hits_a_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = common::sample(dir.path(), "a.pdf", 2);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pdfops"))
+        // Too little for the renderer to start, plenty for reading metadata.
+        .args(["--max-memory", "24", "mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        let call = |id: u32, name: &str, args: Value| {
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string()
+        };
+        writeln!(
+            stdin,
+            "{}",
+            call(
+                1,
+                "pdf_render",
+                json!({"input": pdf, "out_dir": dir.path().join("png"), "dpi": 600})
+            )
+        )
+        .unwrap();
+        writeln!(stdin, "{}", call(2, "pdf_info", json!({"input": pdf}))).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    let replies: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["result"]["isError"], true, "{}", replies[0]);
+    assert!(
+        replies[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("memory limit")
+    );
+    // The server is still there and answers the next call.
+    assert_eq!(replies[1]["result"]["isError"], false, "{}", replies[1]);
+    assert_eq!(replies[1]["result"]["structuredContent"]["pages"], 2);
+}

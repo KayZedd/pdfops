@@ -1,0 +1,34 @@
+name: Corpus
+
+# Runs every command over the pdf.js test files, many of them malformed on purpose.
+# A crash, a hang or an invalid output file fails the run.
+on:
+  push:
+    branches: [main]
+    paths: ["src/**", "Cargo.lock", "scripts/corpus.py", ".github/workflows/corpus.yml"]
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  corpus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y qpdf
+      - run: cargo build --release --locked
+      # Pinned, so that a new upstream test file cannot fail an unrelated change.
+      - name: Fetch the corpus
+        run: |
+          git clone --quiet --filter=blob:none --sparse https://github.com/mozilla/pdf.js corpus
+          git -C corpus checkout --quiet 6d7294aff1c90f5d7ebd2e7b57bdacaa2faf7094
+          git -C corpus sparse-checkout set test/pdfs
+      - run: python3 scripts/corpus.py --pdfops target/release/pdfops --jobs 4 --report defects.json corpus/test/pdfs
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: defects
+          path: defects.json
