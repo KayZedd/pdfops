@@ -42,16 +42,21 @@ pdfops ocr-install --engine          # install tesseract itself where that needs
 | `info` | Page count, page size, metadata, encryption, outline and form summary |
 | `text` | Extract text page by page, with a character budget and optional OCR fallback |
 | `search` | Find text or a regex, returns pages and snippets |
+| `layout` | Text with positions: bounding box, font and size of every line or word |
+| `tables` | Tables as rows of cells, Markdown or CSV |
 | `ocr` | Recognise text on scanned pages |
 | `ocr-langs` / `ocr-install` | Check the OCR setup, download language data, install tesseract |
 | `outline` | Bookmarks with target pages |
 | `render` | Pages to PNG, for charts and layout |
 | `images` | Extract the images drawn on pages |
+| `create` | New PDF from Markdown |
 | `merge` | Concatenate PDFs |
 | `pages` | Keep, reorder, duplicate or delete pages |
 | `split` | Split by page count or by ranges |
 | `rotate` | Rotate pages by multiples of 90 degrees |
-| `stamp` | Text watermark, header or footer in any script, with page numbers |
+| `stamp` | Text watermark, header, footer or page numbers; an image such as a signature; a QR code |
+| `redact` | Remove text, images and drawings in given areas or matching given text, then verify |
+| `replace` | Replace text in place, in the document's own font where possible |
 | `set-meta` | Set title, author, subject, keywords, creator |
 | `compress` | Shrink: lossless by default, optionally re-encoding and downscaling images |
 | `encrypt` / `decrypt` | AES-256 passwords and permissions |
@@ -80,12 +85,24 @@ $ pdfops images report.pdf -o images/
 $ pdfops pages in.pdf --keep "3,1,5-" -o out.pdf
 $ pdfops split in.pdf --every 10 -o parts/
 $ pdfops merge a.pdf b.pdf -o merged.pdf
+$ pdfops tables report.pdf --pages 4 --format markdown
+$ pdfops layout report.pdf --pages 4 --level words         # bbox, font and size per word
 $ pdfops stamp in.pdf --text "Poufne · {page}/{pages}" --position footer -o out.pdf
+$ pdfops stamp in.pdf --image signature.png --x 380 --y 690 --width 140 --pages last -o out.pdf
+$ pdfops stamp in.pdf --qr "https://example.com/doc/42" --anchor bottom-right -o out.pdf
+$ pdfops redact in.pdf --text "Jan Kowalski" --text "\d{11}" --regex -o redacted.pdf
+$ pdfops redact in.pdf --rect "2:100,200,300,220" -o redacted.pdf
+$ pdfops replace in.pdf --find "2025" --with "2026" -o out.pdf
+$ pdfops create notes.md -o notes.pdf
 $ pdfops compress in.pdf --max-image-edge 1600 --image-quality 70 -o small.pdf
 $ pdfops forms form.pdf
 $ pdfops fill form.pdf --set name="Ada Lovelace" --set agree=true -o filled.pdf
 $ pdfops encrypt in.pdf --owner-password secret --deny-copy -o locked.pdf
 ```
+
+Positions are in points with the origin at the top-left corner of the page as displayed, y growing
+downwards. `layout` reports them, `stamp --x/--y` and `redact --rect` accept them, and a pixel of
+`render --dpi 72` is exactly one point.
 
 Page specs are 1-based and comma separated: `3`, `2-5`, `7-` (to the end), `-4` (from the start),
 `5-2` (descending), `last`, `odd`, `even`, `all`.
@@ -145,10 +162,26 @@ follow the selection, not the source.
 
 ## Behaviour worth knowing
 
-- **Text outside Latin-1.** `stamp` and `fill` embed a subset of a font that has the glyphs: the one
+- **Text outside Latin-1.** `stamp`, `fill`, `replace` and `create` embed a subset of a font that has the glyphs: the one
   given with `stamp --font`, otherwise one found on the system. Latin-1 text uses the built-in
   Helvetica and embeds nothing. Text is placed glyph by glyph: scripts that need shaping or
   right-to-left layout (Arabic, Hebrew, Indic) will not come out right.
+- **Redaction** deletes what is under the areas from the page content: glyphs, image pixels
+  (including scanned pages), drawings lying wholly inside an area, and annotations with the form
+  values they show. Text around it does not move. The result is read back by a second, independent
+  interpreter, and nothing is written unless every area is empty. When a page is built in a way that
+  cannot be rewritten with certainty (inline images, JPEG 2000 or CMYK JPEG under an area), the
+  command fails instead of guessing. It does not rewrite document metadata, bookmarks or attached
+  files, and it removes the accessibility structure tree, which can repeat page text.
+- **Replace** writes the new text with the codes the document's own font already uses for those
+  characters on that page, so style is kept exactly. If the font (usually a subset) lacks a needed
+  glyph, another font writes just those words, at the same size, position and colour, and the result
+  says so. Lines are not re-flowed: a longer replacement runs into what follows, and `overflow_pt`
+  reports by how much. Text inside form fields and annotations is not edited.
+- **Tables** drawn with ruling lines are read cell by cell and are reliable. Tables without lines
+  are inferred from column alignment (`detected_by: alignment`) and deserve a look before trusting.
+- **Create** understands headings, emphasis, links, nested lists, quotes, code blocks, tables, rules
+  and local images. HTML inside the Markdown is ignored; there is no HTML or CSS engine.
 - **Bookmarks.** `merge`, `pages` and `split` keep the bookmarks whose target page is in the output.
   They land at the top of that page. Named destinations used by links are not carried over.
 - **Forms when merging.** Fields of the second and later inputs are renamed `doc2.<name>`,
@@ -178,8 +211,9 @@ cargo fmt --check
 
 Built on [lopdf](https://github.com/J-F-Liu/lopdf) (object model),
 [pdf-extract](https://github.com/jrmuizel/pdf-extract) (text),
-[hayro](https://github.com/LaurenzV/hayro) (rendering and image decoding) and
-[subsetter](https://github.com/typst/subsetter) (font embedding).
+[hayro](https://github.com/LaurenzV/hayro) (rendering, positions and image decoding),
+[subsetter](https://github.com/typst/subsetter) (font embedding) and
+[pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark) (Markdown).
 
 ## License
 

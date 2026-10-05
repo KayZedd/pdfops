@@ -1,0 +1,1429 @@
+//! Redaction: content under the given areas is removed from the file, not just covered.
+//!
+//! Two interpreters cooperate. hayro, which renders the page, says where every
+//! glyph lands; this module walks the same content stream with lopdf and deletes
+//! the glyphs, vector paths, image pixels and annotations inside the areas. The
+//! result is then scanned again, and nothing is written unless the areas are empty.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use anyhow::{Context as _, Result, anyhow, bail};
+use clap::Args;
+use hayro::hayro_interpret::font::{Glyph, GlyphRun};
+use hayro::hayro_interpret::hayro_cmap::BfString;
+use hayro::hayro_interpret::util::TransformExt;
+use hayro::hayro_interpret::{
+    BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
+    InterpreterCache, InterpreterSettings, SoftMask, interpret_page,
+};
+use hayro::hayro_syntax::Pdf;
+use hayro::hayro_syntax::object::{ObjectIdentifier, Stream as LazyStream};
+use hayro::hayro_syntax::page::Page;
+use hayro::kurbo::{Affine, BezPath, Point, Rect};
+use lopdf::content::{Content, Operation};
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::font::TextFont;
+use crate::ops::edit::{append_content, own_resources, prune, visual_space};
+use crate::ops::layout;
+use crate::{doc, pagespec};
+
+#[derive(Args, Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct RedactArgs {
+    /// Source PDF file
+    pub input: PathBuf,
+    /// Where to write the redacted PDF (may be the input file)
+    #[arg(short, long)]
+    pub output: PathBuf,
+    /// Area to redact as "page:x0,y0,x1,y1" in the coordinates layout reports, e.g. "2:100,200,300,220"
+    #[arg(long = "rect")]
+    #[serde(default)]
+    pub rects: Vec<String>,
+    /// Text to find and redact wherever it occurs, e.g. a name or an ID number
+    #[arg(long = "text")]
+    #[serde(default)]
+    pub texts: Vec<String>,
+    /// Treat the texts as regular expressions
+    #[arg(long)]
+    #[serde(default)]
+    pub regex: bool,
+    /// Match case exactly (default: case-insensitive)
+    #[arg(long)]
+    #[serde(default)]
+    pub case_sensitive: bool,
+    /// Pages searched for the texts, e.g. "1-5" (default: all)
+    #[arg(short, long)]
+    pub pages: Option<String>,
+    /// Password, if the file is encrypted
+    #[arg(long)]
+    pub password: Option<String>,
+}
+
+#[derive(Args, Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceArgs {
+    /// Source PDF file
+    pub input: PathBuf,
+    /// Where to write the result (may be the input file)
+    #[arg(short, long)]
+    pub output: PathBuf,
+    /// Text to find
+    #[arg(long)]
+    pub find: String,
+    /// Text to put in its place; with regex, $1 refers to a capture group
+    #[arg(long = "with")]
+    pub with: String,
+    /// Treat the text to find as a regular expression
+    #[arg(long)]
+    #[serde(default)]
+    pub regex: bool,
+    /// Match case exactly (default: case-insensitive)
+    #[arg(long)]
+    #[serde(default)]
+    pub case_sensitive: bool,
+    /// Pages to change, e.g. "1-5" (default: all)
+    #[arg(short, long)]
+    pub pages: Option<String>,
+    /// Password, if the file is encrypted
+    #[arg(long)]
+    pub password: Option<String>,
+}
+
+type Matrix = [f64; 6];
+type Area = [f64; 4];
+
+const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// `first` followed by `second`, in PDF's row-vector convention.
+fn concat(first: Matrix, second: Matrix) -> Matrix {
+    [
+        first[0] * second[0] + first[1] * second[2],
+        first[0] * second[1] + first[1] * second[3],
+        first[2] * second[0] + first[3] * second[2],
+        first[2] * second[1] + first[3] * second[3],
+        first[4] * second[0] + first[5] * second[2] + second[4],
+        first[4] * second[1] + first[5] * second[3] + second[5],
+    ]
+}
+
+fn apply(m: Matrix, x: f64, y: f64) -> (f64, f64) {
+    (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
+}
+
+fn invert(m: Matrix) -> Option<Matrix> {
+    let det = m[0] * m[3] - m[1] * m[2];
+    (det.abs() > 1e-12).then(|| {
+        [
+            m[3] / det,
+            -m[1] / det,
+            -m[2] / det,
+            m[0] / det,
+            (m[2] * m[5] - m[3] * m[4]) / det,
+            (m[1] * m[4] - m[0] * m[5]) / det,
+        ]
+    })
+}
+
+fn bounds(points: impl IntoIterator<Item = (f64, f64)>) -> Area {
+    points.into_iter().fold(
+        [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ],
+        |b, (x, y)| [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)],
+    )
+}
+
+fn intersects(a: &Area, b: &Area) -> bool {
+    a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]
+}
+
+fn contains(outer: &Area, inner: &Area) -> bool {
+    let slack = 0.5;
+    inner[0] >= outer[0] - slack
+        && inner[1] >= outer[1] - slack
+        && inner[2] <= outer[2] + slack
+        && inner[3] <= outer[3] + slack
+}
+
+fn number(o: &Object) -> Option<f64> {
+    match o {
+        Object::Integer(i) => Some(*i as f64),
+        Object::Real(r) => Some(*r as f64),
+        _ => None,
+    }
+}
+
+fn numbers<const N: usize>(operands: &[Object]) -> Option<[f64; N]> {
+    let v: Vec<f64> = operands.iter().filter_map(number).collect();
+    <[f64; N]>::try_from(v).ok()
+}
+
+/// One glyph as the renderer places it.
+#[derive(Clone)]
+struct Placed {
+    /// Box in layout coordinates (top-left origin).
+    bbox: Area,
+    /// Advance in thousandths of the font size, when the font states one.
+    advance: Option<f32>,
+    origin: Point,
+    /// The direction and length of one em of horizontal advance on the page.
+    em: (f64, f64),
+    /// Which font drew it and what it reads as, to reuse the font for replacement text.
+    font: Option<u128>,
+    text: Option<String>,
+}
+
+impl Placed {
+    /// How far `to` lies ahead of this glyph, in thousandths of the font size.
+    fn units_to(&self, to: Point) -> f64 {
+        let length = self.em.0 * self.em.0 + self.em.1 * self.em.1;
+        let delta = to - self.origin;
+        if length > 0.0 {
+            (delta.x * self.em.0 + delta.y * self.em.1) / length * 1000.0
+        } else {
+            0.0
+        }
+    }
+}
+
+impl Placed {
+    /// The first area covering the glyph: its centre, or a substantial part of its box.
+    fn hit(&self, areas: &[Area]) -> Option<usize> {
+        let (cx, cy) = (
+            (self.bbox[0] + self.bbox[2]) / 2.0,
+            (self.bbox[1] + self.bbox[3]) / 2.0,
+        );
+        let size = (self.bbox[2] - self.bbox[0]) * (self.bbox[3] - self.bbox[1]);
+        areas.iter().position(|a| {
+            let w = (self.bbox[2].min(a[2]) - self.bbox[0].max(a[0])).max(0.0);
+            let h = (self.bbox[3].min(a[3]) - self.bbox[1].max(a[1])).max(0.0);
+            (cx >= a[0] && cx <= a[2] && cy >= a[1] && cy <= a[3])
+                || (size > 0.0 && w * h > 0.3 * size)
+        })
+    }
+}
+
+/// Records the glyphs of every text-showing operator, in content order.
+#[derive(Default)]
+struct Runs(Vec<Vec<Placed>>);
+
+impl<'a> Device<'a> for Runs {
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
+    fn push_clip_path(&mut self, _: &ClipPath) {}
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
+    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+
+    fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, props: DrawProps<'a>, mode: &DrawMode) {
+        let glyphs: Vec<Placed> = run
+            .glyphs()
+            .iter()
+            .map(|glyph| {
+                let to_page: Affine = props.transform * glyph.transform();
+                let (advance, font) = match &**glyph {
+                    Glyph::Outline(o) => (o.advance_width(), Some(o.font_cache_key())),
+                    Glyph::Type3(_) => (None, None),
+                };
+                let text = glyph.as_unicode().map(|u| match u {
+                    BfString::Char(c) => c.to_string(),
+                    BfString::String(s) => s,
+                });
+                let origin = to_page * Point::new(0.0, 0.0);
+                let end = to_page * Point::new(advance.unwrap_or(500.0) as f64, 0.0);
+                let up = (to_page * Point::new(0.0, 1000.0)) - origin;
+                let corners = [
+                    origin - up * 0.2,
+                    origin + up * 0.8,
+                    end - up * 0.2,
+                    end + up * 0.8,
+                ];
+                let em = (to_page * Point::new(1000.0, 0.0)) - origin;
+                Placed {
+                    bbox: bounds(corners.iter().map(|p| (p.x, p.y))),
+                    advance,
+                    origin,
+                    em: (em.x, em.y),
+                    font,
+                    text,
+                }
+            })
+            .collect();
+        // Text that is both filled and stroked arrives twice; it is one operator.
+        let repeat = matches!(mode, DrawMode::Stroke(_))
+            && self.0.last().is_some_and(|last| {
+                last.len() == glyphs.len()
+                    && last
+                        .iter()
+                        .zip(&glyphs)
+                        .all(|(a, b)| (a.origin - b.origin).hypot() < 1e-6)
+            });
+        if !repeat {
+            self.0.push(glyphs);
+        }
+    }
+}
+
+fn glyph_runs(page: &Page<'_>, annotations: bool) -> Vec<Vec<Placed>> {
+    let (w, h) = page.render_dimensions();
+    let cache = InterpreterCache::new();
+    let settings = InterpreterSettings {
+        render_annotations: annotations,
+        ..Default::default()
+    };
+    let mut context = Context::new(
+        page.initial_transform(true).to_kurbo(),
+        Rect::new(0.0, 0.0, w as f64, h as f64),
+        &cache,
+        page.xref(),
+        settings,
+    );
+    let mut runs = Runs::default();
+    interpret_page(page, &mut context, &mut runs);
+    runs.0
+}
+
+#[derive(Default, Clone, Copy)]
+struct Stats {
+    glyphs: usize,
+    paths: usize,
+    images: usize,
+    annotations: usize,
+}
+
+/// The part of the graphics state that q and Q save and restore.
+#[derive(Clone, Copy)]
+struct State {
+    ctm: Matrix,
+    char_spacing: f64,
+    word_spacing: f64,
+    font_size: f64,
+    render_mode: i64,
+    /// The current font, as an index into the names seen in this stream.
+    font: Option<usize>,
+}
+
+struct Rewriter<'a> {
+    pdf: &'a Pdf,
+    runs: &'a [Vec<Placed>],
+    next_run: usize,
+    /// Areas in layout coordinates, for glyphs.
+    areas: &'a [Area],
+    /// The same areas in the page's user space, for paths and images.
+    user_areas: &'a [Area],
+    stats: Stats,
+    /// Text to put in place of each area's glyphs; empty when redacting.
+    replacements: &'a [String],
+    /// What became of each replacement so far.
+    placed: Vec<Outcome>,
+    /// Every character seen on the page, by font: its code and width. This is how
+    /// replacement text is written in the document's own (usually subsetted) font.
+    seen: HashMap<(u128, String), (Vec<u8>, f32)>,
+    /// First pass: only fill `seen`.
+    collect_only: bool,
+}
+
+/// How a replacement was written.
+#[derive(Clone, Copy, PartialEq)]
+enum Outcome {
+    Pending,
+    /// Written in the original font; widths of the new and old text in points.
+    Original {
+        new: f64,
+        old: f64,
+    },
+    /// The font lacks a needed glyph, so another font wrote the replacement.
+    Substitute,
+}
+
+fn stream_bytes(stream: &Stream) -> Result<Vec<u8>> {
+    if stream.dict.has(b"Filter") {
+        stream
+            .decompressed_content()
+            .map_err(|e| anyhow!("cannot decode a content stream: {e}"))
+    } else {
+        Ok(stream.content.clone())
+    }
+}
+
+/// Sets `count` samples of `bits` bits each to zero, starting at sample `from` of a packed row.
+fn zero_bits(row: &mut [u8], from: usize, count: usize, bits: usize) {
+    for bit in from * bits..(from + count) * bits {
+        if let Some(byte) = row.get_mut(bit / 8) {
+            *byte &= !(0x80 >> (bit % 8));
+        }
+    }
+}
+
+impl Rewriter<'_> {
+    /// Blanks the pixels of an image that fall into an area. Returns the replacement image.
+    fn image(&mut self, d: &mut Document, id: ObjectId, ctm: Matrix) -> Result<Option<ObjectId>> {
+        let placed =
+            bounds([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(x, y)| apply(ctm, x, y)));
+        let hits: Vec<&Area> = self
+            .user_areas
+            .iter()
+            .filter(|a| intersects(a, &placed))
+            .collect();
+        if hits.is_empty() {
+            return Ok(None);
+        }
+        let stream = d.get_object(id)?.as_stream()?.clone();
+        let int = |key: &[u8]| {
+            stream
+                .dict
+                .get(key)
+                .ok()
+                .and_then(|o| doc::resolve(d, o).as_i64().ok())
+        };
+        let (width, height) = (
+            int(b"Width").unwrap_or(0) as usize,
+            int(b"Height").unwrap_or(0) as usize,
+        );
+        let mask = stream
+            .dict
+            .get(b"ImageMask")
+            .is_ok_and(|m| doc::resolve(d, m).as_bool().unwrap_or(false));
+        let bits = if mask {
+            1
+        } else {
+            int(b"BitsPerComponent").unwrap_or(8) as usize
+        };
+        let filters: Vec<Vec<u8>> =
+            match stream.dict.get(b"Filter").ok().map(|f| doc::resolve(d, f)) {
+                Some(Object::Name(n)) => vec![n.clone()],
+                Some(Object::Array(a)) => a
+                    .iter()
+                    .filter_map(|o| o.as_name().ok().map(<[u8]>::to_vec))
+                    .collect(),
+                _ => Vec::new(),
+            };
+        let unsupported = |what: &str| anyhow!("cannot redact {what} images; nothing was written");
+        let mut data = if filters.iter().any(|f| f == b"JPXDecode") {
+            return Err(unsupported("JPEG 2000"));
+        } else if filters.iter().any(|f| f == b"DCTDecode" || f == b"DCT") {
+            if filters.len() != 1 {
+                return Err(unsupported("doubly encoded JPEG"));
+            }
+            match image::load_from_memory_with_format(&stream.content, image::ImageFormat::Jpeg) {
+                Ok(image::DynamicImage::ImageLuma8(g)) => g.into_raw(),
+                Ok(image::DynamicImage::ImageRgb8(c)) => c.into_raw(),
+                _ => return Err(unsupported("CMYK JPEG")),
+            }
+        } else {
+            // hayro decodes every lossless filter, including the fax and JBIG2 ones scanners use.
+            let lazy: LazyStream<'_> = self
+                .pdf
+                .xref()
+                .get(ObjectIdentifier::new(id.0 as i32, id.1 as i32))
+                .ok_or_else(|| unsupported("unreadable"))?;
+            lazy.decoded()
+                .map_err(|_| unsupported("undecodable"))?
+                .into_owned()
+        };
+        if width == 0 || height == 0 || bits == 0 || data.len() % height != 0 {
+            return Err(unsupported("malformed"));
+        }
+        let row_bytes = data.len() / height;
+        let components = row_bytes * 8 / (width * bits);
+        if components == 0 {
+            return Err(unsupported("malformed"));
+        }
+        let to_image = invert(ctm).ok_or_else(|| unsupported("degenerate"))?;
+        for area in hits {
+            let corners = [
+                (area[0], area[1]),
+                (area[2], area[1]),
+                (area[0], area[3]),
+                (area[2], area[3]),
+            ];
+            // Image space is the unit square with the first row of samples at the top.
+            let b = bounds(corners.map(|(x, y)| apply(to_image, x, y)));
+            let x0 = ((b[0].clamp(0.0, 1.0) * width as f64).floor() as usize).min(width);
+            let x1 = ((b[2].clamp(0.0, 1.0) * width as f64).ceil() as usize).min(width);
+            let y0 = (((1.0 - b[3].clamp(0.0, 1.0)) * height as f64).floor() as usize).min(height);
+            let y1 = (((1.0 - b[1].clamp(0.0, 1.0)) * height as f64).ceil() as usize).min(height);
+            for row in data.chunks_mut(row_bytes).take(y1).skip(y0) {
+                zero_bits(row, x0, x1.saturating_sub(x0), bits * components);
+            }
+        }
+        let mut dict = stream.dict.clone();
+        dict.remove(b"Filter");
+        dict.remove(b"DecodeParms");
+        let mut replacement = Stream::new(dict, data);
+        let _ = replacement.compress();
+        self.stats.images += 1;
+        Ok(Some(d.add_object(replacement)))
+    }
+
+    /// Rewrites one content stream. Returns the new content and resources if anything changed.
+    fn content(
+        &mut self,
+        d: &mut Document,
+        content: &[u8],
+        resources: &Dictionary,
+        base: Matrix,
+        depth: u32,
+    ) -> Result<Option<(Vec<u8>, Dictionary)>> {
+        if depth > 16 {
+            bail!("forms are nested too deeply to redact safely; nothing was written");
+        }
+        let operations = Content::decode(content)
+            .map_err(|e| anyhow!("cannot parse page content: {e}"))?
+            .operations;
+        let mut out: Vec<Operation> = Vec::with_capacity(operations.len());
+        let mut resources = resources.clone();
+        let mut changed = false;
+
+        let mut state = State {
+            ctm: base,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            font_size: 0.0,
+            render_mode: 0,
+            font: None,
+        };
+        let mut saved: Vec<State> = Vec::new();
+        let mut fonts_seen: Vec<Vec<u8>> = Vec::new();
+        // The path under construction: where it starts in `out`, its extent, and whether it clips.
+        let mut path: Option<(usize, Area, bool)> = None;
+        // Open marked-content sections, as positions in `out` (None when they carry no properties).
+        let mut marked: Vec<Option<usize>> = Vec::new();
+
+        for op in operations {
+            let name = op.operator.as_str();
+            match name {
+                "q" => saved.push(state),
+                "Q" => state = saved.pop().unwrap_or(state),
+                "cm" => {
+                    if let Some(m) = numbers::<6>(&op.operands) {
+                        state.ctm = concat(m, state.ctm);
+                    }
+                }
+                "Tc" => state.char_spacing = op.operands.first().and_then(number).unwrap_or(0.0),
+                "Tw" => state.word_spacing = op.operands.first().and_then(number).unwrap_or(0.0),
+                "Tr" => {
+                    state.render_mode = op
+                        .operands
+                        .first()
+                        .and_then(|o| o.as_i64().ok())
+                        .unwrap_or(0)
+                }
+                "Tf" => {
+                    state.font_size = op.operands.get(1).and_then(number).unwrap_or(0.0);
+                    if let Some(font) = op.operands.first().and_then(|n| n.as_name().ok()) {
+                        fonts_seen.push(font.to_vec());
+                        state.font = Some(fonts_seen.len() - 1);
+                    }
+                }
+                "BMC" => marked.push(None),
+                "BDC" => marked.push(Some(out.len())),
+                "EMC" => {
+                    marked.pop();
+                }
+                "BI" => bail!(
+                    "the page has an inline image, which cannot be redacted safely; nothing was written"
+                ),
+                _ => {}
+            }
+
+            match name {
+                "m" | "l" | "c" | "v" | "y" | "re" | "h" => {
+                    let n: Vec<f64> = op.operands.iter().filter_map(number).collect();
+                    let points: Vec<(f64, f64)> = if name == "re" && n.len() == 4 {
+                        vec![
+                            (n[0], n[1]),
+                            (n[0] + n[2], n[1]),
+                            (n[0], n[1] + n[3]),
+                            (n[0] + n[2], n[1] + n[3]),
+                        ]
+                    } else {
+                        n.as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).collect()
+                    };
+                    let extent = bounds(points.into_iter().map(|(x, y)| apply(state.ctm, x, y)));
+                    let (start, so_far, clips) = path.unwrap_or((out.len(), extent, false));
+                    path = Some((
+                        start,
+                        bounds([
+                            (so_far[0], so_far[1]),
+                            (so_far[2], so_far[3]),
+                            (extent[0], extent[1]),
+                            (extent[2], extent[3]),
+                        ]),
+                        clips,
+                    ));
+                    out.push(op);
+                }
+                "W" | "W*" => {
+                    if let Some(p) = &mut path {
+                        p.2 = true;
+                    }
+                    out.push(op);
+                }
+                "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" | "n" => {
+                    // A drawing that lies wholly inside an area goes, with its coordinates.
+                    // One that only crosses an area stays: it also draws what is outside.
+                    let inside = path.is_some_and(|(_, extent, clips)| {
+                        name != "n"
+                            && !clips
+                            && self.user_areas.iter().any(|a| contains(a, &extent))
+                    }) && self.replacements.is_empty()
+                        && !self.collect_only;
+                    match path.take() {
+                        Some((start, ..)) if inside => {
+                            out.truncate(start);
+                            self.stats.paths += 1;
+                            changed = true;
+                        }
+                        _ => out.push(op),
+                    }
+                }
+                "Tj" | "'" | "\"" | "TJ" => {
+                    let strings: usize = match name {
+                        "TJ" => {
+                            op.operands
+                                .first()
+                                .and_then(|a| a.as_array().ok())
+                                .map_or(0, |a| {
+                                    a.iter()
+                                        .filter_map(|o| o.as_str().ok())
+                                        .map(<[u8]>::len)
+                                        .sum()
+                                })
+                        }
+                        _ => op
+                            .operands
+                            .last()
+                            .and_then(|s| s.as_str().ok())
+                            .map_or(0, <[u8]>::len),
+                    };
+                    if name == "\""
+                        && let Some([word, character]) =
+                            numbers::<2>(&op.operands[..op.operands.len().saturating_sub(1)])
+                    {
+                        state.word_spacing = word;
+                        state.char_spacing = character;
+                    }
+                    // Empty strings and clip-only text draw nothing, so the renderer reports no run.
+                    if strings == 0 || state.render_mode == 7 {
+                        out.push(op);
+                        continue;
+                    }
+                    let run = self.runs.get(self.next_run).ok_or_else(out_of_step)?;
+                    self.next_run += 1;
+                    if self.collect_only {
+                        if !run.is_empty() && strings.is_multiple_of(run.len()) {
+                            let codes = match name {
+                                "TJ" => op
+                                    .operands
+                                    .first()
+                                    .and_then(|a| a.as_array().ok())
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                _ => op.operands.last().cloned().into_iter().collect(),
+                            };
+                            let bytes: Vec<u8> = codes
+                                .iter()
+                                .filter_map(|o| o.as_str().ok())
+                                .flatten()
+                                .copied()
+                                .collect();
+                            for (code, glyph) in bytes.chunks(strings / run.len()).zip(run) {
+                                if let (Some(font), Some(text), Some(advance)) =
+                                    (glyph.font, &glyph.text, glyph.advance)
+                                {
+                                    self.seen
+                                        .entry((font, text.clone()))
+                                        .or_insert_with(|| (code.to_vec(), advance));
+                                }
+                            }
+                        }
+                        out.push(op);
+                        continue;
+                    }
+                    let hits: Vec<Option<usize>> = run.iter().map(|g| g.hit(self.areas)).collect();
+                    let remove: Vec<bool> = hits.iter().map(Option::is_some).collect();
+                    if !remove.contains(&true) {
+                        out.push(op);
+                        continue;
+                    }
+                    if run.is_empty()
+                        || !strings.is_multiple_of(run.len())
+                        || state.font_size == 0.0
+                    {
+                        bail!(
+                            "text in the area uses an encoding that cannot be redacted safely; nothing was written"
+                        );
+                    }
+                    let code_len = strings / run.len();
+
+                    // The operator becomes a TJ in which every removed glyph is replaced by
+                    // the same amount of movement, so the text around it stays where it was.
+                    let elements: Vec<Object> = match name {
+                        "TJ" => op
+                            .operands
+                            .first()
+                            .and_then(|a| a.as_array().ok())
+                            .cloned()
+                            .unwrap_or_default(),
+                        _ => op.operands.last().cloned().into_iter().collect(),
+                    };
+                    // Flattened to single character codes and the movements between them.
+                    let mut pieces: Vec<Result<(Vec<u8>, lopdf::StringFormat), Object>> =
+                        Vec::new();
+                    for element in elements {
+                        match element {
+                            Object::String(bytes, format) => {
+                                pieces.extend(
+                                    bytes
+                                        .chunks(code_len)
+                                        .map(|code| Ok((code.to_vec(), format))),
+                                );
+                            }
+                            other => pieces.push(Err(other)),
+                        }
+                    }
+                    // ' and " start a new line first; that part is kept as separate operators.
+                    if name == "\"" {
+                        out.push(Operation::new(
+                            "Tw",
+                            vec![Object::Real(state.word_spacing as f32)],
+                        ));
+                        out.push(Operation::new(
+                            "Tc",
+                            vec![Object::Real(state.char_spacing as f32)],
+                        ));
+                    }
+                    if name != "Tj" && name != "TJ" {
+                        out.push(Operation::new("T*", vec![]));
+                    }
+                    let mut rebuilt: Vec<Object> = Vec::new();
+                    let mut kept: Option<(Vec<u8>, lopdf::StringFormat)> = None;
+                    let mut index = 0;
+                    for (at, piece) in pieces.iter().enumerate() {
+                        let (code, format) = match piece {
+                            Ok(code) => code,
+                            Err(movement) => {
+                                rebuilt.extend(
+                                    kept.take()
+                                        .map(|(bytes, format)| Object::String(bytes, format)),
+                                );
+                                rebuilt.push(movement.clone());
+                                continue;
+                            }
+                        };
+                        if !remove[index] {
+                            kept.get_or_insert_with(|| (Vec::new(), *format))
+                                .0
+                                .extend_from_slice(code);
+                            index += 1;
+                            continue;
+                        }
+                        rebuilt.extend(
+                            kept.take()
+                                .map(|(bytes, format)| Object::String(bytes, format)),
+                        );
+                        let glyph = &run[index];
+                        let area = hits[index].expect("removed glyphs have an area");
+                        if self.placed.get(area) == Some(&Outcome::Pending) {
+                            // The replacement goes where the first removed glyph was. It is written
+                            // with the codes this font uses for the same characters elsewhere, then
+                            // the pen is moved back, so everything after keeps its position.
+                            let size = (glyph.em.0.hypot(glyph.em.1)).max(0.001);
+                            let written: Option<Vec<&(Vec<u8>, f32)>> =
+                                glyph.font.and_then(|font| {
+                                    self.replacements[area]
+                                        .chars()
+                                        .map(|c| self.seen.get(&(font, c.to_string())))
+                                        .collect()
+                                });
+                            self.placed[area] = match written {
+                                Some(codes) => {
+                                    let units: f64 = codes
+                                        .iter()
+                                        .map(|(code, advance)| {
+                                            let space = if code == &[32] {
+                                                state.word_spacing
+                                            } else {
+                                                0.0
+                                            };
+                                            *advance as f64
+                                                + (state.char_spacing + space) * 1000.0
+                                                    / state.font_size
+                                        })
+                                        .sum();
+                                    if !codes.is_empty() {
+                                        let bytes: Vec<u8> = codes
+                                            .iter()
+                                            .flat_map(|(code, _)| code.clone())
+                                            .collect();
+                                        rebuilt.push(Object::String(bytes, *format));
+                                        rebuilt.push(Object::Real(units as f32));
+                                    }
+                                    Outcome::Original {
+                                        new: units * size / 1000.0,
+                                        old: 0.0,
+                                    }
+                                }
+                                None => {
+                                    // The font cannot write it. Another font takes over for
+                                    // these characters only, in the same text object, so size,
+                                    // colour, position and reading order all carry over.
+                                    let text = &self.replacements[area];
+                                    let original = state.font.and_then(|i| fonts_seen.get(i)).cloned().ok_or_else(|| {
+                                        anyhow!("text is shown without a font being set; nothing was written")
+                                    })?;
+                                    if !text.is_empty() {
+                                        let font = TextFont::new(d, text, None)?;
+                                        let mut fonts = resources
+                                            .get(b"Font")
+                                            .ok()
+                                            .and_then(|f| doc::resolve(d, f).as_dict().ok())
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        let key = (1..)
+                                            .map(|i| format!("PdfopsR{i}"))
+                                            .find(|k| !fonts.has(k.as_bytes()))
+                                            .expect("an unbounded range always yields a free name");
+                                        fonts.set(key.as_str(), font.id);
+                                        resources.set("Font", fonts);
+                                        // Word spacing applies to single-byte spaces only, which an embedded font has none of.
+                                        let spaces = if font.is_embedded() {
+                                            0
+                                        } else {
+                                            text.matches(' ').count()
+                                        };
+                                        let spacing = state.char_spacing
+                                            * text.chars().count() as f64
+                                            + state.word_spacing * spaces as f64;
+                                        let units = font.width(text, 1000.0)
+                                            + spacing * 1000.0 / state.font_size;
+                                        if !rebuilt.is_empty() {
+                                            out.push(Operation::new(
+                                                "TJ",
+                                                vec![Object::Array(std::mem::take(&mut rebuilt))],
+                                            ));
+                                        }
+                                        let size = Object::Real(state.font_size as f32);
+                                        out.push(Operation::new(
+                                            "Tf",
+                                            vec![Object::Name(key.into_bytes()), size.clone()],
+                                        ));
+                                        out.push(Operation::new(
+                                            "TJ",
+                                            vec![Object::Array(vec![
+                                                font.operand(text),
+                                                Object::Real(units as f32),
+                                            ])],
+                                        ));
+                                        out.push(Operation::new(
+                                            "Tf",
+                                            vec![Object::Name(original), size],
+                                        ));
+                                    }
+                                    Outcome::Substitute
+                                }
+                            };
+                        }
+                        // The renderer's own positions say how far the glyph moved the pen:
+                        // the distance to the next glyph, less any explicit movement in between.
+                        let shift = match run.get(index + 1) {
+                            Some(next) => {
+                                let between: f64 = pieces[at + 1..]
+                                    .iter()
+                                    .map_while(|p| p.as_ref().err())
+                                    .filter_map(number)
+                                    .sum();
+                                glyph.units_to(next.origin) + between
+                            }
+                            // Nothing follows in this operator. The stated width is used when there
+                            // is one; otherwise the next operator shows where the pen ended up,
+                            // provided it carries on along the same line.
+                            None => match glyph.advance {
+                                Some(advance) => {
+                                    let space = if code == &[32] {
+                                        state.word_spacing
+                                    } else {
+                                        0.0
+                                    };
+                                    advance as f64
+                                        + (state.char_spacing + space) * 1000.0 / state.font_size
+                                }
+                                None => self
+                                    .runs
+                                    .get(self.next_run)
+                                    .and_then(|run| run.first())
+                                    .map(|next| glyph.units_to(next.origin))
+                                    .filter(|units| (0.0..3000.0).contains(units))
+                                    .unwrap_or(500.0),
+                            },
+                        };
+                        if !shift.is_finite() || shift.abs() > 100_000.0 {
+                            bail!(
+                                "text in the area is laid out in a way that cannot be redacted safely; nothing was written"
+                            );
+                        }
+                        rebuilt.push(Object::Real(-shift as f32));
+                        if let Some(Outcome::Original { old, .. }) = self.placed.get_mut(area) {
+                            *old += shift * glyph.em.0.hypot(glyph.em.1) / 1000.0;
+                        }
+                        self.stats.glyphs += 1;
+                        index += 1;
+                    }
+                    rebuilt.extend(
+                        kept.take()
+                            .map(|(bytes, format)| Object::String(bytes, format)),
+                    );
+                    if !rebuilt.is_empty() {
+                        out.push(Operation::new("TJ", vec![Object::Array(rebuilt)]));
+                    }
+                    // Marked content may repeat the removed text as /ActualText or /Alt.
+                    for section in marked.iter().flatten() {
+                        let tag = out[*section]
+                            .operands
+                            .first()
+                            .cloned()
+                            .into_iter()
+                            .collect();
+                        out[*section] = Operation::new("BMC", tag);
+                    }
+                    changed = true;
+                }
+                "Do" => {
+                    let target = op
+                        .operands
+                        .first()
+                        .and_then(|n| n.as_name().ok())
+                        .and_then(|n| {
+                            let xobjects = doc::resolve(d, resources.get(b"XObject").ok()?)
+                                .as_dict()
+                                .ok()?;
+                            Some((n.to_vec(), xobjects.get(n).ok()?.as_reference().ok()?))
+                        });
+                    if let Some((key, id)) = target {
+                        let stream = d
+                            .get_object(id)
+                            .ok()
+                            .and_then(|o| o.as_stream().ok())
+                            .cloned();
+                        let subtype = stream.as_ref().and_then(|s| {
+                            s.dict
+                                .get(b"Subtype")
+                                .ok()?
+                                .as_name()
+                                .ok()
+                                .map(<[u8]>::to_vec)
+                        });
+                        let replacement = match (subtype.as_deref(), stream) {
+                            (Some(b"Image"), _)
+                                if self.replacements.is_empty() && !self.collect_only =>
+                            {
+                                self.image(d, id, state.ctm)?
+                            }
+                            (Some(b"Form"), Some(form)) => {
+                                let matrix = form
+                                    .dict
+                                    .get(b"Matrix")
+                                    .ok()
+                                    .and_then(|m| doc::resolve(d, m).as_array().ok())
+                                    .and_then(|m| numbers::<6>(m))
+                                    .unwrap_or(IDENTITY);
+                                let inner = form
+                                    .dict
+                                    .get(b"Resources")
+                                    .ok()
+                                    .and_then(|r| doc::resolve(d, r).as_dict().ok())
+                                    .cloned()
+                                    .unwrap_or_else(|| resources.clone());
+                                let body = stream_bytes(&form)?;
+                                // A changed form becomes a copy, so other pages drawing it keep theirs.
+                                match self.content(
+                                    d,
+                                    &body,
+                                    &inner,
+                                    concat(matrix, state.ctm),
+                                    depth + 1,
+                                )? {
+                                    Some((body, inner)) => {
+                                        let mut dict = form.dict.clone();
+                                        dict.remove(b"Filter");
+                                        dict.remove(b"DecodeParms");
+                                        dict.set("Resources", inner);
+                                        let mut copy = Stream::new(dict, body);
+                                        let _ = copy.compress();
+                                        Some(d.add_object(copy))
+                                    }
+                                    None => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(new) = replacement {
+                            let mut xobjects = resources
+                                .get(b"XObject")
+                                .ok()
+                                .and_then(|x| doc::resolve(d, x).as_dict().ok())
+                                .cloned()
+                                .unwrap_or_default();
+                            xobjects.set(key, new);
+                            resources.set("XObject", xobjects);
+                            changed = true;
+                        }
+                    }
+                    out.push(op);
+                }
+                _ => out.push(op),
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        let encoded = Content { operations: out }
+            .encode()
+            .map_err(|e| anyhow!("cannot write page content: {e}"))?;
+        Ok(Some((encoded, resources)))
+    }
+}
+
+fn out_of_step() -> anyhow::Error {
+    anyhow!("the page draws text in a way that cannot be redacted safely; nothing was written")
+}
+
+/// Parses "page:x0,y0,x1,y1".
+fn parse_rect(spec: &str, total: u32) -> Result<(u32, Area)> {
+    let bad =
+        || anyhow!("invalid rect '{spec}'; expected page:x0,y0,x1,y1, e.g. 2:100,200,300,220");
+    let (page, coords) = spec.split_once(':').ok_or_else(bad)?;
+    let page: u32 = page.trim().parse().map_err(|_| bad())?;
+    if page == 0 || page > total {
+        bail!("rect '{spec}': page {page} out of range 1-{total}");
+    }
+    let v: Vec<f64> = coords
+        .split(',')
+        .map(|c| c.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| bad())?;
+    let [x0, y0, x1, y1] = v[..] else {
+        return Err(bad());
+    };
+    let area = [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)];
+    if area[2] - area[0] <= 0.0 || area[3] - area[1] <= 0.0 {
+        bail!("rect '{spec}' is empty");
+    }
+    Ok((page, area))
+}
+
+/// The area and text of every match of `patterns` on the page, line by line.
+///
+/// Areas follow the matched glyphs exactly, so a match inside a longer word
+/// covers only its own characters.
+fn text_areas(page: &layout::PageLayout, patterns: &[regex::Regex]) -> Vec<(Area, String, usize)> {
+    let mut areas = Vec::new();
+    for line in layout::lines(&page.words) {
+        // The line as one string, with each glyph's byte range and box.
+        let mut text = String::new();
+        let mut glyphs: Vec<(usize, usize, Area)> = Vec::new();
+        for word in &line {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            let base = text.len();
+            for (i, (offset, bbox)) in word.parts.iter().enumerate() {
+                let end = word.parts.get(i + 1).map_or(word.text.len(), |next| next.0);
+                glyphs.push((base + offset, base + end, *bbox));
+            }
+            text.push_str(&word.text);
+        }
+        for (which, pattern) in patterns.iter().enumerate() {
+            for found in pattern.find_iter(&text) {
+                let hit = glyphs
+                    .iter()
+                    .filter(|g| g.0 < found.end() && found.start() < g.1);
+                let b = bounds(hit.flat_map(|g| [(g.2[0], g.2[1]), (g.2[2], g.2[3])]));
+                if b[0].is_finite() {
+                    areas.push((b, found.as_str().to_string(), which));
+                }
+            }
+        }
+    }
+    areas
+}
+
+fn compile(texts: &[String], regex: bool, case_sensitive: bool) -> Result<Vec<regex::Regex>> {
+    texts
+        .iter()
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            let pattern = if regex { t.clone() } else { regex::escape(t) };
+            Ok(regex::RegexBuilder::new(&pattern)
+                .case_insensitive(!case_sensitive)
+                .build()?)
+        })
+        .collect()
+}
+
+/// Removes annotations that touch an area, with the form values they show.
+fn drop_annotations(d: &mut Document, page: ObjectId, user_areas: &[Area]) -> Result<usize> {
+    let annots: Vec<Object> = match d.get_dictionary(page)?.get(b"Annots") {
+        Ok(a) => doc::resolve(d, a).as_array().cloned().unwrap_or_default(),
+        Err(_) => return Ok(0),
+    };
+    let mut kept = Vec::with_capacity(annots.len());
+    let mut values = Vec::new();
+    for annot in &annots {
+        let dict = doc::resolve(d, annot).as_dict().ok();
+        let rect = dict
+            .and_then(|a| doc::resolve(d, a.get(b"Rect").ok()?).as_array().ok())
+            .and_then(|r| numbers::<4>(r))
+            .map(|r| {
+                [
+                    r[0].min(r[2]),
+                    r[1].min(r[3]),
+                    r[0].max(r[2]),
+                    r[1].max(r[3]),
+                ]
+            });
+        if rect.is_some_and(|r| user_areas.iter().any(|a| intersects(a, &r))) {
+            // A widget's value lives on the field, which may be the widget or its parent.
+            values.extend(annot.as_reference().ok());
+            values.extend(dict.and_then(|a| a.get(b"Parent").ok()?.as_reference().ok()));
+        } else {
+            kept.push(annot.clone());
+        }
+    }
+    let removed = annots.len() - kept.len();
+    if removed > 0 {
+        d.get_dictionary_mut(page)?.set("Annots", kept);
+        for id in values {
+            if let Ok(field) = d.get_dictionary_mut(id) {
+                // The appearance stream draws the value, and stays reachable through the form.
+                for key in [&b"V"[..], b"DV", b"RV", b"AP"] {
+                    field.remove(key);
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
+pub fn redact(a: RedactArgs) -> Result<Value> {
+    if a.rects.is_empty() && a.texts.is_empty() {
+        bail!("nothing to redact: give rects (page:x0,y0,x1,y1) or texts to find");
+    }
+    let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
+    let total = pdf.pages().len() as u32;
+
+    let mut areas: HashMap<u32, Vec<Area>> = HashMap::new();
+    for spec in &a.rects {
+        let (page, area) = parse_rect(spec, total)?;
+        areas.entry(page).or_default().push(area);
+    }
+    let mut matches = 0;
+    if !a.texts.is_empty() {
+        let patterns = compile(&a.texts, a.regex, a.case_sensitive)?;
+        for n in pagespec::parse_or_all(a.pages.as_deref(), total)? {
+            let found = text_areas(&layout::scan(&pdf.pages()[n as usize - 1]), &patterns);
+            matches += found.len();
+            if !found.is_empty() {
+                areas
+                    .entry(n)
+                    .or_default()
+                    .extend(found.into_iter().map(|(area, ..)| area));
+            }
+        }
+    }
+    if areas.is_empty() {
+        bail!("none of the texts were found; nothing was written");
+    }
+
+    let mut d = doc::load(&a.input, a.password.as_deref())?;
+    let ids = doc::page_ids(&d);
+    let open = d.add_object(Stream::new(Dictionary::new(), b"q\n".to_vec()));
+    let mut pages: Vec<u32> = areas.keys().copied().collect();
+    pages.sort_unstable();
+    let mut report = Vec::new();
+    for &n in &pages {
+        let id = *ids
+            .get(n as usize - 1)
+            .with_context(|| format!("page {n} is missing"))?;
+        let page_areas = &areas[&n];
+        // Layout coordinates have their origin at the top-left; user space is the page's own.
+        let (to_user, _, visual_height) =
+            visual_space(doc::page_box(&d, id), doc::rotation(&d, id));
+        let user_areas: Vec<Area> = page_areas
+            .iter()
+            .map(|r| {
+                bounds(
+                    [(r[0], r[1]), (r[2], r[3])].map(|(x, y)| apply(to_user, x, visual_height - y)),
+                )
+            })
+            .collect();
+
+        let runs = glyph_runs(&pdf.pages()[n as usize - 1], false);
+        let mut rewriter = Rewriter {
+            pdf: &pdf,
+            runs: &runs,
+            next_run: 0,
+            areas: page_areas,
+            user_areas: &user_areas,
+            stats: Stats::default(),
+            replacements: &[],
+            placed: Vec::new(),
+            seen: HashMap::new(),
+            collect_only: false,
+        };
+        let content = d
+            .get_page_content(id)
+            .map_err(|e| anyhow!("cannot read the content of page {n}: {e}"))?;
+        let resources = own_resources(&d, id);
+        let rewritten = rewriter
+            .content(&mut d, &content, &resources, IDENTITY, 0)
+            .with_context(|| format!("page {n}"))?;
+        if rewriter.next_run != runs.len() {
+            return Err(out_of_step()).with_context(|| format!("page {n}"));
+        }
+        let mut stats = rewriter.stats;
+        let resources = match rewritten {
+            Some((body, resources)) => {
+                let mut stream = Stream::new(Dictionary::new(), body);
+                let _ = stream.compress();
+                let stream = d.add_object(stream);
+                d.get_dictionary_mut(id)?.set("Contents", stream);
+                resources
+            }
+            None => resources,
+        };
+        stats.annotations = drop_annotations(&mut d, id, &user_areas)?;
+
+        let boxes: String = user_areas
+            .iter()
+            .map(|r| {
+                format!(
+                    "{:.2} {:.2} {:.2} {:.2} re\n",
+                    r[0],
+                    r[1],
+                    r[2] - r[0],
+                    r[3] - r[1]
+                )
+            })
+            .collect();
+        append_content(
+            &mut d,
+            id,
+            open,
+            format!("q\n0 0 0 rg\n{boxes}f\nQ\n"),
+            resources,
+        )?;
+        report.push(json!({
+            "page": n,
+            "areas": page_areas.len(),
+            "glyphs_removed": stats.glyphs,
+            "paths_removed": stats.paths,
+            "images_blanked": stats.images,
+            "annotations_removed": stats.annotations,
+        }));
+    }
+
+    // The structure tree can repeat page text as alternative descriptions, and nothing
+    // ties those to the areas, so it goes as a whole. Unreferenced objects go too:
+    // they include the original content streams.
+    if let Ok(catalog) = d.catalog_mut() {
+        catalog.remove(b"StructTreeRoot");
+        catalog.remove(b"MarkInfo");
+    }
+    prune(&mut d);
+    let mut bytes = Vec::new();
+    d.max_id = d.objects.keys().map(|id| id.0).max().unwrap_or(0);
+    d.save_to(&mut bytes)?;
+
+    // Proof before delivery: read the result back and look inside every area.
+    let check = Pdf::new(bytes.clone())
+        .map_err(|_| anyhow!("the redacted file does not read back; nothing was written"))?;
+    for &n in &pages {
+        let left = glyph_runs(&check.pages()[n as usize - 1], true)
+            .iter()
+            .flatten()
+            .filter(|g| g.hit(&areas[&n]).is_some())
+            .count();
+        if left > 0 {
+            bail!(
+                "page {n}: {left} glyphs are still inside a redacted area after rewriting; nothing was written"
+            );
+        }
+    }
+    doc::write_atomic(&a.output, &bytes)?;
+    Ok(json!({
+        "output": a.output,
+        "text_matches": matches,
+        "pages": report,
+        "verified": true,
+        "size_bytes": bytes.len(),
+    }))
+}
+
+pub fn replace(a: ReplaceArgs) -> Result<Value> {
+    if a.find.is_empty() {
+        bail!("the text to find is empty");
+    }
+    let patterns = compile(std::slice::from_ref(&a.find), a.regex, a.case_sensitive)?;
+    let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
+    let total = pdf.pages().len() as u32;
+
+    // Per page: where each match is and what replaces it.
+    let mut found: Vec<(u32, Vec<Area>, Vec<String>)> = Vec::new();
+    for n in pagespec::parse_or_all(a.pages.as_deref(), total)? {
+        let matches = text_areas(&layout::scan(&pdf.pages()[n as usize - 1]), &patterns);
+        if matches.is_empty() {
+            continue;
+        }
+        let texts = matches
+            .iter()
+            .map(|(_, matched, _)| {
+                if a.regex {
+                    patterns[0].replace(matched, a.with.as_str()).into_owned()
+                } else {
+                    a.with.clone()
+                }
+            })
+            .collect();
+        found.push((n, matches.into_iter().map(|m| m.0).collect(), texts));
+    }
+    if found.is_empty() {
+        bail!("'{}' was not found; nothing was written", a.find);
+    }
+
+    let mut d = doc::load(&a.input, a.password.as_deref())?;
+    let ids = doc::page_ids(&d);
+    let mut report = Vec::new();
+    let mut total = 0;
+    for (n, areas, texts) in &found {
+        let id = *ids
+            .get(*n as usize - 1)
+            .with_context(|| format!("page {n} is missing"))?;
+        let runs = glyph_runs(&pdf.pages()[*n as usize - 1], false);
+        let content = d
+            .get_page_content(id)
+            .map_err(|e| anyhow!("cannot read the content of page {n}: {e}"))?;
+        let resources = own_resources(&d, id);
+        let mut rewriter = Rewriter {
+            pdf: &pdf,
+            runs: &runs,
+            next_run: 0,
+            areas,
+            user_areas: &[],
+            stats: Stats::default(),
+            replacements: texts,
+            placed: vec![Outcome::Pending; areas.len()],
+            seen: HashMap::new(),
+            collect_only: true,
+        };
+        // First pass: learn which characters the page's fonts can write.
+        rewriter
+            .content(&mut d, &content, &resources, IDENTITY, 0)
+            .with_context(|| format!("page {n}"))?;
+        rewriter.next_run = 0;
+        rewriter.collect_only = false;
+        let rewritten = rewriter
+            .content(&mut d, &content, &resources, IDENTITY, 0)
+            .with_context(|| format!("page {n}"))?;
+        if rewriter.next_run != runs.len() {
+            return Err(out_of_step()).with_context(|| format!("page {n}"));
+        }
+        let resources = match rewritten {
+            Some((body, resources)) => {
+                let mut stream = Stream::new(Dictionary::new(), body);
+                let _ = stream.compress();
+                let stream = d.add_object(stream);
+                d.get_dictionary_mut(id)?.set("Contents", stream);
+                resources
+            }
+            None => resources,
+        };
+
+        let (mut original, mut substituted, mut overflow) = (0, 0, 0.0f64);
+        for outcome in &rewriter.placed {
+            match outcome {
+                Outcome::Original { new, old } => {
+                    original += 1;
+                    overflow = overflow.max(new - old);
+                }
+                Outcome::Substitute => substituted += 1,
+                Outcome::Pending => {}
+            }
+        }
+        d.get_dictionary_mut(id)?.set("Resources", resources);
+        // A match the page content does not draw itself sits in an annotation,
+        // such as a form field's value; those are left alone and counted.
+        total += original + substituted;
+        report.push(json!({
+            "page": n,
+            "replaced": original + substituted,
+            "not_replaced_in_annotations": areas.len() - original - substituted,
+            "in_original_font": original,
+            "in_substitute_font": substituted,
+            "overflow_pt": (overflow.max(0.0) * 10.0).round() / 10.0,
+        }));
+    }
+    if total == 0 {
+        bail!(
+            "'{}' only occurs inside annotations or form fields, which replace does not edit; nothing was written",
+            a.find
+        );
+    }
+    prune(&mut d);
+    let size = doc::save(&mut d, &a.output)?;
+    Ok(json!({
+        "output": a.output,
+        "replacements": total,
+        "pages": report,
+        "size_bytes": size,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matrices_compose_and_invert() {
+        let m = concat(
+            [2.0, 0.0, 0.0, 3.0, 10.0, 20.0],
+            [1.0, 0.0, 0.0, 1.0, 5.0, 5.0],
+        );
+        assert_eq!(apply(m, 1.0, 1.0), (17.0, 28.0));
+        let back = invert(m).unwrap();
+        let (x, y) = apply(back, 17.0, 28.0);
+        assert!((x - 1.0).abs() < 1e-9 && (y - 1.0).abs() < 1e-9);
+        assert!(invert([0.0; 6]).is_none());
+    }
+
+    #[test]
+    fn zero_bits_clears_only_the_requested_samples() {
+        let mut row = [0xffu8; 2];
+        zero_bits(&mut row, 3, 6, 1);
+        assert_eq!(row, [0b1110_0000, 0b0111_1111]);
+        let mut rgb = [1u8; 9];
+        zero_bits(&mut rgb, 1, 1, 24);
+        assert_eq!(rgb, [1, 1, 1, 0, 0, 0, 1, 1, 1]);
+    }
+
+    #[test]
+    fn rect_specs_are_validated() {
+        assert_eq!(
+            parse_rect("2: 10,20,5,40", 3).unwrap(),
+            (2, [5.0, 20.0, 10.0, 40.0])
+        );
+        assert!(parse_rect("4:1,2,3,4", 3).is_err());
+        assert!(parse_rect("1:1,2,3", 3).is_err());
+        assert!(parse_rect("1:1,2,1,4", 3).is_err());
+        assert!(parse_rect("x", 3).is_err());
+    }
+}

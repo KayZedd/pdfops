@@ -314,3 +314,75 @@ pub fn serve(routes: Vec<(&'static str, Vec<u8>)>) -> String {
     });
     base
 }
+
+/// Dark pixel counts inside page rectangles given in PDF points, at 72 dpi.
+pub fn ink<const N: usize>(
+    pdf: &std::path::Path,
+    dir: &std::path::Path,
+    rects: [[usize; 4]; N],
+) -> [usize; N] {
+    let v = call(
+        "pdf_render",
+        json!({"input": pdf, "out_dir": dir, "dpi": 72}),
+    );
+    let bytes = std::fs::read(v["files"][0]["file"].as_str().unwrap()).unwrap();
+    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+        .read_info()
+        .unwrap();
+    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    let (width, height) = (info.width as usize, info.height as usize);
+    let channels = buf.len() / (width * height);
+    rects.map(|[x0, y0, x1, y1]| {
+        (height - y1..height - y0)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(y * width + x) * channels] < 128)
+            .count()
+    })
+}
+
+/// A document whose pages have exactly the given content streams, with Helvetica as /F1.
+pub fn custom(dir: &Path, name: &str, contents: &[&str]) -> PathBuf {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let ids: Vec<Object> = contents
+        .iter()
+        .map(|c| content_page(&mut doc, pages_id, c).into())
+        .collect();
+    skeleton(&mut doc, pages_id, ids, Dictionary::new());
+    let path = dir.join(name);
+    doc.save(&path).unwrap();
+    path
+}
+
+/// The decoded content stream of a page, for checking what is really in the file.
+pub fn content_of(path: &Path, page: u32) -> String {
+    let doc = Document::load(path).unwrap();
+    let id = doc.get_pages()[&page];
+    String::from_utf8_lossy(&doc.get_page_content(id).unwrap()).into_owned()
+}
+
+/// Words of a page with their boxes, as `layout` reports them.
+pub fn words(path: &Path, page: u32) -> Vec<(String, [f64; 4])> {
+    let v = call(
+        "pdf_layout",
+        json!({"input": path, "pages": page.to_string(), "level": "words"}),
+    );
+    v["pages"][0]["words"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| {
+            let b: Vec<f64> = w["bbox"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap())
+                .collect();
+            (
+                w["text"].as_str().unwrap().to_string(),
+                [b[0], b[1], b[2], b[3]],
+            )
+        })
+        .collect()
+}

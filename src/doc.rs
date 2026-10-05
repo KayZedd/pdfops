@@ -58,6 +58,18 @@ pub fn save(doc: &mut Document, path: &Path) -> Result<u64> {
     Ok(std::fs::metadata(path)?.len())
 }
 
+/// Writes finished bytes to `path` through a temp file, so `path` may be the input file.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    std::fs::write(&tmp, bytes)
+        .and_then(|_| std::fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow!("cannot write {}: {e}", path.display())
+        })
+}
+
 /// Page number to object id, 1-based and in document order.
 pub fn page_ids(doc: &Document) -> Vec<ObjectId> {
     doc.get_pages().into_values().collect()

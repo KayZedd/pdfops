@@ -64,9 +64,28 @@ pub fn literal(bytes: &[u8]) -> String {
 /// A font object in a document, able to encode and measure text for it.
 pub struct TextFont {
     pub id: ObjectId,
-    /// Character to (glyph id in the subset, advance in 1/1000 em); `None` for Helvetica.
+    /// Character to (glyph id in the subset, advance in 1/1000 em); `None` for a built-in font.
     glyphs: Option<BTreeMap<char, (u16, f64)>>,
+    /// Which built-in metrics apply when nothing is embedded.
+    builtin: Style,
 }
+
+/// The variant of a typeface.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct Style {
+    pub bold: bool,
+    pub italic: bool,
+    pub mono: bool,
+}
+
+/// Helvetica-Bold advance widths for ASCII 32..=126, in 1/1000 em (Adobe AFM).
+const HELVETICA_BOLD: [u16; 95] = [
+    278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
+    556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611, 975, 722, 722, 722, 722, 667,
+    611, 778, 722, 278, 556, 722, 611, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667,
+    667, 611, 333, 278, 333, 584, 556, 333, 556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556,
+    278, 889, 611, 611, 611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, 389, 280, 389, 584,
+];
 
 impl TextFont {
     /// Adds a font able to draw every character of `chars` to the document.
@@ -79,6 +98,7 @@ impl TextFont {
             return Ok(TextFont {
                 id: doc.add_object(helvetica()),
                 glyphs: None,
+                builtin: Style::default(),
             });
         }
         wanted.sort_unstable();
@@ -117,6 +137,51 @@ impl TextFont {
         }
     }
 
+    /// Adds a font of the given style for `chars`: a built-in one (Helvetica or Courier)
+    /// when the text is Latin-1, otherwise an installed font of that style, embedded.
+    pub fn styled(doc: &mut Document, chars: &str, style: Style) -> Result<TextFont> {
+        let mut wanted: Vec<char> = chars.chars().filter(|c| !c.is_control()).collect();
+        if winansi(&wanted.iter().collect::<String>()).is_some() {
+            let family = if style.mono { "Courier" } else { "Helvetica" };
+            let variant = match (style.bold, style.italic) {
+                (false, false) => "",
+                (true, false) => "-Bold",
+                (false, true) => "-Oblique",
+                (true, true) => "-BoldOblique",
+            };
+            let mut font = helvetica();
+            font.set(
+                "BaseFont",
+                Object::Name(format!("{family}{variant}").into_bytes()),
+            );
+            return Ok(TextFont {
+                id: doc.add_object(font),
+                glyphs: None,
+                builtin: style,
+            });
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        let (data, index) = styled_system_font(&wanted, style)?;
+        embed(doc, &data, index, &wanted)
+    }
+
+    /// The string object showing `text`, for content built as operations.
+    pub fn operand(&self, text: &str) -> Object {
+        match &self.glyphs {
+            None => Object::String(
+                winansi(text).unwrap_or_default(),
+                lopdf::StringFormat::Literal,
+            ),
+            Some(glyphs) => Object::String(
+                text.chars()
+                    .flat_map(|c| glyphs.get(&c).map_or(0, |g| g.0).to_be_bytes())
+                    .collect(),
+                lopdf::StringFormat::Hexadecimal,
+            ),
+        }
+    }
+
     /// Whether this is an embedded font rather than the built-in Helvetica.
     pub fn is_embedded(&self) -> bool {
         self.glyphs.is_some()
@@ -124,7 +189,26 @@ impl TextFont {
 
     pub fn width(&self, text: &str, size: f64) -> f64 {
         match &self.glyphs {
-            None => helvetica_width(&winansi(text).unwrap_or_default(), size),
+            None => {
+                let bytes = winansi(text).unwrap_or_default();
+                if self.builtin.mono {
+                    // Every Courier glyph is 600 units wide.
+                    bytes.len() as f64 * 0.6 * size
+                } else if self.builtin.bold {
+                    let units: u32 = bytes
+                        .iter()
+                        .map(|&b| {
+                            HELVETICA_BOLD
+                                .get((b as usize).wrapping_sub(32))
+                                .copied()
+                                .unwrap_or(556) as u32
+                        })
+                        .sum();
+                    units as f64 * size / 1000.0
+                } else {
+                    helvetica_width(&bytes, size)
+                }
+            }
             Some(glyphs) => {
                 text.chars()
                     .map(|c| glyphs.get(&c).map_or(0.0, |g| g.1))
@@ -169,6 +253,76 @@ const USUAL_FONTS: [&str; 9] = [
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "C:\\Windows\\Fonts\\arial.ttf",
 ];
+
+/// Finds an installed font of the given style covering `wanted`.
+///
+/// Falls back to any covering font: wrong emphasis beats missing letters.
+fn styled_system_font(wanted: &[char], style: Style) -> Result<(Vec<u8>, u32)> {
+    if style == Style::default() {
+        return system_font(wanted);
+    }
+    let covers =
+        |data: &[u8], index: u32| missing(data, index, wanted).is_some_and(|m| m.is_empty());
+    // The usual families name their variants predictably, which avoids indexing all fonts.
+    let variant = match (style.bold, style.italic) {
+        (false, false) => ["", "-Regular"],
+        (true, false) => ["-Bold", "-Bold"],
+        (false, true) => ["-Oblique", "-Italic"],
+        (true, true) => ["-BoldOblique", "-BoldItalic"],
+    };
+    for path in USUAL_FONTS {
+        let path = Path::new(path);
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let family = match (style.mono, stem.trim_end_matches("-Regular")) {
+            (true, "LiberationSans") => "LiberationMono".to_string(),
+            // DejaVuSans has DejaVuSansMono, NotoSans has NotoSansMono.
+            (true, family) => format!("{family}Mono"),
+            (false, family) => family.to_string(),
+        };
+        for suffix in variant {
+            let candidate = path.with_file_name(format!("{family}{suffix}.ttf"));
+            if let Ok(data) = std::fs::read(&candidate)
+                && covers(&data, 0)
+            {
+                return Ok((data, 0));
+            }
+        }
+    }
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    let query = fontdb::Query {
+        families: &[if style.mono {
+            fontdb::Family::Monospace
+        } else {
+            fontdb::Family::SansSerif
+        }],
+        weight: if style.bold {
+            fontdb::Weight::BOLD
+        } else {
+            fontdb::Weight::NORMAL
+        },
+        style: if style.italic {
+            fontdb::Style::Italic
+        } else {
+            fontdb::Style::Normal
+        },
+        ..Default::default()
+    };
+    let found = db
+        .query(&query)
+        .and_then(|id| {
+            db.with_face_data(id, |data, index| {
+                covers(data, index).then(|| (data.to_vec(), index))
+            })
+        })
+        .flatten();
+    match found {
+        Some(hit) => Ok(hit),
+        None => system_font(wanted),
+    }
+}
 
 /// Finds an installed font covering `wanted`, preferring a regular sans-serif.
 fn system_font(wanted: &[char]) -> Result<(Vec<u8>, u32)> {
@@ -354,6 +508,7 @@ fn embed(doc: &mut Document, data: &[u8], index: u32, wanted: &[char]) -> Result
     Ok(TextFont {
         id: doc.add_object(font),
         glyphs: Some(glyphs),
+        builtin: Style::default(),
     })
 }
 

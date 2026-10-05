@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
-use crate::ops::{assemble, edit, forms, ocr, read, render};
+use crate::ops::{assemble, create, edit, forms, layout, ocr, read, redact, render};
 use crate::{mcp, tools};
 
 #[derive(Parser)]
@@ -32,6 +32,10 @@ enum Command {
     Text(read::TextArgs),
     /// Find text or a regular expression and return matching pages with context
     Search(read::SearchArgs),
+    /// Text with positions: bounding box, font and size of every line or word
+    Layout(layout::LayoutArgs),
+    /// Extract tables as rows of cells, Markdown or CSV
+    Tables(layout::TablesArgs),
     /// Recognise text on scanned pages with OCR (needs the tesseract program)
     Ocr(ocr::OcrArgs),
     /// Show whether tesseract is installed and which OCR languages can be used
@@ -44,6 +48,8 @@ enum Command {
     Render(render::RenderArgs),
     /// Extract the images drawn on pages to files (JPEG and JPEG 2000 as stored, the rest as PNG)
     Images(render::ImagesArgs),
+    /// Create a PDF from Markdown: headings, lists, tables, code, links and images
+    Create(create::CreateArgs),
     /// Concatenate several PDFs into one
     Merge(assemble::MergeArgs),
     /// Keep, reorder, duplicate or delete pages
@@ -52,8 +58,12 @@ enum Command {
     Split(assemble::SplitArgs),
     /// Rotate pages by a multiple of 90 degrees
     Rotate(edit::RotateArgs),
-    /// Draw a text watermark, header or footer in any script (supports page numbers)
+    /// Draw text (watermark, header, footer, page numbers), an image such as a signature, or a QR code
     Stamp(edit::StampArgs),
+    /// Permanently remove text, images and drawings in given areas or matching given text, then verify
+    Redact(redact::RedactArgs),
+    /// Replace text in place, written in the document's own font where it has the glyphs
+    Replace(redact::ReplaceArgs),
     /// Set title, author, subject, keywords or creator
     SetMeta(edit::SetMetaArgs),
     /// Shrink a PDF: lossless by default, optionally re-encoding and downscaling images
@@ -85,17 +95,22 @@ fn run(command: Command) -> Result<Option<Value>> {
             value
         }
         Command::Search(a) => read::search(a)?,
+        Command::Layout(a) => layout::layout(a)?,
+        Command::Tables(a) => layout::tables(a)?,
         Command::Ocr(a) => ocr::ocr(a)?,
         Command::OcrLangs(a) => ocr::ocr_langs(a)?,
         Command::OcrInstall(a) => ocr::ocr_install(a)?,
         Command::Outline(a) => read::outline(a)?,
         Command::Render(a) => render::render(a)?,
         Command::Images(a) => render::images(a)?,
+        Command::Create(a) => create::create(a)?,
         Command::Merge(a) => assemble::merge(a)?,
         Command::Pages(a) => assemble::pages(a)?,
         Command::Split(a) => assemble::split(a)?,
         Command::Rotate(a) => edit::rotate(a)?,
         Command::Stamp(a) => edit::stamp(a)?,
+        Command::Redact(a) => redact::redact(a)?,
+        Command::Replace(a) => redact::replace(a)?,
         Command::SetMeta(a) => edit::set_meta(a)?,
         Command::Compress(a) => edit::compress(a)?,
         Command::Encrypt(a) => edit::encrypt(a)?,

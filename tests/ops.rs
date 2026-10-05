@@ -1,7 +1,7 @@
 mod common;
 
 use common::{
-    call, call_err, form, image_stream, ocr_lang, page_count, sample, scan, texts, with_images,
+    call, call_err, form, image_stream, ink, ocr_lang, page_count, sample, scan, texts, with_images,
 };
 use serde_json::json;
 
@@ -363,32 +363,6 @@ fn stamping_twice_keeps_the_first_stamps_resources() {
     alphas.sort_by(f32::total_cmp);
     assert_eq!(alphas, [0.25, 1.0]);
     assert_eq!(res.get(b"Font").unwrap().as_dict().unwrap().len(), 3);
-}
-
-/// Dark pixel counts inside page rectangles given in PDF points, at 72 dpi.
-fn ink<const N: usize>(
-    pdf: &std::path::Path,
-    dir: &std::path::Path,
-    rects: [[usize; 4]; N],
-) -> [usize; N] {
-    let v = call(
-        "pdf_render",
-        json!({"input": pdf, "out_dir": dir, "dpi": 72}),
-    );
-    let bytes = std::fs::read(v["files"][0]["file"].as_str().unwrap()).unwrap();
-    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
-        .read_info()
-        .unwrap();
-    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
-    let info = reader.next_frame(&mut buf).unwrap();
-    let (width, height) = (info.width as usize, info.height as usize);
-    let channels = buf.len() / (width * height);
-    rects.map(|[x0, y0, x1, y1]| {
-        (height - y1..height - y0)
-            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
-            .filter(|&(x, y)| buf[(y * width + x) * channels] < 128)
-            .count()
-    })
 }
 
 #[test]
