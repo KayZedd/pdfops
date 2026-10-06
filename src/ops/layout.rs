@@ -1107,12 +1107,30 @@ fn continues(above: &Cells<'_>, line: &Cells<'_>, tighter: bool) -> bool {
     let filled = |row: &Cells<'_>| row.iter().filter(|c| !c.is_empty()).count();
     let wordy = |cell: &[&Word]| cell.iter().any(|w| w.text.chars().any(char::is_alphabetic));
     if line[0].is_empty() {
+        // A line that fills just the cells the row above fills, beyond the first, is a
+        // row like it whose first cell is left empty: a group named once, or a column
+        // in which something beside the table stands. A cell that wrapped reads on in
+        // small letters, and rarely do all cells of a row wrap at once.
+        let reads_on = line
+            .iter()
+            .flatten()
+            .next()
+            .and_then(|w| w.text.chars().next())
+            .is_some_and(char::is_lowercase);
+        let alike = filled(line) >= 2
+            && (above[0].is_empty() || !reads_on)
+            && line
+                .iter()
+                .zip(above)
+                .skip(1)
+                .all(|(cell, over)| cell.is_empty() == over.is_empty());
         // Text under cells that have text, with nothing in the first column: a cell
         // that wrapped. Figures alone are a row, such as a total set under its column.
-        return line
-            .iter()
-            .zip(above)
-            .all(|(cell, over)| cell.is_empty() || !over.is_empty())
+        return !alike
+            && line
+                .iter()
+                .zip(above)
+                .all(|(cell, over)| cell.is_empty() || !over.is_empty())
             && line.iter().any(|cell| wordy(cell));
     }
     // A label with nothing beside it, then a line that reads on: the label wrapped,
@@ -1127,6 +1145,112 @@ fn continues(above: &Cells<'_>, line: &Cells<'_>, tighter: bool) -> bool {
         .next()
         .is_some_and(char::is_lowercase);
     lowercase || (tighter && indent >= 0.4 * line[0][0].size)
+}
+
+/// The rows of a block whose cells are centred on their rows, as the lines each takes
+/// up; `None` for a block that is not set that way.
+///
+/// A cell of one line beside a cell of two stands half a line lower than the first of
+/// those two. So there are lines closer together than the lines of any one cell are,
+/// filling different columns: parts of one row, which no two rows of a table are.
+/// Such a table has room between its rows, more than between the lines of a cell,
+/// and that room is where a row ends.
+fn bands(block: &[Cells<'_>], columns: &[(f64, f64)]) -> Option<Vec<std::ops::Range<usize>>> {
+    let top = |line: &Cells<'_>| line[0][0].center().1;
+    let filled: Vec<Vec<bool>> = block
+        .iter()
+        .map(|line| {
+            into_columns(line, columns)
+                .iter()
+                .map(|cell| !cell.is_empty())
+                .collect()
+        })
+        .collect();
+    // The pitch of the lines within a cell: the least distance between two lines
+    // that both have something in one column.
+    let size = block[0][0][0].size;
+    let pitch = (0..columns.len())
+        .flat_map(|column| {
+            let tops: Vec<f64> = (0..block.len())
+                .filter(|&i| filled[i][column])
+                .map(|i| top(&block[i]))
+                .collect();
+            tops.windows(2).map(|p| p[1] - p[0]).collect::<Vec<_>>()
+        })
+        .filter(|d| *d > 0.8 * size)
+        .fold(f64::INFINITY, f64::min);
+    if !pitch.is_finite() {
+        return None;
+    }
+    let staggered = (0..block.len() - 1).any(|i| {
+        top(&block[i + 1]) - top(&block[i]) <= 0.75 * pitch
+            && filled[i]
+                .iter()
+                .zip(&filled[i + 1])
+                .all(|(a, b)| !(*a && *b))
+    });
+    if !staggered {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut from = 0;
+    for i in 0..block.len() - 1 {
+        if top(&block[i + 1]) - top(&block[i]) > 1.2 * pitch {
+            out.push(from..i + 1);
+            from = i + 1;
+        }
+    }
+    out.push(from..block.len());
+    // Rows set this way come with room between every two of them. One or two such
+    // stretches are lines standing beside something else, a drawing's labels.
+    (out.len() >= 3).then_some(out)
+}
+
+/// Whether rows are two columns of running text rather than a table: most cells on
+/// both sides are whole lines of prose, which a page set in two columns gives.
+fn prose(rows: &[Cells<'_>]) -> bool {
+    let Some(columns) = rows.first().map(Vec::len).filter(|n| *n == 2) else {
+        return false;
+    };
+    (0..columns).all(|column| {
+        let cells: Vec<&Vec<&Word>> = rows
+            .iter()
+            .map(|row| &row[column])
+            .filter(|cell| !cell.is_empty())
+            .collect();
+        let wordy = cells
+            .iter()
+            .filter(|cell| {
+                cell.iter()
+                    .map(|w| w.text.split(' ').count())
+                    .sum::<usize>()
+                    >= 6
+            })
+            .count();
+        !cells.is_empty() && wordy * 2 > cells.len()
+    })
+}
+
+/// Whether rows are the items of a list: a number, a letter or a bullet in front, and
+/// what it says beside it.
+fn listed(rows: &[Cells<'_>]) -> bool {
+    let marker = |cell: &Vec<&Word>| {
+        let [word] = cell.as_slice() else {
+            return false;
+        };
+        let text = word.text.trim_end_matches(['.', ')', ':']);
+        let short = text.chars().count() <= 3
+            && text.chars().all(char::is_alphanumeric)
+            && text.len() < word.text.len();
+        short
+            || matches!(
+                word.text.as_str(),
+                "\u{2022}" | "-" | "\u{2013}" | "*" | "\u{25aa}"
+            )
+    };
+    rows.iter().all(|row| row.len() == 2)
+        && rows.iter().all(|row| row[0].is_empty() || marker(&row[0]))
+        && rows.iter().any(|row| !row[0].is_empty())
 }
 
 /// Builds the table of a block of lines, or the tables of its parts where a line of
@@ -1165,22 +1289,38 @@ fn block_tables(block: &[Cells<'_>], tables: &mut Vec<Table>) {
     let pitch = pitches.get(pitches.len() / 2).copied().unwrap_or(0.0);
 
     let mut rows: Vec<Cells<'_>> = Vec::new();
-    for (i, line) in block.iter().enumerate() {
-        let row = into_columns(line, &columns);
-        let gap = if i > 0 {
-            top(line) - top(&block[i - 1])
-        } else {
-            0.0
-        };
-        let close = gap <= 1.6 * line[0][0].size;
-        match rows.last_mut() {
-            Some(above) if close && continues(above, &row, gap <= 0.93 * pitch) => {
-                for (cell, more) in above.iter_mut().zip(row) {
+    if let Some(bands) = bands(block, &columns) {
+        // Rows set apart by room, each of as many lines as its fullest cell has.
+        for band in bands {
+            let mut row: Cells<'_> = vec![Vec::new(); columns.len()];
+            for line in &block[band] {
+                for (cell, more) in row.iter_mut().zip(into_columns(line, &columns)) {
                     cell.extend(more);
                 }
             }
-            _ => rows.push(row),
+            rows.push(row);
         }
+    } else {
+        for (i, line) in block.iter().enumerate() {
+            let row = into_columns(line, &columns);
+            let gap = if i > 0 {
+                top(line) - top(&block[i - 1])
+            } else {
+                0.0
+            };
+            let close = gap <= 1.6 * line[0][0].size;
+            match rows.last_mut() {
+                Some(above) if close && continues(above, &row, gap <= 0.93 * pitch) => {
+                    for (cell, more) in above.iter_mut().zip(row) {
+                        cell.extend(more);
+                    }
+                }
+                _ => rows.push(row),
+            }
+        }
+    }
+    if prose(&rows) || listed(&rows) {
+        return;
     }
     // A last line that stands alone under the table was only taken on trial.
     if block.last().is_some_and(|line| line.len() == 1) && rows.len() > 1 {
@@ -1217,6 +1357,31 @@ fn aligned_tables(page: &PageLayout, taken: &[[f64; 4]]) -> Vec<Table> {
     // label that wrapped, a single figure. It is taken along when the table goes on
     // within two lines of it and the lines are not far apart.
     let near = |a: usize, b: usize| top(&lines[b]) - top(&lines[a]) <= 2.5 * lines[b][0][0].size;
+    // Rows may stand further apart than that, where cells of several lines are given
+    // room. A line then belongs to the table by its cells: they begin, end or are
+    // centred where cells of the lines before it are.
+    let within_reach =
+        |a: usize, b: usize| top(&lines[b]) - top(&lines[a]) <= 6.0 * lines[b][0][0].size;
+    let lined_up = |start: usize, end: usize, next: usize| {
+        let marks = |cell: &Vec<&Word>| {
+            let (from, to) = extent(cell);
+            [from, to, (from + to) / 2.0]
+        };
+        let known: Vec<[f64; 3]> = lines[start..end]
+            .iter()
+            .flat_map(|line| line.iter().map(marks))
+            .collect();
+        let matching = lines[next]
+            .iter()
+            .filter(|cell| {
+                let own = marks(cell);
+                known
+                    .iter()
+                    .any(|other| (0..3).any(|k| (own[k] - other[k]).abs() < 2.0))
+            })
+            .count();
+        matching >= 2 && matching * 2 >= lines[next].len()
+    };
 
     let mut tables = Vec::new();
     let mut start = 0;
@@ -1231,7 +1396,11 @@ fn aligned_tables(page: &PageLayout, taken: &[[f64; 4]]) -> Vec<Table> {
                 .take_while(|&k| k == end || lines[k - 1].len() < 2)
                 .find(|&k| lines[k].len() >= 2);
             match ahead {
-                Some(next) if (end..=next).all(|k| k == next && next == end || near(k - 1, k)) => {
+                Some(next)
+                    if (end..=next).all(|k| k == next && next == end || near(k - 1, k))
+                        || (end..=next).all(|k| within_reach(k - 1, k))
+                            && lined_up(start, end, next) =>
+                {
                     end = next + 1;
                 }
                 _ => break,

@@ -270,3 +270,136 @@ fn text_between_two_tables_belongs_to_neither() {
         json!([["Paint, grey", "2"], ["Primer", "1"]])
     );
 }
+
+#[test]
+fn cells_centred_on_rows_of_several_lines_make_one_row_each() {
+    // A comparison as a word processor sets it: room between the rows, and a cell of
+    // one line standing half a line below the first line of the cell of two beside it.
+    let sheet = Sheet::default()
+        .left(72.0, 726.0, "No.")
+        .left(110.0, 726.0, "Requirement")
+        .left(300.0, 726.0, "Offered")
+        .left(420.0, 726.0, "Verdict")
+        .left(72.0, 700.0, "1")
+        .left(110.0, 700.0, "Uncoiler motor")
+        .left(300.0, 700.0, "55 kW")
+        .left(420.0, 700.0, "MEETS")
+        .left(110.0, 674.0, "Motor of the main")
+        .left(420.0, 674.0, "FAILS")
+        .left(72.0, 666.0, "2")
+        .left(300.0, 666.0, "160 kW")
+        .left(110.0, 658.0, "cutting head")
+        .left(420.0, 658.0, "by 40 kW")
+        .left(110.0, 632.0, "Recoilers for the")
+        .left(300.0, 632.0, "11 kW each,")
+        .left(72.0, 624.0, "3")
+        .left(420.0, 624.0, "MEETS")
+        .left(110.0, 616.0, "edge trim")
+        .left(300.0, 616.0, "two of them")
+        .left(72.0, 590.0, "4")
+        .left(110.0, 590.0, "Protective film unit")
+        .left(300.0, 590.0, "Not offered")
+        .left(420.0, 590.0, "FAILS");
+    let found = tables(&[&sheet]);
+    assert_eq!(found.as_array().unwrap().len(), 1, "{found}");
+    assert_eq!(
+        found[0]["cells"],
+        json!([
+            ["No.", "Requirement", "Offered", "Verdict"],
+            ["1", "Uncoiler motor", "55 kW", "MEETS"],
+            [
+                "2",
+                "Motor of the main cutting head",
+                "160 kW",
+                "FAILS by 40 kW"
+            ],
+            [
+                "3",
+                "Recoilers for the edge trim",
+                "11 kW each, two of them",
+                "MEETS"
+            ],
+            ["4", "Protective film unit", "Not offered", "FAILS"]
+        ])
+    );
+}
+
+#[test]
+fn labels_of_a_drawing_beside_a_list_do_not_join_its_rows() {
+    // Names and values, and to their left a dimension written into a sketch, which
+    // makes a first column that the other rows have nothing in.
+    let sheet = Sheet::default()
+        .left(300.0, 700.0, "Developed width")
+        .right(540.0, 700.0, "40")
+        .left(120.0, 683.0, "90")
+        .left(300.0, 683.0, "Sheet width")
+        .right(540.0, 683.0, "1100")
+        .left(300.0, 666.0, "Strips per sheet")
+        .right(540.0, 666.0, "2")
+        .left(300.0, 649.0, "Offcut")
+        .right(540.0, 649.0, "300");
+    let found = tables(&[&sheet]);
+    assert_eq!(found.as_array().unwrap().len(), 1, "{found}");
+    let pairs: Vec<(&str, &str)> = found[0]["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let row = row.as_array().unwrap();
+            (
+                row[row.len() - 2].as_str().unwrap(),
+                row[row.len() - 1].as_str().unwrap(),
+            )
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            ("Developed width", "40"),
+            ("Sheet width", "1100"),
+            ("Strips per sheet", "2"),
+            ("Offcut", "300")
+        ],
+        "{found}"
+    );
+}
+
+#[test]
+fn two_columns_of_running_text_and_lists_are_not_tables() {
+    let mut columns = Sheet::default();
+    let left = [
+        "Before writing any code, decide which two or three",
+        "tasks the tool has to make easier for the people",
+        "who will use it, and write each of them down as a",
+        "request somebody would really type on a busy day",
+        "with nothing else to go by than what is on screen.",
+    ];
+    let right = [
+        "Three kinds of use have turned up again and again",
+        "in the tools that people kept using after a month,",
+        "and each of them asks for a different way of saying",
+        "what the tool does and when it should be reached for",
+        "instead of something simpler that is already there.",
+    ];
+    for (i, (a, b)) in left.iter().zip(right).enumerate() {
+        let y = 700.0 - 14.0 * i as f64;
+        columns = columns.left(72.0, y, a).left(330.0, y, b);
+    }
+    assert_eq!(tables(&[&columns]), json!([]));
+
+    let mut list = Sheet::default();
+    let items = [
+        ("1.", "The warranty covers the coating and its colour."),
+        ("2.", "Fitting has to follow the maker's instructions."),
+        (
+            "3.",
+            "A defect found within the term is put right at no cost.",
+        ),
+    ];
+    for (i, (number, item)) in items.iter().enumerate() {
+        let y = 700.0 - 14.0 * i as f64;
+        list = list.left(72.0, y, number).left(96.0, y, item);
+    }
+    assert_eq!(tables(&[&list]), json!([]));
+}
