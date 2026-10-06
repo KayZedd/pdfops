@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use hayro::hayro_syntax::object::{
-    Dict, MaybeRef, Object as LazyObject, ObjectIdentifier, Stream as LazyStream,
+    Dict, FromBytes, MaybeRef, Object as LazyObject, ObjectIdentifier, Stream as LazyStream,
 };
 use hayro::hayro_syntax::{Filter, LoadPdfError, Pdf};
 use lopdf::{Dictionary, Document, Object, ObjectId};
@@ -28,24 +28,34 @@ pub fn load_noting(path: &Path, password: Option<&str>) -> Result<(Document, boo
     let bytes =
         Arc::new(std::fs::read(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?);
     let strict = parse(&bytes, path, password);
-    // An encrypted file is rebuilt from decrypted objects, and nothing here could
-    // encrypt those again; such a file is taken as it is or not at all.
+    // An encrypted file is rebuilt from decrypted objects. The key it was opened with
+    // goes along, so that saving protects the rebuilt document the way the file was.
     let encrypted = trailer_has_encrypt(&bytes);
-    let reason = match strict {
+    let (reason, state) = match strict {
         Ok(doc) => match damage(&doc, bytes.clone(), password) {
             None => return Ok((doc, false)),
-            Some(reason) => reason,
+            Some(reason) => (reason, doc.encryption_state),
         },
-        Err(e) if encrypted => return Err(e),
-        Err(e) => match rebuild(bytes.clone()) {
-            Ok(doc) => return Ok((note_repaired(path, doc), true)),
-            Err(_) => return Err(e),
-        },
+        Err(e) => {
+            let state = match encrypted.then(|| stated_encryption(&bytes)) {
+                None => None,
+                Some(Err(_)) => return Err(e),
+                Some(Ok(stated)) => {
+                    match lopdf::EncryptionState::decode(&stated, password.unwrap_or("")) {
+                        Ok(state) => Some(state),
+                        Err(_) => return Err(locked(path, password)),
+                    }
+                }
+            };
+            match rebuild(bytes.clone(), password, state) {
+                Ok(doc) => return Ok((note_repaired(path, doc), true)),
+                Err(_) => return Err(e),
+            }
+        }
     };
-    let rebuilt = if encrypted {
-        Err(anyhow!("it is encrypted as well"))
-    } else {
-        rebuild(bytes)
+    let rebuilt = match (encrypted, state) {
+        (true, None) => Err(anyhow!("the key of its encryption could not be worked out")),
+        (_, state) => rebuild(bytes, password, state),
     };
     match rebuilt {
         Ok(doc) => Ok((note_repaired(path, doc), true)),
@@ -89,17 +99,22 @@ fn parse(bytes: &[u8], path: &Path, password: Option<&str>) -> Result<Document> 
     }
     .map_err(|e| anyhow!("cannot open {}: {e}", path.display()))?;
     if doc.is_encrypted() {
-        bail!(
-            "{} is encrypted: {}",
-            path.display(),
-            if password.is_some() {
-                "wrong password"
-            } else {
-                "pass a password"
-            }
-        );
+        return Err(locked(path, password));
     }
     Ok(doc)
+}
+
+/// What is said of an encrypted file that the password given, or none, does not open.
+fn locked(path: &Path, password: Option<&str>) -> anyhow::Error {
+    anyhow!(
+        "{} is encrypted: {}",
+        path.display(),
+        if password.is_some() {
+            "wrong password"
+        } else {
+            "pass a password"
+        }
+    )
 }
 
 /// One object as the repairing reader has it, in the writing model's terms.
@@ -166,13 +181,59 @@ pub(crate) fn direct_dictionary(dict: &Dict<'_>) -> Result<Dictionary> {
     }
 }
 
+/// What a file states about its encryption, found in its bytes alone, for a file the
+/// strict reader cannot open: a document of nothing but that, to work the key out from.
+///
+/// The encryption dictionary is parsed on its own: read through the repairing reader
+/// its strings would be taken for encrypted ones and come back garbled.
+fn stated_encryption(bytes: &[u8]) -> Result<Document> {
+    let last = |pattern: &str| {
+        let pattern = regex::bytes::Regex::new(pattern).expect("the pattern is valid");
+        pattern.find_iter(bytes).last().map(|found| found.end())
+    };
+    let direct = |from: usize| -> Result<Object> {
+        let lazy = LazyObject::from_bytes(&bytes[from..])
+            .ok_or_else(|| anyhow!("the encryption dictionary cannot be read"))?;
+        convert(&lazy, &mut Vec::new(), 0)
+    };
+    // The trailer holds the dictionary itself or, as a rule, names the object that does.
+    let named = regex::bytes::Regex::new(r"(?-u)/Encrypt\s+(\d{1,10})\s+(\d{1,5})\s+R")
+        .expect("the pattern is valid");
+    let dictionary = match named.captures_iter(bytes).last() {
+        Some(found) => {
+            let part = |i: usize| String::from_utf8_lossy(&found[i]).into_owned();
+            let object = format!(r"(?-u)(?:^|[^0-9]){}\s+{}\s+obj\s*", part(1), part(2));
+            direct(last(&object).ok_or_else(|| anyhow!("no encryption dictionary"))?)?
+        }
+        None => {
+            direct(last(r"(?-u)/Encrypt\s*").ok_or_else(|| anyhow!("no encryption dictionary"))?)?
+        }
+    };
+    if dictionary.as_dict().is_err() {
+        bail!("the encryption dictionary cannot be read");
+    }
+    let mut doc = Document::new();
+    let id = doc.add_object(dictionary);
+    doc.trailer.set("Encrypt", id);
+    if let Some(identifier) = last(r"(?-u)/ID\s*").and_then(|at| direct(at).ok()) {
+        doc.trailer.set("ID", identifier);
+    }
+    Ok(doc)
+}
+
 /// Builds a document from what the repairing reader sees of a damaged file.
 ///
 /// Everything the catalog and the pages reach is carried over as it is read; the
 /// page tree is laid out afresh from the pages in the order that reader gives
 /// them. What it cannot read is absent, exactly as it is for `text` and `render`.
-fn rebuild(bytes: Arc<Vec<u8>>) -> Result<Document> {
-    let pdf = Pdf::new(bytes.clone()).map_err(|_| anyhow!("it has no readable structure"))?;
+/// An encrypted file is read decrypted, and `state` is kept for encrypting it again.
+fn rebuild(
+    bytes: Arc<Vec<u8>>,
+    password: Option<&str>,
+    state: Option<lopdf::EncryptionState>,
+) -> Result<Document> {
+    let pdf = Pdf::new_with_password(bytes.clone(), password.unwrap_or(""))
+        .map_err(|_| anyhow!("it has no readable structure"))?;
     let xref = pdf.xref();
     let key = |id: ObjectIdentifier| -> Option<ObjectId> {
         let number = u32::try_from(id.obj_number).ok().filter(|n| *n > 0)?;
@@ -337,6 +398,19 @@ fn rebuild(bytes: Arc<Vec<u8>>) -> Result<Document> {
     if doc.get_pages().len() != pages.len() {
         bail!("its pages cannot be laid out again");
     }
+    if state.is_some() {
+        // Older ciphers derive the key from the file identifier: it has to stay.
+        let identifier = regex::bytes::Regex::new(r"(?-u)/ID\s*")
+            .expect("the pattern is valid")
+            .find_iter(&bytes)
+            .last()
+            .and_then(|found| LazyObject::from_bytes(&bytes[found.end()..]))
+            .and_then(|lazy| convert(&lazy, &mut Vec::new(), 0).ok());
+        if let Some(identifier) = identifier {
+            doc.trailer.set("ID", identifier);
+        }
+        doc.encryption_state = state;
+    }
     Ok(doc)
 }
 
@@ -363,9 +437,8 @@ fn damage(
     password: Option<&str>,
 ) -> Option<String> {
     let pages = doc.get_pages();
-    let seen = Pdf::new_with_password(bytes, password.unwrap_or(""))
-        .map(|pdf| pdf.pages().len())
-        .ok();
+    let pdf = Pdf::new_with_password(bytes, password.unwrap_or("")).ok();
+    let seen = pdf.as_ref().map(|pdf| pdf.pages().len());
     if pages.is_empty() {
         return Some("its page tree could not be read".to_string());
     }
@@ -398,7 +471,21 @@ fn damage(
         .objects
         .values()
         .any(|o| o.as_stream().is_ok_and(|s| !s.dict.has(b"Length")));
-    unsized_stream.then(|| "a stream has no length".to_string())
+    // Decrypting states a length for every stream, also for one that had none and was
+    // read as empty. Such a stream shows in that the other reader finds data in it.
+    let emptied = || {
+        let pdf = pdf.as_ref().filter(|_| doc.encryption_state.is_some());
+        pdf.is_some_and(|pdf| {
+            doc.objects.iter().any(|(id, object)| {
+                object.as_stream().is_ok_and(|s| s.content.is_empty())
+                    && pdf
+                        .xref()
+                        .get::<LazyStream<'_>>(ObjectIdentifier::new(id.0 as i32, id.1 as i32))
+                        .is_some_and(|stream| !stream.raw_data().is_empty())
+            })
+        })
+    };
+    (unsized_stream || emptied()).then(|| "a stream has no length".to_string())
 }
 
 /// Writes `doc` to `path` through a temp file, so `path` may be the input file.

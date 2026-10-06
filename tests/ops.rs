@@ -654,6 +654,77 @@ fn handmade(path: &std::path::Path, objects: &[&str], shift: usize) {
     std::fs::write(path, body).unwrap();
 }
 
+#[test]
+fn damaged_files_that_are_encrypted_are_rebuilt_and_stay_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 2);
+    let locked = dir.path().join("locked.pdf");
+    call(
+        "pdf_encrypt",
+        json!({"input": pdf, "output": locked, "user_password": "open", "owner_password": "own"}),
+    );
+    let sound = std::fs::read(&locked).unwrap();
+    // Two kinds of damage: a stream that no longer states its length, which the strict
+    // reader opens with that page's content read as empty, and a pointer to the cross-reference table
+    // that leads beside it, which it does not open at all.
+    let length = regex::bytes::Regex::new(r"/Length \d+").unwrap();
+    let unsized_stream = length
+        .replace(&sound, |found: &regex::bytes::Captures| {
+            vec![b' '; found[0].len()]
+        })
+        .into_owned();
+    let start = regex::bytes::Regex::new(r"startxref\s+(\d+)").unwrap();
+    let shifted = start
+        .replace(&sound, |found: &regex::bytes::Captures| {
+            let offset: usize = std::str::from_utf8(&found[1]).unwrap().parse().unwrap();
+            format!("startxref\n{}", offset + 7).into_bytes()
+        })
+        .into_owned();
+    assert!(unsized_stream != sound && shifted != sound);
+
+    for (name, bytes) in [("unsized.pdf", unsized_stream), ("shifted.pdf", shifted)] {
+        let damaged = dir.path().join(name);
+        let out = dir.path().join(format!("out-{name}"));
+        std::fs::write(&damaged, bytes).unwrap();
+        let v = call(
+            "pdf_rotate",
+            json!({"input": damaged, "output": out, "angle": 90, "password": "open"}),
+        );
+        assert_eq!(v["repaired_inputs"], json!([damaged]), "{name}: {v}");
+
+        // The output is sound and locked as the input was: closed without a password,
+        // open with either of the two it had.
+        let raw = std::fs::read(&out).unwrap();
+        assert!(!raw.windows(7).any(|w| w == b"alpha-1"), "{name}");
+        assert!(
+            call_err("pdf_info", json!({"input": out})).contains("encrypted"),
+            "{name}"
+        );
+        for password in ["open", "own"] {
+            let v = call("pdf_text", json!({"input": out, "password": password}));
+            assert!(
+                v["pages"][1]["text"].as_str().unwrap().contains("alpha-2"),
+                "{name} with {password}: {v}"
+            );
+        }
+        let again = call(
+            "pdf_rotate",
+            json!({"input": out, "output": out, "angle": 90, "password": "open"}),
+        );
+        assert!(again.get("repaired_inputs").is_none(), "{name}: {again}");
+
+        // The wrong password opens a damaged file no more than a sound one.
+        assert!(
+            call_err(
+                "pdf_rotate",
+                json!({"input": damaged, "output": out, "angle": 90, "password": "nope"})
+            )
+            .contains("encrypted"),
+            "{name}"
+        );
+    }
+}
+
 const CATALOG: &str = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
 const TREE: &str =
     "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>\nendobj\n";
