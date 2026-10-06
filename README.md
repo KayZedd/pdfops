@@ -10,15 +10,32 @@
   <a href="https://crates.io/crates/pdfops"><img src="https://img.shields.io/crates/v/pdfops.svg" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/pdfops-cli"><img src="https://img.shields.io/npm/v/pdfops-cli.svg" alt="npm"></a>
   <a href="https://github.com/KayZedd/pdfops/releases/latest"><img src="https://img.shields.io/github/v/release/KayZedd/pdfops.svg" alt="release"></a>
+  <a href="https://docs.rs/pdfops"><img src="https://img.shields.io/docsrs/pdfops" alt="docs.rs"></a>
+  <a href="https://crates.io/crates/pdfops"><img src="https://img.shields.io/crates/d/pdfops.svg?label=crates.io%20downloads" alt="crates.io downloads"></a>
+  <a href="https://www.npmjs.com/package/pdfops-cli"><img src="https://img.shields.io/npm/dm/pdfops-cli.svg?label=npm%20downloads" alt="npm downloads"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
-```sh
-$ pdfops tables invoice.pdf --format markdown        # tables as tables, not as a blob of text
-$ pdfops redact contract.pdf --text "Jan Kowalski" -o safe.pdf   # removed from the file, then verified
-$ pdfops text scan.pdf --ocr --ocr-lang pol+eng      # OCR only where there is no text layer
-$ pdfops stamp offer.pdf --image signature.png --x 380 --y 690 -o signed.pdf
-```
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#tools">Tools</a> ·
+  <a href="#examples">Examples</a> ·
+  <a href="#how-it-compares">Comparison</a> ·
+  <a href="#benchmarks">Benchmarks</a> ·
+  <a href="#behaviour-worth-knowing">Limits</a>
+</p>
+
+<p align="center">
+  <img src=".github/demo.svg" width="820"
+       alt="pdfops reading a table as Markdown, redacting a name and checking that it is gone">
+</p>
+
+| **65x** | **78x** | **10x** | **7 ms** |
+| :---: | :---: | :---: | :---: |
+| faster than `pdftoppm` at rendering 20 pages | faster than PyMuPDF at reading the tables of 50 pages | faster than `pdftotext` at the text of 308 pages | to open a file and say what is in it |
+
+One document on one machine, start-up included. Every row, the one pdfops loses too, is in the
+[benchmarks](#benchmarks).
 
 ## Why pdfops
 
@@ -44,6 +61,18 @@ $ pdfops stamp offer.pdf --image signature.png --x 380 --y 690 -o signed.pdf
 
 As an MCP server, with nothing installed beforehand:
 
+[![Install in Cursor](https://img.shields.io/badge/Cursor-install-000000)](https://cursor.com/en/install-mcp?name=pdfops&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsInBkZm9wcy1jbGkiLCJtY3AiXX0%3D)
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-install-0098FF)](https://insiders.vscode.dev/redirect?url=vscode%3Amcp%2Finstall%3F%257B%2522name%2522%253A%2522pdfops%2522%252C%2522command%2522%253A%2522npx%2522%252C%2522args%2522%253A%255B%2522-y%2522%252C%2522pdfops-cli%2522%252C%2522mcp%2522%255D%257D)
+
+| Client | How |
+| --- | --- |
+| Claude Code | `claude mcp add pdfops -- npx -y pdfops-cli mcp` |
+| Codex | `codex mcp add pdfops -- npx -y pdfops-cli mcp` |
+| VS Code | `code --add-mcp '{"name":"pdfops","command":"npx","args":["-y","pdfops-cli","mcp"]}'` |
+| Cursor | the JSON below in `~/.cursor/mcp.json` |
+| Claude Desktop | the JSON below in `claude_desktop_config.json` (Settings, Developer, Edit Config) |
+| Windsurf | the JSON below in `~/.codeium/windsurf/mcp_config.json` |
+
 ```json
 {
   "mcpServers": {
@@ -51,8 +80,6 @@ As an MCP server, with nothing installed beforehand:
   }
 }
 ```
-
-For Claude Code: `claude mcp add pdfops -- npx -y pdfops-cli mcp`.
 
 Tools are named `pdf_info`, `pdf_text`, `pdf_redact` and so on, and take the same arguments as the
 CLI. Relative paths resolve against the server's working directory.
@@ -167,7 +194,7 @@ pdfops split in.pdf --every 10 -o parts/
 Editing:
 
 ```sh
-pdfops stamp in.pdf --text "Poufne · {page}/{pages}" --position footer -o out.pdf
+pdfops stamp in.pdf --text "Confidential · {page}/{pages}" --position footer -o out.pdf
 pdfops stamp in.pdf --image signature.png --x 380 --y 690 --width 140 --pages last -o out.pdf
 pdfops stamp in.pdf --qr "https://example.com/doc/42" --anchor bottom-right -o out.pdf
 pdfops redact in.pdf --text "Jan Kowalski" --text "\d{11}" --regex -o redacted.pdf
@@ -261,6 +288,20 @@ did not complete the task. PyMuPDF's entry for `sanitize` is its `scrub`.
 
 | Task | pdfops | command line tool | PyMuPDF | pypdf | pdfplumber |
 | --- | ---: | ---: | ---: | ---: | ---: |
+| `text`, all pages | **53 ms** | `pdftotext` 540 ms | 297 ms | 1273 ms | 11.3 s |
+| `tables`, 50 pages | **20 ms** | - | 1558 ms | - | 1629 ms |
+| `render`, 20 pages at 150 dpi | **41 ms** | `pdftoppm` 2677 ms | 593 ms | - | - |
+| `ocr`, one page | 1087 ms | `tesseract` **759 ms** | - | - | - |
+| `merge`, three copies | **57 ms** | `qpdf` 204 ms | 401 ms | 2037 ms | - |
+| `split`, one file per page | **156 ms** | `pdfseparate` 46.0 s | 437 ms | 2513 ms | - |
+| `redact`, a word on every page | **564 ms** | - | 1926 ms | - | - |
+| `sign`, RSA-2048 | **23 ms** | `pyhanko` 615 ms | - | - | - |
+
+<details>
+<summary>All 31 rows</summary>
+
+| Task | pdfops | command line tool | PyMuPDF | pypdf | pdfplumber |
+| --- | ---: | ---: | ---: | ---: | ---: |
 | `info` | **7 ms** | `pdfinfo` 12 ms | 129 ms | 203 ms | 222 ms |
 | `text`, all pages | **53 ms** | `pdftotext` 540 ms | 297 ms | 1273 ms | 11.3 s |
 | `search`, all pages | **53 ms** | - | 326 ms | - | - |
@@ -292,6 +333,8 @@ did not complete the task. PyMuPDF's entry for `sanitize` is its `scrub`.
 | `signatures`, verify | **16 ms** | `pdfsig` n/a | - | - | - |
 | `forms`, list fields | **7 ms** | - | 121 ms | 169 ms | - |
 | `fill`, one field | **9 ms** | - | 130 ms | 198 ms | - |
+
+</details>
 
 Reproduce with `scripts/bench.py` on any document.
 
@@ -362,6 +405,7 @@ cargo test -- --ignored                   # OCR test, needs tesseract with a lan
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 scripts/bench.py --help                   # regenerate the benchmark table
+scripts/demo.py --help                    # record the session at the top again
 ```
 
 Built on [lopdf](https://github.com/J-F-Liu/lopdf) (object model),
@@ -369,6 +413,13 @@ Built on [lopdf](https://github.com/J-F-Liu/lopdf) (object model),
 [rustybuzz](https://github.com/harfbuzz/rustybuzz) (text shaping),
 [subsetter](https://github.com/typst/subsetter) (font embedding) and
 [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark) (Markdown).
+
+## Contributing
+
+Bug reports are most useful with the file that shows the problem, or the smallest one that still
+does. Pull requests need `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
+`cargo test` to pass, and a test for what they change: a fix comes with a test that fails
+without it.
 
 ## License
 
