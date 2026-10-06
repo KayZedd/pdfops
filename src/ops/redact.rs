@@ -1465,17 +1465,38 @@ impl Rewriter<'_> {
                     let size = Object::Real(pass.state.font_size as f32);
                     let last = pieces.len() - 1;
                     for (n, (k, font, piece)) in pieces.into_iter().enumerate() {
-                        let mut shown = font.elements(piece);
-                        // After the last piece the pen goes back over all of it.
-                        if n == last {
-                            shown.push(Object::Real(units as f32));
-                        }
                         pass.out.push(Operation::new(
                             "Tf",
                             vec![Object::Name(keys[k].clone().into_bytes()), size.clone()],
                         ));
-                        pass.out
-                            .push(Operation::new("TJ", vec![Object::Array(shown)]));
+                        for (stated, shown) in font.elements(piece) {
+                            // What the glyphs would not read back as is said around them.
+                            if let Some(text) = &stated {
+                                let mut utf16 = vec![0xFE, 0xFF];
+                                utf16.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+                                let mut properties = Dictionary::new();
+                                properties.set(
+                                    "ActualText",
+                                    Object::String(utf16, lopdf::StringFormat::Hexadecimal),
+                                );
+                                pass.out.push(Operation::new(
+                                    "BDC",
+                                    vec![Object::Name(b"Span".to_vec()), properties.into()],
+                                ));
+                            }
+                            pass.out
+                                .push(Operation::new("TJ", vec![Object::Array(shown)]));
+                            if stated.is_some() {
+                                pass.out.push(Operation::new("EMC", vec![]));
+                            }
+                        }
+                        // After the last piece the pen goes back over all of it.
+                        if n == last {
+                            pass.out.push(Operation::new(
+                                "TJ",
+                                vec![Object::Array(vec![Object::Real(units as f32)])],
+                            ));
+                        }
                     }
                     pass.out
                         .push(Operation::new("Tf", vec![Object::Name(original), size]));

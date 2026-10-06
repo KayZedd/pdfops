@@ -602,6 +602,22 @@ fn protect_again(doc: &mut Document) -> Result<bool> {
     Ok(true)
 }
 
+/// Decodes a PDF text string: UTF-16 with a byte order mark, otherwise one byte per character.
+pub(crate) fn text_string(bytes: &[u8]) -> String {
+    match bytes {
+        [0xFE, 0xFF, rest @ ..] => {
+            let units: Vec<u16> = rest
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| u16::from_be_bytes(*p))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        _ => bytes.iter().map(|&b| b as char).collect(),
+    }
+}
+
 /// Writes finished bytes to `path` through a temp file, so `path` may be the input file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();

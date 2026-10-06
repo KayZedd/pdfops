@@ -17,7 +17,10 @@ use hayro::hayro_interpret::{
     BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
     InterpreterCache, InterpreterSettings, Paint, SoftMask, interpret_page,
 };
-use hayro::hayro_syntax::page::Page;
+use hayro::hayro_syntax::content::TypedIter;
+use hayro::hayro_syntax::content::ops::TypedInstruction;
+use hayro::hayro_syntax::object::{Array, Dict, Name, Object, Stream, String as PdfString};
+use hayro::hayro_syntax::page::{Page, Resources};
 use hayro::kurbo::{Affine, BezPath, PathSeg, Point, Rect, Shape};
 use rayon::prelude::*;
 use schemars::JsonSchema;
@@ -94,6 +97,9 @@ pub struct Word {
     /// None of its glyphs has an outline, as when a font is neither embedded nor known.
     /// Only established when a page is scanned for what can be seen.
     pub(crate) blank: bool,
+    /// What the glyphs read as by their font, where text stated around some of them
+    /// was taken instead. Only established when a page is scanned for what can be seen.
+    pub(crate) drawn: Option<String>,
     /// Each glyph's byte offset into `text` and its box, for marking part of a word.
     pub(crate) parts: Vec<(usize, [f64; 4])>,
     /// Where the first glyph starts and where the next one would, on the baseline.
@@ -273,6 +279,113 @@ struct Collector {
     veils: Vec<[f64; 4]>,
     /// One entry per open transparency group: whether it lets what is under it show.
     groups: Vec<bool>,
+    /// The marked content the page is expected to open, in order, each with the text
+    /// it states for what it holds; see `marked_content`.
+    marked: Vec<Marked>,
+    /// How many of those have been opened.
+    met: usize,
+    /// Set once the page opened something other than what was expected.
+    astray: bool,
+    /// One entry per open marked content: its stated text, and whether a glyph took it.
+    stated: Vec<Option<(String, bool)>>,
+}
+
+/// A marked content sequence: its tag, and the text it gives for its content.
+type Marked = (Vec<u8>, Option<String>);
+
+/// The marked content a page opens, in the order in which interpreting it meets them,
+/// or nothing when none of it states text.
+///
+/// A producer that cannot say through a font what its glyphs read as, because shaping
+/// reordered, split or stacked them, states the text around them: `/Span <</ActualText
+/// ...>> BDC`. The interpreter reports that a sequence opens and with which tag, not
+/// what it states, so that is read here beforehand, and `Collector` counts along.
+fn marked_content(page: &Page<'_>, annotations: bool) -> Vec<Marked> {
+    let appearances: Vec<Stream<'_>> = match annotations {
+        true => page
+            .raw()
+            .get::<Array<'_>>(b"Annots")
+            .into_iter()
+            .flat_map(|annots| annots.iter::<Dict<'_>>().collect::<Vec<_>>())
+            // The same choice of what to draw as the interpreter makes.
+            .filter(|annot| annot.get::<u32>(b"F").unwrap_or(0) & 2 == 0)
+            .filter_map(
+                |annot| match annot.get::<Dict<'_>>(b"AP")?.get::<Object<'_>>(b"N")? {
+                    Object::Stream(stream) => Some(stream),
+                    Object::Dict(states) => annot
+                        .get::<Name<'_>>(b"AS")
+                        .and_then(|state| states.get::<Stream<'_>>(state))
+                        .or_else(|| states.get::<Stream<'_>>(b"Off")),
+                    _ => None,
+                },
+            )
+            .collect(),
+        false => Vec::new(),
+    };
+    let states = |data: &[u8]| data.windows(11).any(|w| w == b"/ActualText");
+    let any = page.page_stream().is_some_and(states)
+        || appearances
+            .iter()
+            .any(|stream| stream.decoded().is_ok_and(|data| states(&data)));
+    let mut out = Vec::new();
+    if any {
+        walk(page.typed_operations(), page.resources(), 0, &mut out);
+        for stream in &appearances {
+            form(stream, page.resources(), 0, &mut out);
+        }
+    }
+    out
+}
+
+/// Adds the marked content of a form to `out`, if the interpreter would draw it.
+fn form(stream: &Stream<'_>, resources: &Resources<'_>, depth: u32, out: &mut Vec<Marked>) {
+    let dict = stream.dict();
+    if depth > 16 || dict.get::<[f32; 4]>(b"BBox").is_none() {
+        return;
+    }
+    let Ok(data) = stream.decoded() else {
+        return;
+    };
+    let own = dict.get::<Dict<'_>>(b"Resources").map(Resources::new);
+    walk(
+        TypedIter::new(&data),
+        own.as_ref().unwrap_or(resources),
+        depth + 1,
+        out,
+    );
+}
+
+fn walk(mut ops: TypedIter<'_>, resources: &Resources<'_>, depth: u32, out: &mut Vec<Marked>) {
+    while let Some(op) = ops.next() {
+        match op {
+            TypedInstruction::BeginMarkedContentWithProperties(begin) => {
+                // The properties stand in place, or under a name in the resources.
+                let properties = match begin.1.clone() {
+                    Object::Dict(dict) => Some(dict),
+                    Object::Stream(stream) => Some(stream.dict().clone()),
+                    Object::Name(name) => resources.properties.get::<Dict<'_>>(name),
+                    _ => None,
+                };
+                let text = properties
+                    .and_then(|p| p.get::<PdfString<'_>>(b"ActualText"))
+                    .map(|text| doc::text_string(text.as_ref()));
+                out.push((begin.0.to_vec(), text));
+            }
+            TypedInstruction::BeginMarkedContent(begin) => out.push((begin.0.to_vec(), None)),
+            TypedInstruction::XObject(shown) => {
+                let drawn = resources.get_x_object(shown.0).filter(|stream| {
+                    stream
+                        .dict()
+                        .get::<Name<'_>>(b"Subtype")
+                        .is_some_and(|kind| kind.as_ref() == b"Form")
+                });
+                if let Some(stream) = drawn {
+                    form(&stream, resources, depth, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Collector {
@@ -306,6 +419,18 @@ impl Collector {
 impl<'a> Device<'a> for Collector {
     fn push_clip_path(&mut self, _: &ClipPath) {}
     fn pop_clip(&mut self) {}
+
+    fn begin_marked_content(&mut self, tag: &[u8], _: Option<i32>) {
+        let expected = self.marked.get(self.met).filter(|(name, _)| name == tag);
+        self.astray |= expected.is_none() && !self.marked.is_empty();
+        self.stated
+            .push(expected.and_then(|(_, text)| Some((text.clone()?, false))));
+        self.met += 1;
+    }
+
+    fn end_marked_content(&mut self) {
+        self.stated.pop();
+    }
 
     fn push_transparency_group(
         &mut self,
@@ -384,15 +509,59 @@ impl<'a> Device<'a> for Collector {
             let end = to_page * Point::new(advance, 0.0);
             let up = (to_page * Point::new(0.0, 1000.0)) - origin;
             let size = up.hypot();
-            let text = match glyph.as_unicode() {
+            if size < 0.01 {
+                continue;
+            }
+            // The direction of writing is taken from an em rather than from the advance:
+            // a mark advances by nothing, and would be near everything.
+            let em = (to_page * Point::new(1000.0, 0.0)) - origin;
+            let along = em / em.hypot().max(1e-9);
+            // Where the text of what is being drawn is stated, the first glyph stands
+            // for all of it and the others for none: they only add to its extent.
+            let reading = || match glyph.as_unicode() {
                 Some(BfString::Char(c)) => c.to_string(),
                 Some(BfString::String(s)) => s,
                 // Kept as a placeholder, so unmapped glyphs still occupy their place.
                 None => "\u{fffd}".to_string(),
             };
-            if size < 0.01 {
-                continue;
-            }
+            let within = self.stated.iter_mut().rev().find_map(|s| s.as_mut());
+            // What the glyph itself reads as, kept beside stated text to compare them.
+            let drawn = (self.visibility && within.is_some()).then(reading);
+            let text = match within {
+                Some((stated, taken)) if !*taken => {
+                    *taken = true;
+                    stated.clone()
+                }
+                Some(_) => {
+                    if let Some(word) = self.words.last_mut().filter(|_| self.open) {
+                        if let (Some(all), Some(drawn)) = (&mut word.drawn, &drawn) {
+                            all.push_str(drawn);
+                        }
+                        let part = word.parts.last_mut().expect("a word has a glyph");
+                        for (i, value) in [origin.x.min(end.x), origin.y.min(end.y)]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            part.1[i] = part.1[i].min(value);
+                            word.bbox[i] = word.bbox[i].min(value);
+                        }
+                        for (i, value) in [origin.x.max(end.x), origin.y.max(end.y)]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            part.1[i + 2] = part.1[i + 2].max(value);
+                            word.bbox[i + 2] = word.bbox[i + 2].max(value);
+                        }
+                        // The word goes on from the glyph that reaches furthest.
+                        let further = end - word.end;
+                        if along.x * further.x + along.y * further.y > 0.0 {
+                            word.end = end;
+                        }
+                    }
+                    continue;
+                }
+                None => reading(),
+            };
             if text.chars().all(char::is_whitespace) {
                 self.open = false;
                 continue;
@@ -418,7 +587,6 @@ impl<'a> Device<'a> for Collector {
             ];
             // The gap is judged along the baseline; across it there is more room, so that a
             // raised or lowered glyph (an asterisk, an exponent) stays in its word.
-            let along = (end - origin) / (end - origin).hypot().max(1e-9);
             let continues = self.open
                 && self.words.last().is_some_and(|w| {
                     let gap = origin - w.end;
@@ -431,6 +599,11 @@ impl<'a> Device<'a> for Collector {
                 let word = self.words.last_mut().expect("checked above");
                 word.blank &= blank;
                 word.parts.push((word.text.len(), bbox));
+                match (&mut word.drawn, &drawn) {
+                    (Some(all), drawn) => all.push_str(drawn.as_ref().unwrap_or(&text)),
+                    (all @ None, Some(drawn)) => *all = Some(format!("{}{drawn}", word.text)),
+                    (None, None) => {}
+                }
                 word.text.push_str(&text);
                 word.bbox = [
                     word.bbox[0].min(bbox[0]),
@@ -464,6 +637,7 @@ impl<'a> Device<'a> for Collector {
                     italic,
                     invisible,
                     blank,
+                    drawn,
                     parts: vec![(0, bbox)],
                     start: origin,
                     end,
@@ -496,9 +670,30 @@ pub(crate) fn scan_with(page: &Page<'_>, annotations: bool, visibility: bool) ->
     );
     let mut collector = Collector {
         visibility,
+        marked: marked_content(page, annotations),
         ..Default::default()
     };
     interpret_page(page, &mut context, &mut collector);
+    if collector.astray || collector.met != collector.marked.len() && !collector.marked.is_empty() {
+        // The page did not open what was read off it beforehand, so which text was
+        // stated for what is not known: it is read again from its glyphs alone.
+        let cache = InterpreterCache::new();
+        let mut context = Context::new(
+            page.initial_transform(true).to_kurbo(),
+            Rect::new(0.0, 0.0, w as f64, h as f64),
+            &cache,
+            page.xref(),
+            InterpreterSettings {
+                render_annotations: annotations,
+                ..Default::default()
+            },
+        );
+        collector = Collector {
+            visibility,
+            ..Default::default()
+        };
+        interpret_page(page, &mut context, &mut collector);
+    }
     PageLayout {
         width: w as f64,
         height: h as f64,

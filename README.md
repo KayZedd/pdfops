@@ -364,8 +364,8 @@ The short version. `pdfops <command> --help` has the detail for each command.
 - **Any script.** Text that `stamp`, `fill`, `replace`, `create` and `ocr -o` draw is shaped and
   embedded as font subsets; where no one font has every character, several share the text.
   Hebrew and Arabic are laid out from the right and read back in the order they are read in, so
-  a word is found by typing it. Some Indic and Thai clusters that pdfops itself wrote read back
-  with their characters regrouped.
+  a word is found by typing it. Where shaping reorders, splits or stacks glyphs, as in Indic
+  scripts and Thai, the text is stated beside them and reads back as it was written.
 - **Redaction removes, it does not cover.** Glyphs, image pixels in any encoding, drawings and
   annotations under an area are deleted, a text to redact is also struck from metadata and
   bookmarks, and the result is read back by a second interpreter before anything is written.

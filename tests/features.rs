@@ -1042,6 +1042,83 @@ fn dry_run_reports_the_plan_and_writes_nothing() {
 }
 
 #[test]
+fn text_stated_around_glyphs_is_what_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    // A ligature drawn with a glyph that reads as something else, said to be "office";
+    // text stated in UTF-16; and marked content that states nothing, left as it reads.
+    let content = "\
+        BT /F1 12 Tf 72 700 Td \
+        /Span <</ActualText (office)>> BDC (o) Tj (X) Tj (ce) Tj EMC ( hours) Tj ET \
+        BT /F1 12 Tf 72 650 Td /Span <</ActualText <FEFF0063006100660119>>> BDC (cafe) Tj EMC ET \
+        BT /F1 12 Tf 72 600 Td /Artifact BMC (Page one) Tj EMC ET";
+    let pdf = custom(dir.path(), "stated.pdf", &[content]);
+    let text = &texts(&pdf)[0];
+    assert!(
+        text.contains("office hours") && text.contains("caf\u{119}") && text.contains("Page one"),
+        "{text}"
+    );
+    assert!(!text.contains("oXce"), "{text}");
+    // The word is found as stated, and its box takes in every glyph that draws it.
+    let found = call("pdf_search", json!({"input": pdf, "query": "office"}));
+    assert_eq!(found["total_matches"], 1, "{found}");
+    let office = words(&pdf, 1)
+        .into_iter()
+        .find(|w| w.0 == "office")
+        .expect("the stated word");
+    assert!(office.1[2] - office.1[0] > 15.0, "{office:?}");
+    // Removing it takes the statement along, not just the glyphs.
+    let out = dir.path().join("out.pdf");
+    call(
+        "pdf_redact",
+        json!({"input": pdf, "output": out, "texts": ["office"]}),
+    );
+    assert!(!content_of(&out, 1).contains("office"));
+    assert!(texts(&out)[0].contains("hours"));
+}
+
+#[test]
+fn clusters_that_shaping_reorders_splits_or_stacks_read_back_as_written() {
+    let dir = tempfile::tempdir().unwrap();
+    // A vowel sign drawn before its consonant and conjuncts in Devanagari, a vowel that
+    // is drawn in two parts in Thai and one drawn around its consonant in Tamil, and a
+    // letter set under another in Bengali.
+    let lines = [
+        (
+            "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940} \u{915}\u{943}\u{92a}\u{93e} \u{915}\u{94d}\u{937}\u{924}\u{94d}\u{930}\u{93f}\u{92f}",
+            "\u{915}\u{943}\u{92a}\u{93e}",
+        ),
+        (
+            "\u{e19}\u{e49}\u{e33} \u{e17}\u{e35}\u{e48}\u{e19}\u{e35}\u{e48} \u{e01}\u{e47}",
+            "\u{e19}\u{e49}\u{e33}",
+        ),
+        (
+            "\u{ba4}\u{bae}\u{bbf}\u{bb4}\u{bcd} \u{bae}\u{bca}\u{bb4}\u{bbf}",
+            "\u{bae}\u{bca}\u{bb4}\u{bbf}",
+        ),
+        (
+            "\u{9ad}\u{9be}\u{9b7}\u{9be} \u{995}\u{9cd}\u{9b7}\u{9c1}\u{9a6}\u{9cd}\u{9b0}",
+            "\u{995}\u{9cd}\u{9b7}\u{9c1}\u{9a6}\u{9cd}\u{9b0}",
+        ),
+    ];
+    // One document for all of them, since looking for fonts takes its time.
+    let out = dir.path().join("out.pdf");
+    let page = lines.map(|(line, _)| line).join("\n\n");
+    let made = pdfops::tools::call("pdf_create", json!({"markdown": page, "output": out}));
+    if let Err(e) = &made {
+        assert!(e.to_string().contains("no installed font"), "{e:#}");
+        eprintln!("skipped: {e}");
+        return;
+    }
+    let text = &texts(&out)[0];
+    assert!(content_of(&out, 1).contains("ActualText"));
+    for (line, word) in lines {
+        assert!(text.lines().any(|read| read == line), "{line}: {text}");
+        let found = call("pdf_search", json!({"input": out, "query": word}));
+        assert_eq!(found["total_matches"], 1, "{line}: {found}");
+    }
+}
+
+#[test]
 fn right_to_left_text_is_shaped_and_laid_out_from_the_right() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out.pdf");
