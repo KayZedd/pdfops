@@ -2130,3 +2130,81 @@ fn create_understands_the_html_that_markdown_carries() {
         "{tables}"
     );
 }
+
+#[test]
+fn create_follows_the_styling_that_html_carries() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("styled.pdf");
+    let page = "\
+<style>
+  h1 { color: #1a4d8f; text-align: center }
+  .note { background: #fff3cd; font-size: 8pt }
+  td.num { text-align: right }
+  .total td { background: #dddddd }
+</style>
+
+<h1>Quarterly report</h1>
+
+<p class=\"note\">Figures are <u>provisional</u>, <s>unchecked</s>.</p>
+
+<p style=\"text-align: right\">Signed <span style=\"color: red\">today</span></p>
+
+Plain text with <mark>a marked word</mark> in it.
+
+<table>
+<tr><th>Item</th><th>Units</th></tr>
+<tr><td>Bracket</td><td class=\"num\">7</td></tr>
+<tr class=\"total\"><td>Sum</td><td class=\"num\">840</td></tr>
+</table>
+";
+    call("pdf_create", json!({"markdown": page, "output": out}));
+
+    // The words are all there and nothing of the styling is among them.
+    let text = &texts(&out)[0];
+    for said in [
+        "Quarterly report",
+        "Figures are provisional, unchecked.",
+        "Signed today",
+        "Plain text with a marked word in it.",
+    ] {
+        assert!(text.contains(said), "{said}: {text}");
+    }
+    assert!(!text.contains("color") && !text.contains(|c| ('\u{e000}'..='\u{f8ff}').contains(&c)));
+
+    let content = content_of(&out, 1);
+    // Colours: the heading, the red word, the note's and the marked word's backgrounds,
+    // the fill of the last row.
+    for paint in [
+        "0.102 0.302 0.561 rg",
+        "1.000 0.000 0.000 rg",
+        "1.000 0.953 0.804 rg",
+        "1.000 1.000 0.000 rg",
+        "0.867 0.867 0.867 rg",
+    ] {
+        assert!(content.contains(paint), "{paint} in {content}");
+    }
+
+    let placed = words(&out, 1);
+    let word = |text: &str| {
+        placed
+            .iter()
+            .find(|w| w.0 == text)
+            .unwrap_or_else(|| panic!("{text} in {placed:?}"))
+            .1
+    };
+    // A4 with margins of 56 points: text runs from 56 to 539.3.
+    let (left, right) = (56.0, 595.3 - 56.0);
+    // The heading stands in the middle, the signed line against the right margin.
+    let (quarterly, report) = (word("Quarterly"), word("report"));
+    assert!(
+        ((quarterly[0] - left) - (right - report[2])).abs() < 1.0,
+        "{placed:?}"
+    );
+    assert!((word("today")[2] - right).abs() < 1.0, "{placed:?}");
+    // The note is set in the size asked for, and plain text in the usual one.
+    assert!((word("Figures")[3] - word("Figures")[1] - 8.0).abs() < 0.2);
+    assert!((word("Plain")[3] - word("Plain")[1] - 11.0).abs() < 0.2);
+    // Figures stand against the right edge of their column, one under the other.
+    assert!((word("7")[2] - word("840")[2]).abs() < 0.5, "{placed:?}");
+    assert!(word("7")[0] > word("840")[0] + 5.0, "{placed:?}");
+}

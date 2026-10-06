@@ -377,10 +377,12 @@ The short version. `pdfops <command> --help` has the detail for each command.
 - **Dry run.** `redact`, `replace`, `annotate` and `stamp` take `--dry-run`: all the work,
   nothing written.
 - **Scan** reports scripts, actions, attachments, disguised content and hidden text by severity.
-  It is not a virus scanner and never calls a file safe. **Sanitize** removes the active content
-  and scans the result before writing it.
-- **Tables** with ruling lines are read cell by cell. Tables without are inferred from alignment
-  (`detected_by: alignment`) and deserve a look.
+  With `--clamav` the file also goes through ClamAV's signatures, where that is installed. It
+  never calls a file safe. **Sanitize** removes the active content and scans the result before
+  writing it.
+- **Tables** with ruling lines are read cell by cell. Tables without are inferred from how
+  their text lines up (`detected_by: alignment`), rows of several lines included; lists and
+  pages set in columns are left alone. An inference deserves a look.
 - **OCR** is tesseract's. `ocr -o` writes the recognised text into a copy as an invisible layer.
 - **Signatures.** `sign` appends, so earlier signatures stay valid. It can show the signature on
   a page (`--visible`) and embed a timestamp authority's statement of the time (`--tsa`).
@@ -394,8 +396,10 @@ The short version. `pdfops <command> --help` has the detail for each command.
   `decrypt` removes the protection.
 - **Limits.** 4 GiB and 300 seconds per command by default: `--max-memory`, `--timeout`, or
   `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`; 0 lifts a limit. Rasters are capped at 64 megapixels.
-- **Create** takes Markdown, and the HTML in it for what it says: headings, emphasis, links,
-  lists, tables. How it should look is not read: there is no CSS.
+- **Create** takes Markdown and the HTML in it: headings, emphasis, links, lists, tables. Of
+  its styling it follows colour, background, bold, italic, underline, strike-through, size and
+  alignment, from `style` attributes and `<style>` rules that go by tag, class and id. Layout
+  is not read: no boxes, floats or grids.
 
 ## Development
 

@@ -85,7 +85,7 @@ enum Command {
     Images(render::ImagesArgs),
     /// Create a PDF from Markdown: headings, lists, tables, code, links and images
     ///
-    /// Understood: headings, emphasis, links, nested lists, quotes, code blocks, tables, rules and local images. HTML inside the Markdown is read too, for what it says rather than how it looks: headings, paragraphs, emphasis, links, images, lists, quotes, preformatted text and tables become what the same Markdown would. Scripts and style sheets are left out, styling is not applied (there is no CSS), and a tag that means nothing here is dropped with its text kept; the result counts those.
+    /// Understood: headings, emphasis, links, nested lists, quotes, code blocks, tables, rules and local images. HTML inside the Markdown is read too: headings, paragraphs, emphasis, links, images, lists, quotes, preformatted text and tables become what the same Markdown would. Of its styling, colour, background, bold, italic, underline, strike-through, font size and alignment are followed, from style attributes and from style sheets whose rules go by tag, class and id; layout (boxes, floats, grids) is not. Scripts are left out, and a tag that means nothing here is dropped with its text kept; the result counts those.
     ///
     /// Text outside Latin-1 is drawn with subsets of installed fonts and shaped: Arabic is joined, Indic and Thai clusters are formed, Latin gets its ligatures and kerning. Where no one font has every character, several share the text. A line is laid out as a whole, so punctuation next to right-to-left words lands where the sentence goes on, and a paragraph that runs from the right is set against the right margin.
     Create(create::CreateArgs),
