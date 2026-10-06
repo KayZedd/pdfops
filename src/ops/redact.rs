@@ -327,6 +327,8 @@ struct State {
     render_mode: i64,
     /// How far text is raised above its baseline, in text space.
     rise: f64,
+    /// The width glyphs are drawn at, in hundredths of their own.
+    scaling: f64,
     /// The current font, as an index into the names seen in this stream.
     font: Option<usize>,
 }
@@ -402,6 +404,13 @@ struct Reflow {
     /// column. The same for every change on one line; a factor of one changes nothing.
     anchor: Point,
     factor: f64,
+    /// Whether the glyphs beyond that point are drawn narrower by `factor` as well,
+    /// rather than only closer together: more than a little cannot be had from the
+    /// room between letters.
+    narrow: bool,
+    /// The stretch of the line that the change bears on: between the rules of a
+    /// table that enclose it, a cell and no more.
+    span: (f64, f64),
 }
 
 /// A stretch of a line of text that is drawn elsewhere: what stands on `baseline`
@@ -875,6 +884,7 @@ impl Rewriter<'_> {
                 font_size: 0.0,
                 render_mode: 0,
                 rise: 0.0,
+                scaling: 100.0,
                 font: None,
             },
             saved: Vec::new(),
@@ -901,6 +911,7 @@ impl Rewriter<'_> {
                     pass.state.word_spacing = op.operands.first().and_then(number).unwrap_or(0.0)
                 }
                 "Ts" => pass.state.rise = op.operands.first().and_then(number).unwrap_or(0.0),
+                "Tz" => pass.state.scaling = op.operands.first().and_then(number).unwrap_or(100.0),
                 "Tr" => {
                     pass.state.render_mode = op
                         .operands
@@ -1031,7 +1042,8 @@ impl Rewriter<'_> {
             let from = origin - change.at;
             let same_way = (em.0 * change.along.0 + em.1 * change.along.1) / size > 0.99;
             let beside = (from.x * change.along.1 - from.y * change.along.0).abs();
-            if same_way && beside < 0.3 * size {
+            let in_span = change.span.0 - 0.5 <= origin.x && origin.x < change.span.1;
+            if same_way && beside < 0.3 * size && in_span {
                 if from.x * change.along.0 + from.y * change.along.1 > 0.01 {
                     moved += change.delta;
                 }
@@ -1046,6 +1058,30 @@ impl Rewriter<'_> {
             }
         }
         moved
+    }
+
+    /// How much narrower than itself a glyph at `origin` is drawn, where its line is
+    /// drawn together by more than the room between letters gives; one elsewhere.
+    fn narrowed_at(&self, origin: Point, em: (f64, f64)) -> f64 {
+        let size = em.0.hypot(em.1);
+        if size <= 0.0 {
+            return 1.0;
+        }
+        self.reflow
+            .iter()
+            .filter(|change| change.narrow && change.factor < 1.0)
+            .find(|change| {
+                let from = origin - change.at;
+                let same_way = (em.0 * change.along.0 + em.1 * change.along.1) / size > 0.99;
+                let beside = (from.x * change.along.1 - from.y * change.along.0).abs();
+                let past = origin - change.anchor;
+                same_way
+                    && beside < 0.3 * size
+                    && change.span.0 - 0.5 <= origin.x
+                    && origin.x < change.span.1
+                    && past.x * change.along.0 + past.y * change.along.1 > -0.01
+            })
+            .map_or(1.0, |change| change.factor)
     }
 
     /// Handles one text-showing operator: passes it on, or rewrites it without the glyphs in an area.
@@ -1121,10 +1157,21 @@ impl Rewriter<'_> {
             .zip(&elsewhere)
             .map(|(g, to)| self.shift_at(g.origin, g.em) + to.0)
             .collect();
+        // How much narrower each glyph is drawn. A glyph that goes to another line is
+        // out of the line that is short of room.
+        let narrower: Vec<f64> = run
+            .iter()
+            .zip(&elsewhere)
+            .map(|(g, to)| match to.1.abs() > 0.01 {
+                true => 1.0,
+                false => self.narrowed_at(g.origin, g.em),
+            })
+            .collect();
         // How far down the page each glyph goes: to another line, or nowhere.
         let lowered = elsewhere.iter().any(|to| to.1.abs() > 0.01);
         let removes = remove.contains(&true);
-        if !removes && !lowered && !wants.iter().any(|w| w.abs() > 0.01) {
+        let narrows = narrower.iter().any(|n| *n != 1.0);
+        if !removes && !lowered && !narrows && !wants.iter().any(|w| w.abs() > 0.01) {
             pass.out.push(op);
             return Ok(());
         }
@@ -1184,26 +1231,64 @@ impl Rewriter<'_> {
         let mut index = 0;
         // How far the pen has been moved off its own course so far, in points, and the
         // size of the glyphs it was moved by.
-        let mut applied = 0.0f64;
-        let mut em = 1.0f64;
+        let applied = std::cell::Cell::new(0.0f64);
+        let em = std::cell::Cell::new(1.0f64);
+        // How much narrower than usual text is drawn at the moment. Movements in a TJ
+        // array are narrowed with it.
+        let narrowed = std::cell::Cell::new(1.0f64);
         // Moves the pen so that what is shown next lands `want` points along the line
         // from where it would have. A number in a TJ array moves the pen back by
         // thousandths of the font size.
-        let mut settle =
-            |want: f64,
-             glyph: &Placed,
-             rebuilt: &mut Vec<Object>,
-             kept: &mut Option<(Vec<u8>, lopdf::StringFormat)>| {
-                em = glyph.em.0.hypot(glyph.em.1).max(0.001);
-                if (want - applied).abs() > 0.01 {
-                    rebuilt.extend(
-                        kept.take()
-                            .map(|(bytes, format)| Object::String(bytes, format)),
-                    );
-                    rebuilt.push(Object::Real((-(want - applied) / em * 1000.0) as f32));
-                    applied = want;
-                }
-            };
+        let settle = |want: f64,
+                      glyph: &Placed,
+                      rebuilt: &mut Vec<Object>,
+                      kept: &mut Option<(Vec<u8>, lopdf::StringFormat)>| {
+            em.set(glyph.em.0.hypot(glyph.em.1).max(0.001));
+            if (want - applied.get()).abs() > 0.01 {
+                rebuilt.extend(
+                    kept.take()
+                        .map(|(bytes, format)| Object::String(bytes, format)),
+                );
+                let back = -(want - applied.get()) / (em.get() * narrowed.get()) * 1000.0;
+                rebuilt.push(Object::Real(back as f32));
+                applied.set(want);
+            }
+        };
+        // Draws what is shown next `to` times as wide as it is. What was gathered so
+        // far is shown first, at the width it was gathered for.
+        let scaling = pass.state.scaling;
+        let narrow = |to: f64,
+                      rebuilt: &mut Vec<Object>,
+                      kept: &mut Option<(Vec<u8>, lopdf::StringFormat)>,
+                      out: &mut Vec<Operation>| {
+            if (to - narrowed.get()).abs() <= 0.0005 {
+                return;
+            }
+            rebuilt.extend(
+                kept.take()
+                    .map(|(bytes, format)| Object::String(bytes, format)),
+            );
+            if !rebuilt.is_empty() {
+                out.push(Operation::new(
+                    "TJ",
+                    vec![Object::Array(std::mem::take(rebuilt))],
+                ));
+            }
+            out.push(Operation::new(
+                "Tz",
+                vec![Object::Real((scaling * to) as f32)],
+            ));
+            narrowed.set(to);
+        };
+        // Under a narrower width the pen covers less ground than on its own course:
+        // from one glyph to the next, less by the share that was taken off.
+        let fallen_behind = |index: usize| {
+            if index > 0 && narrowed.get() != 1.0 {
+                let (last, glyph) = (&run[index - 1], &run[index]);
+                let ground = last.units_to(glyph.origin) * last.em.0.hypot(last.em.1) / 1000.0;
+                applied.set(applied.get() + (narrowed.get() - 1.0) * ground);
+            }
+        };
         // Puts what is shown next `down` points lower on the page than its line. Text
         // rise does that without touching the text matrix, so the operators that
         // follow start where they always did.
@@ -1248,6 +1333,7 @@ impl Rewriter<'_> {
                     continue;
                 }
             };
+            fallen_behind(index);
             if !remove[index] {
                 lower(
                     elsewhere[index].1,
@@ -1256,6 +1342,7 @@ impl Rewriter<'_> {
                     &mut kept,
                     &mut pass.out,
                 );
+                narrow(narrower[index], &mut rebuilt, &mut kept, &mut pass.out);
                 settle(wants[index], &run[index], &mut rebuilt, &mut kept);
                 kept.get_or_insert_with(|| (Vec::new(), *format))
                     .0
@@ -1277,6 +1364,7 @@ impl Rewriter<'_> {
                     &mut kept,
                     &mut pass.out,
                 );
+                narrow(narrower[index], &mut rebuilt, &mut kept, &mut pass.out);
                 settle(wants[index], glyph, &mut rebuilt, &mut kept);
                 self.place_replacement(d, glyph, area, *format, pass, &mut rebuilt)?;
             }
@@ -1329,14 +1417,32 @@ impl Rewriter<'_> {
             kept.take()
                 .map(|(bytes, format)| Object::String(bytes, format)),
         );
+        // What the last glyph lost in width the pen is behind by as well.
+        if narrowed.get() != 1.0
+            && let Some(last) = run.last()
+        {
+            let width = match last.advance {
+                Some(advance) => {
+                    advance as f64 + pass.state.char_spacing * 1000.0 / pass.state.font_size
+                }
+                None => 500.0,
+            };
+            let ground = width * last.em.0.hypot(last.em.1) / 1000.0;
+            applied.set(applied.get() + (narrowed.get() - 1.0) * ground);
+        }
         // The pen goes back on its own course, so that the next operator starts where
         // it always did and is moved, if at all, on its own account.
-        if applied.abs() > 0.01 {
-            rebuilt.push(Object::Real((applied / em * 1000.0) as f32));
+        if applied.get().abs() > 0.01 {
+            let back = applied.get() / (em.get() * narrowed.get()) * 1000.0;
+            rebuilt.push(Object::Real(back as f32));
         }
         if !rebuilt.is_empty() {
             pass.out
                 .push(Operation::new("TJ", vec![Object::Array(rebuilt)]));
+        }
+        if narrowed.get() != 1.0 {
+            pass.out
+                .push(Operation::new("Tz", vec![Object::Real(scaling as f32)]));
         }
         if lowered_by.get().abs() > 0.01 {
             pass.out
@@ -2110,6 +2216,10 @@ struct PageMatches {
 /// How much closer together the rest of a line may be drawn to stay in its column,
 /// as a share of its length.
 const SQUEEZE: f64 = 0.08;
+/// The least width, as a share of its own, that a line is drawn at to stay in its
+/// column where its last words cannot go to the next line. Narrower than this, type
+/// stops being read with ease, and what is still over is reported instead.
+const NARROWEST: f64 = 0.7;
 
 /// The changes of width on a page, each with what its line does about it, and for
 /// each replacement by how much its line still runs over its column.
@@ -2283,6 +2393,8 @@ struct Plan {
     moves: Vec<LineMove>,
     /// Lines whose last words went to the next line.
     wrapped: usize,
+    /// Lines drawn narrower to stay in their column.
+    narrowed: usize,
 }
 
 fn plan_reflow(
@@ -2310,6 +2422,8 @@ fn plan_reflow(
                     delta: new - old,
                     anchor: at,
                     factor: 1.0,
+                    narrow: false,
+                    span: (f64::NEG_INFINITY, f64::INFINITY),
                 },
                 new,
             )),
@@ -2318,7 +2432,7 @@ fn plan_reflow(
         .collect();
     let mut overflow = vec![0.0; placed.len()];
     let mut moves = Vec::new();
-    let mut wrapped = 0;
+    let (mut wrapped, mut narrowed) = (0, 0);
     // Lines are told apart by their baseline. Only level text is fitted to a column.
     let level = |c: &Reflow| c.along.0 > 0.99;
     let mut lines: Vec<f64> = changes
@@ -2329,8 +2443,44 @@ fn plan_reflow(
     lines.sort_by(f64::total_cmp);
     lines.dedup_by(|a, b| (*a - *b).abs() < 1.0);
     let changed = lines.clone();
-    for baseline in lines {
-        let on_line = |c: &Reflow| level(c) && (c.at.y - baseline).abs() < 1.0;
+    let cells: Vec<(f64, (f64, f64))> = lines
+        .into_iter()
+        .flat_map(|baseline| {
+            // The upright rules that cross the line cut it into the cells of a table. What
+            // changes in a cell is the business of that cell alone.
+            let mut rules: Vec<f64> = strokes
+                .iter()
+                .filter(|s| s[2] - s[0] < 2.0 && s[1] < baseline - 3.0 && baseline - 3.0 < s[3])
+                .map(|s| (s[0] + s[2]) / 2.0)
+                .collect();
+            rules.sort_by(f64::total_cmp);
+            let cell = |x: f64| {
+                (
+                    rules
+                        .iter()
+                        .copied()
+                        .rfind(|r| *r <= x + 0.5)
+                        .unwrap_or(f64::NEG_INFINITY),
+                    rules
+                        .iter()
+                        .copied()
+                        .find(|r| *r > x + 0.5)
+                        .unwrap_or(f64::INFINITY),
+                )
+            };
+            let mut cells: Vec<(f64, f64)> = changes
+                .iter()
+                .filter(|c| level(&c.1) && (c.1.at.y - baseline).abs() < 1.0)
+                .map(|c| cell(c.1.at.x))
+                .collect();
+            cells.sort_by(|a, b| a.0.total_cmp(&b.0));
+            cells.dedup();
+            cells.into_iter().map(move |cell| (baseline, cell))
+        })
+        .collect();
+    for (baseline, (lo, hi)) in cells {
+        let inside = |x: f64| lo - 0.5 <= x && x < hi;
+        let on_line = |c: &Reflow| level(c) && (c.at.y - baseline).abs() < 1.0 && inside(c.at.x);
         let grown: f64 = changes
             .iter()
             .filter(|c| on_line(&c.1))
@@ -2338,6 +2488,12 @@ fn plan_reflow(
             .sum();
         // Words of this line have the baseline inside their box; the others that
         // overlap it sideways show how wide the column is.
+        let words: Vec<Area> = words
+            .iter()
+            .copied()
+            .filter(|w| inside((w[0] + w[2]) / 2.0))
+            .collect();
+        let words = &words[..];
         let mine = |w: &Area| w[1] < baseline && baseline <= w[3] + 0.5;
         let extent = bounds(
             words
@@ -2362,6 +2518,13 @@ fn plan_reflow(
             beside.iter().map(|w| w[2]).fold(extent[2], f64::max)
         } else {
             (width - left).max(extent[2])
+        };
+        // In a cell the text keeps as far from the rule on its right as from the one
+        // on its left.
+        let column = match (lo.is_finite(), hi.is_finite()) {
+            (true, true) => column.min(hi - (extent[0] - lo).clamp(1.0, 8.0)),
+            (false, true) => column.min(hi - 2.0),
+            _ => column,
         };
         let over = extent[2] + grown - column;
         if over <= 0.5 {
@@ -2400,20 +2563,38 @@ fn plan_reflow(
             };
             if let Some(wrap) = wrap_line(around, baseline, extent, column, &grown_before, &others)
             {
-                moves.extend(wrap);
+                moves.extend(wrap.into_iter().map(|line| LineMove {
+                    from: line.from.max(lo),
+                    until: line.until.min(hi),
+                    ..line
+                }));
                 wrapped += 1;
                 continue;
             }
         }
+        // The room between letters gives a little. For more, the line is drawn
+        // narrower from where its first replacement begins, the replacement with it.
+        let narrow = over > SQUEEZE * tail.max(0.0) + 0.5;
+        let (anchor, tail) = if narrow {
+            (first.0, extent[2] + grown - first.0.x)
+        } else {
+            (anchor, tail)
+        };
+        let most = if narrow { 1.0 - NARROWEST } else { SQUEEZE };
         let taken = if tail > 0.0 {
-            over.min(SQUEEZE * tail)
+            over.min(most * tail)
         } else {
             0.0
         };
+        if narrow && taken > 0.0 {
+            narrowed += 1;
+        }
         for (i, change, _) in changes.iter_mut().filter(|c| on_line(&c.1)) {
             change.anchor = anchor;
+            change.span = (lo, hi);
             if tail > 0.0 {
                 change.factor = 1.0 - taken / tail;
+                change.narrow = narrow;
             }
             overflow[*i] = over - taken;
         }
@@ -2429,6 +2610,7 @@ fn plan_reflow(
         overflow,
         moves,
         wrapped,
+        narrowed,
     }
 }
 
@@ -2609,6 +2791,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
             overflow,
             moves,
             wrapped,
+            narrowed,
         } = plan_reflow(
             &with_extents(&rewriter.placed, areas),
             words,
@@ -2661,6 +2844,7 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
             "in_substitute_font": substituted,
             "overflow_pt": tenths(overflow.iter().copied().fold(0.0, f64::max)),
             "lines_rewrapped": wrapped,
+            "lines_narrowed": narrowed,
         });
         if a.dry_run {
             entry["matches"] = (0..areas.len())
