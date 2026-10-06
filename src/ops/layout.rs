@@ -528,6 +528,9 @@ impl<'a> Device<'a> for Collector {
             // What the glyph itself reads as, kept beside stated text to compare them.
             let drawn = (self.visibility && within.is_some()).then(reading);
             let text = match within {
+                // Stated to read as nothing: a mark whose letter carries the text of
+                // both. It is no part of any word, and ends none.
+                Some((stated, _)) if stated.is_empty() => continue,
                 Some((stated, taken)) if !*taken => {
                     *taken = true;
                     stated.clone()

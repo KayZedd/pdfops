@@ -1050,9 +1050,13 @@ fn text_stated_around_glyphs_is_what_is_read() {
         BT /F1 12 Tf 72 700 Td \
         /Span <</ActualText (office)>> BDC (o) Tj (X) Tj (ce) Tj EMC ( hours) Tj ET \
         BT /F1 12 Tf 72 650 Td /Span <</ActualText <FEFF0063006100660119>>> BDC (cafe) Tj EMC ET \
-        BT /F1 12 Tf 72 600 Td /Artifact BMC (Page one) Tj EMC ET";
+        BT /F1 12 Tf 72 600 Td /Artifact BMC (Page one) Tj EMC ET \
+        BT /F1 12 Tf 72 550 Td (ab) Tj /Span <</ActualText <FEFF>>> BDC [(x) 500] TJ EMC (cd) Tj ET";
     let pdf = custom(dir.path(), "stated.pdf", &[content]);
     let text = &texts(&pdf)[0];
+    // A glyph stated to read as nothing, as a mark is whose letter carries the text of
+    // both, is no part of the word it is drawn in and does not end it.
+    assert!(text.contains("abcd"), "{text}");
     assert!(
         text.contains("office hours") && text.contains("caf\u{119}") && text.contains("Page one"),
         "{text}"
