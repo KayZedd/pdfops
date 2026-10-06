@@ -552,11 +552,9 @@ impl<'a> Device<'a> for Collector {
                             part.1[i + 2] = part.1[i + 2].max(value);
                             word.bbox[i + 2] = word.bbox[i + 2].max(value);
                         }
-                        // The word goes on from the glyph that reaches furthest.
-                        let further = end - word.end;
-                        if along.x * further.x + along.y * further.y > 0.0 {
-                            word.end = end;
-                        }
+                        // The word goes on from where the glyph drawn last ends, as
+                        // the pen does.
+                        word.end = end;
                     }
                     continue;
                 }
