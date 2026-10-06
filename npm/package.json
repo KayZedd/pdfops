@@ -1,6 +1,6 @@
 {
   "name": "pdfops-cli",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Fast PDF operations for AI agents: CLI and MCP server (text, tables, OCR, redaction, scanning, forms, signatures, stamps, merge, split)",
   "license": "MIT",
   "repository": {
