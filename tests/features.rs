@@ -1308,17 +1308,62 @@ fn replace_draws_a_line_together_to_keep_it_in_its_column() {
         assert!(line.windows(2).all(|p| p[0].1[2] < p[1].1[0]), "{line:?}");
     }
 
-    // With something right under the paragraph there is no room for a line more, so
-    // nothing is rearranged and what is over is reported.
+    // With something right under the paragraph there is no room for a line more. The
+    // line is then drawn narrower from the replacement on, as far as it takes to end
+    // where the column does.
     let crowded = format!("{column} 72 658 m 300 658 l S");
     let pdf = custom(dir.path(), "crowded.pdf", &[&crowded]);
+    let wide = |w: &[(String, [f64; 4])], text: &str| {
+        let word = w.iter().find(|w| w.0 == text).expect("the word");
+        word.1[2] - word.1[0]
+    };
+    let until = wide(&words(&pdf, 1), "until");
     let v = call(
         "pdf_replace",
         json!({"input": pdf, "output": out, "find": "May", "with": "the month after that", "case_sensitive": true}),
     );
-    assert_eq!(v["pages"][0]["lines_rewrapped"], 0, "{v}");
+    let page = &v["pages"][0];
+    assert_eq!(
+        (
+            &page["lines_rewrapped"],
+            &page["lines_narrowed"],
+            &page["overflow_pt"]
+        ),
+        (&json!(0), &json!(1), &json!(0.0)),
+        "{v}"
+    );
+    let narrowed = line(&words(&out, 1));
+    let read: Vec<&str> = narrowed.iter().map(|w| w.0.as_str()).collect();
+    assert_eq!(
+        read.join(" "),
+        "of the month after that until notice is given by either"
+    );
+    assert!(
+        (narrowed.last().unwrap().1[2] - edge).abs() < 0.5,
+        "{narrowed:?}"
+    );
+    // The words are narrower, not run into one another, and those before the
+    // replacement and on the other lines are as they were.
+    assert!(
+        narrowed.windows(2).all(|p| p[0].1[2] < p[1].1[0]),
+        "{narrowed:?}"
+    );
+    let now = wide(&narrowed, "until");
+    assert!(now < 0.8 * until && now > 0.65 * until, "{now} {until}");
+    assert!((wide(&narrowed, "of") - wide(&before, "of")).abs() < 0.05);
+    let after = words(&out, 1);
+    assert!((wide(&after, "schedule") - wide(&before, "schedule")).abs() < 0.05);
+    assert!((wide(&after, "agreement") - wide(&before, "agreement")).abs() < 0.05);
+
+    // Type is not drawn narrower than can be read: what is then still over is reported.
+    let v = call(
+        "pdf_replace",
+        json!({"input": pdf, "output": out, "find": "May", "case_sensitive": true,
+               "with": "the month that follows the one in which this was signed"}),
+    );
     let over = v["pages"][0]["overflow_pt"].as_f64().unwrap();
     let end = line(&words(&out, 1)).last().unwrap().1[2];
+    assert_eq!(v["pages"][0]["lines_narrowed"], 1, "{v}");
     assert!(
         over > 20.0 && (end - edge - over).abs() < 1.0,
         "{over} {end} {edge}"
@@ -2207,4 +2252,48 @@ Plain text with <mark>a marked word</mark> in it.
     // Figures stand against the right edge of their column, one under the other.
     assert!((word("7")[2] - word("840")[2]).abs() < 0.5, "{placed:?}");
     assert!(word("7")[0] > word("840")[0] + 5.0, "{placed:?}");
+}
+
+#[test]
+fn letters_drawn_together_by_kerning_stay_one_word() {
+    let dir = tempfile::tempdir().unwrap();
+    // A capital T with the o drawn under its arm, a fifth of an em back, as fonts
+    // with kerning set it; and two words a space apart.
+    let content = "BT /F1 12 Tf 72 700 Td [(T) 200 (otal) -278 (due)] TJ ET";
+    let pdf = custom(dir.path(), "kerned.pdf", &[content]);
+    assert_eq!(texts(&pdf)[0].trim(), "Total due");
+}
+
+#[test]
+fn replace_in_a_table_cell_leaves_the_other_cells_where_they_are() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pdf");
+    // Two cells on one line, the rules of a table around and between them.
+    let content = "0.5 w 66 690 m 66 716 l S 200 690 m 200 716 l S 300 690 m 300 716 l S \
+        66 690 m 300 690 l S 66 716 m 300 716 l S \
+        BT /F1 11 Tf 72 700 Td (Fitted by hand) Tj 134 0 Td (15 000) Tj ET";
+    let pdf = custom(dir.path(), "cells.pdf", &[content]);
+    let before = words(&pdf, 1);
+    let v = call(
+        "pdf_replace",
+        json!({"input": pdf, "output": out, "find": "hand", "with": "our own two fitters"}),
+    );
+    let page = &v["pages"][0];
+    assert_eq!(
+        (&page["lines_narrowed"], &page["overflow_pt"]),
+        (&json!(1), &json!(0.0)),
+        "{v}"
+    );
+    let after = words(&out, 1);
+    let at =
+        |w: &[(String, [f64; 4])], text: &str| w.iter().find(|w| w.0 == text).expect("the word").1;
+    // The figure in the next cell has not moved or changed, and the text that grew
+    // ends short of the rule between them, as far from it as it begins from its own.
+    for figure in ["15", "000"] {
+        let (was, now) = (at(&before, figure), at(&after, figure));
+        assert!((0..4).all(|i| (was[i] - now[i]).abs() < 0.05), "{after:?}");
+    }
+    let end = at(&after, "fitters")[2];
+    assert!((end - 194.0).abs() < 0.6, "{after:?}");
+    assert!(texts(&out)[0].contains("Fitted by our own two fitters"));
 }

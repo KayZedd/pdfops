@@ -372,8 +372,9 @@ The short version. `pdfops <command> --help` has the detail for each command.
 - **Replace** writes in the document's own font where it has the glyphs and moves the rest of
   the line along; values of text fields and comments of annotations are changed too. A line
   that grows past its column passes its last words on to the next line, and the paragraph gets a
-  line more if there is room below. Where the paragraph cannot be told with certainty the line
-  is left as it is and `overflow_pt` says by how much it runs over; `--dry-run` shows it first.
+  line more if there is room below. Where that cannot be done, the line is drawn narrower from
+  the replacement on, to no less than 70% of its width. In a table all of this stays within
+  the cell. What is then still over is in `overflow_pt`; `--dry-run` shows it first.
 - **Dry run.** `redact`, `replace`, `annotate` and `stamp` take `--dry-run`: all the work,
   nothing written.
 - **Scan** reports scripts, actions, attachments, disguised content and hidden text by severity.
