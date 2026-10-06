@@ -257,50 +257,50 @@ impl Embedded {
                     });
                 }
             }
+            let written = &text[cluster[0].cluster.clone()];
             if out.len() - from > 1 {
-                // Within a cluster the order of drawing is free, and a reader takes the
-                // text to end where the glyph drawn last does, by the width the font
-                // states for it. A mark set back under its letter would end the cluster
-                // short of the letter, and one that the font gives a width of its own
-                // beyond it; either way what follows would seem a word apart. The glyph
-                // that ends nearest to where the cluster does is drawn last.
+                // Within a cluster the order of drawing is free, and a reader takes text
+                // to begin where its first glyph does and to end where its last one
+                // does, by the width the font states for it. So the glyphs that move the
+                // pen on come first, as they stand, and carry the text of the cluster:
+                // they begin and end where it does. The marks set over, under or into
+                // them follow and are stated to read as nothing. Drawn anywhere else, a
+                // mark would begin or end the cluster where it stands itself, and what
+                // is next to it would seem joined on, or a word apart.
                 let total: f64 = out[from..].iter().map(|g| g.advance).sum();
                 let mut pen = 0.0;
-                let mut placed: Vec<(f64, Shaped)> = out
+                let placed: Vec<(f64, bool, Shaped)> = out
                     .drain(from..)
                     .map(|g| {
                         let at = pen + g.dx;
                         pen += g.advance;
-                        (at, g)
+                        (at, g.advance > 0.5, g)
                     })
                     .collect();
-                let short = |glyph: &(f64, Shaped)| (glyph.0 + glyph.1.natural - total).abs();
-                if let Some(last) = (0..placed.len()).min_by(|&a, &b| {
-                    short(&placed[a])
-                        .total_cmp(&short(&placed[b]))
-                        .then(b.cmp(&a))
-                }) {
-                    let glyph = placed.remove(last);
-                    placed.push(glyph);
-                }
-                let (mut pen, last) = (0.0, placed.len() - 1);
-                for (k, (at, mut glyph)) in placed.into_iter().enumerate() {
+                let moving = placed.iter().filter(|g| g.1).count();
+                // Nothing moves the pen in a cluster of marks alone: they carry its text.
+                let carried = if moving == 0 { placed.len() } else { moving };
+                let (first, rest): (Vec<_>, Vec<_>) =
+                    placed.into_iter().partition(|g| g.1 || moving == 0);
+                let (mut pen, last) = (0.0, first.len() + rest.len() - 1);
+                for (k, (at, _, mut glyph)) in first.into_iter().chain(rest).enumerate() {
                     glyph.dx = at - pen;
                     pen = at + glyph.natural;
                     let rest = if k == last { total - pen } else { 0.0 };
                     glyph.advance = glyph.dx + glyph.natural + rest;
+                    glyph.stated = match k {
+                        0 => Some((written.to_string(), carried)),
+                        k if k == carried => Some((String::new(), last + 1 - carried)),
+                        _ => None,
+                    };
                     out.push(glyph);
                 }
-            }
-            let written = &text[cluster[0].cluster.clone()];
-            let read: String = out[from..]
-                .iter()
-                .map(|g| self.reads.get(&g.glyph).map_or("", String::as_str))
-                .collect();
-            // Several glyphs for one cluster are stated too, even where their readings
-            // add up: placed over one another, they have no order a reader can rely on.
-            if out.len() - from > 1 || (read != written && from < out.len()) {
-                out[from].stated = Some((written.to_string(), out.len() - from));
+            } else if let Some(only) = out.get_mut(from) {
+                // One glyph that the font's map reads as something else than was written.
+                let read = self.reads.get(&only.glyph).map_or("", String::as_str);
+                if read != written {
+                    only.stated = Some((written.to_string(), 1));
+                }
             }
             i = j;
         }
