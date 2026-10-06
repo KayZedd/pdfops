@@ -22,7 +22,7 @@
   <a href="#examples">Examples</a> ·
   <a href="#how-it-compares">Comparison</a> ·
   <a href="#benchmarks">Benchmarks</a> ·
-  <a href="#behaviour-worth-knowing">Limits</a>
+  <a href="#limits">Limits</a>
 </p>
 
 <p align="center">
@@ -359,32 +359,21 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
 
 ## Behaviour worth knowing
 
-The short version. `pdfops <command> --help` has the detail for each command.
+`pdfops <command> --help` has the detail for each command.
 
 - **Any script.** Text that `stamp`, `fill`, `replace`, `create` and `ocr -o` draw is shaped and
   embedded as font subsets; where no one font has every character, several share the text.
-  Hebrew and Arabic are laid out from the right and read back in the order they are read in, so
-  a word is found by typing it. Where shaping reorders, splits or stacks glyphs, as in Indic
-  scripts and Thai, the text is stated beside them and reads back as it was written.
-- **Redaction removes, it does not cover.** Glyphs, image pixels in any encoding, drawings and
-  annotations under an area are deleted, a text to redact is also struck from metadata and
-  bookmarks, and the result is read back by a second interpreter before anything is written.
+  Hebrew and Arabic are laid out from the right, Indic scripts and Thai are formed into their
+  clusters, and all of it reads back as it was written, so a word is found by typing it.
 - **Replace** writes in the document's own font where it has the glyphs and moves the rest of
   the line along; values of text fields and comments of annotations are changed too. A line
-  that grows past its column passes its last words on to the next line, and the paragraph gets a
-  line more if there is room below. Where that cannot be done, the line is drawn narrower from
-  the replacement on, to no less than 70% of its width. In a table all of this stays within
-  the cell. What is then still over is in `overflow_pt`; `--dry-run` shows it first.
+  that grows past its column passes its last words on to the next line, or is drawn narrower
+  where it cannot. In a table all of this stays within the cell.
 - **Dry run.** `redact`, `replace`, `annotate` and `stamp` take `--dry-run`: all the work,
   nothing written.
-- **Scan** reports scripts, actions, attachments, disguised content and hidden text by severity.
-  With `--clamav` the file also goes through ClamAV's signatures, where that is installed. It
-  never calls a file safe. **Sanitize** removes the active content and scans the result before
-  writing it.
-- **Tables** with ruling lines are read cell by cell. Tables without are inferred from how
-  their text lines up (`detected_by: alignment`), rows of several lines included; lists and
-  pages set in columns are left alone. An inference deserves a look.
-- **OCR** is tesseract's. `ocr -o` writes the recognised text into a copy as an invisible layer.
+- **Scan** reports scripts, actions, attachments, disguised content and hidden text by severity,
+  and with `--clamav` what ClamAV's signatures recognise, where that is installed. **Sanitize**
+  removes the active content and scans the result before writing it.
 - **Signatures.** `sign` appends, so earlier signatures stay valid. It can show the signature on
   a page (`--visible`) and embed a timestamp authority's statement of the time (`--tsa`).
   `signatures` checks that the bytes are unchanged and who signed; with `--trust` it checks the
@@ -395,12 +384,21 @@ The short version. `pdfops <command> --help` has the detail for each command.
 - **Damaged files** are repaired for reading and rebuilt for writing, encrypted ones too; the
   result then carries `repaired_inputs`. **Protected files stay protected** when edited; only
   `decrypt` removes the protection.
-- **Limits.** 4 GiB and 300 seconds per command by default: `--max-memory`, `--timeout`, or
-  `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`; 0 lifts a limit. Rasters are capped at 64 megapixels.
-- **Create** takes Markdown and the HTML in it: headings, emphasis, links, lists, tables. Of
-  its styling it follows colour, background, bold, italic, underline, strike-through, size and
-  alignment, from `style` attributes and `<style>` rules that go by tag, class and id. Layout
-  is not read: no boxes, floats or grids.
+
+## Limits
+
+- **Tables without ruling lines** are inferred from how their text lines up, and say so
+  (`detected_by: alignment`). An inference deserves a look.
+- **Replace** draws a line no narrower than 70% of its width. What a replacement still runs
+  over by is in `overflow_pt`, and `--dry-run` shows it before anything is written.
+- **Create** follows the styling of HTML for how text looks: colour, background, bold, italic,
+  underline, strike-through, size and alignment, from `style` attributes and `<style>` rules
+  that go by tag, class and id. Layout is not read: no boxes, floats or grids.
+- **OCR** is tesseract's, in quality and in languages.
+- **Scan** is not a verdict: it never calls a file safe, and lists what it did not check.
+- **Resources.** A command may use 4 GiB and 300 seconds by default: `--max-memory`,
+  `--timeout`, or `PDFOPS_MAX_MEMORY` and `PDFOPS_TIMEOUT`; 0 lifts a limit. Rasters are capped
+  at 64 megapixels.
 
 ## Development
 
