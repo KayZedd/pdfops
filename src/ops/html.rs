@@ -2,9 +2,12 @@
 //!
 //! Markdown lets HTML through as it is. `create` has no HTML engine, so the common
 //! tags are rewritten into what it does understand: headings, paragraphs, emphasis,
-//! links, images, lists, quotes, code and tables. Styling is not read: there is no CSS.
+//! links, images, lists, quotes, code and tables. How the text is to look, as far as
+//! `css` reads it, goes along inside the text; see there.
 
 use pulldown_cmark::{Event, Options, Parser};
+
+use super::css::{self, Align, Element, Look, Sheet, Size};
 
 /// What is being converted, across the fragments Markdown hands over one at a time.
 #[derive(Default)]
@@ -22,7 +25,46 @@ struct Converter {
     skipping: Option<String>,
     /// Tags that mean nothing here and were dropped; their text stays.
     unknown: usize,
+    /// The rules of the style sheets met so far, and the text of the one being read.
+    sheet: Sheet,
+    styles: Option<String>,
+    /// The elements that are open, each with whether a look was opened for it.
+    open: Vec<(Element, bool)>,
+    /// The looks of the table and of the row being read, which their cells take on.
+    table_look: Look,
+    row_look: Look,
 }
+
+/// Elements that stand on lines of their own: a background fills them, not their words.
+const BLOCKS: [&str; 22] = [
+    "p",
+    "div",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "td",
+    "th",
+    "tr",
+    "table",
+    "li",
+    "ul",
+    "ol",
+    "blockquote",
+    "section",
+    "article",
+    "header",
+    "footer",
+    "main",
+    "body",
+];
+
+/// Elements that hold nothing and are never closed.
+const VOID: [&str; 9] = [
+    "br", "img", "hr", "meta", "link", "input", "col", "wbr", "source",
+];
 
 /// The character an entity such as `&amp;` or `&#233;` stands for.
 fn entity(name: &str) -> Option<char> {
@@ -101,6 +143,10 @@ impl Converter {
     }
 
     fn text(&mut self, out: &mut String, text: &str) {
+        if let Some(styles) = &mut self.styles {
+            styles.push_str(text);
+            return;
+        }
         if self.skipping.is_some() {
             return;
         }
@@ -147,17 +193,121 @@ impl Converter {
             .take_while(|c| c.is_ascii_alphanumeric())
             .collect::<String>()
             .to_ascii_lowercase();
+        // A style sheet is read wherever it stands, in the head as a rule.
+        if name == "style" {
+            match self.styles.take() {
+                Some(styles) if closing => self.sheet.add(&css::without_comments(&styles)),
+                _ if !closing => self.styles = Some(String::new()),
+                _ => {}
+            }
+        }
         if let Some(until) = &self.skipping {
             if closing && *until == name {
                 self.skipping = None;
             }
             return;
         }
+        if closing {
+            self.close(out, &[name.as_str()], &[]);
+        } else {
+            // Elements whose end tag is left out end where the next of their kind begins.
+            match name.as_str() {
+                "li" => self.close(out, &["li"], &["ul", "ol"]),
+                "td" | "th" => self.close(out, &["td", "th"], &["tr", "table"]),
+                "tr" => self.close(out, &["tr"], &["table"]),
+                "p" => self.close(out, &["p"], &BLOCKS[1..]),
+                _ => {}
+            }
+        }
+        self.tag_itself(out, &name, closing, body);
+        if !closing && !VOID.contains(&name.as_str()) && !inside.ends_with('/') {
+            let element = Element {
+                classes: attribute(body, "class")
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+                id: attribute(body, "id"),
+                tag: name.clone(),
+            };
+            let look = self.look_of(&element, body);
+            let said = !look.is_plain() && !self.verbatim && self.skipping.is_none();
+            match name.as_str() {
+                // Nothing is written between the cells of a table: they take the look on.
+                "table" => self.table_look = look,
+                "tr" => self.row_look = look,
+                _ if said => self.put(out, &look.marker()),
+                _ => {}
+            }
+            let carried = said && !matches!(name.as_str(), "table" | "tr");
+            self.open.push((element, carried));
+        }
+    }
+
+    /// Ends the innermost open element that is one of `names`, and what is open inside
+    /// it, unless one of `stops` encloses it more closely: the looks opened for them end.
+    fn close(&mut self, out: &mut String, names: &[&str], stops: &[&str]) {
+        let found = self
+            .open
+            .iter()
+            .rposition(|(element, _)| {
+                names.contains(&element.tag.as_str()) || stops.contains(&element.tag.as_str())
+            })
+            .filter(|&at| names.contains(&self.open[at].0.tag.as_str()));
+        if let Some(at) = found {
+            for (element, carried) in self.open.split_off(at).into_iter().rev() {
+                if carried {
+                    self.put(out, &css::POP.to_string());
+                }
+                match element.tag.as_str() {
+                    "table" => self.table_look = Look::default(),
+                    "tr" => self.row_look = Look::default(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The look an element asks for: by what it is, by the style sheets, by its
+    /// attributes, and last by its own `style`.
+    fn look_of(&self, element: &Element, body: &str) -> Look {
+        let name = element.tag.as_str();
+        let block = BLOCKS.contains(&name);
+        let mut look = Look::default();
+        match name {
+            "u" | "ins" => look.underline = Some(true),
+            "s" | "del" | "strike" => look.strike = Some(true),
+            "mark" => look.highlight = Some([255, 255, 0]),
+            "center" => look.align = Some(Align::Center),
+            "small" => look.size = Some(Size::Times(0.85)),
+            "big" => look.size = Some(Size::Times(1.2)),
+            "td" | "th" => look = self.row_look.over(self.table_look),
+            _ => {}
+        }
+        let around: Vec<Element> = self.open.iter().map(|(e, _)| e.clone()).collect();
+        look = self.sheet.look(element, &around, block).over(look);
+        let asked = Look {
+            color: attribute(body, "color").and_then(|c| css::color(&c)),
+            fill: attribute(body, "bgcolor").and_then(|c| css::color(&c)),
+            align: match attribute(body, "align").as_deref() {
+                Some("left") => Some(Align::Left),
+                Some("center") => Some(Align::Center),
+                Some("right") => Some(Align::Right),
+                _ => None,
+            },
+            ..Default::default()
+        };
+        look = asked.over(look);
+        let own = attribute(body, "style").unwrap_or_default();
+        Look::declared(&own, block).over(look)
+    }
+
+    /// What a tag becomes in Markdown.
+    fn tag_itself(&mut self, out: &mut String, name: &str, closing: bool, body: &str) {
         let mark = |open: &'static str| open;
-        match (name.as_str(), closing) {
+        match (name, closing) {
             ("b" | "strong", _) => self.put(out, mark("**")),
             ("i" | "em" | "cite" | "var", _) => self.put(out, mark("*")),
-            ("s" | "del" | "strike", _) => self.put(out, mark("~~")),
             ("code" | "kbd" | "tt" | "samp", _) if !self.verbatim => self.put(out, mark("`")),
             ("br", _) => {
                 let line_break = if self.cell.is_some() { " " } else { "\\\n" };
@@ -254,13 +404,16 @@ impl Converter {
                     out.push('\n');
                 }
             }
-            ("script" | "style" | "title" | "head", false) => self.skipping = Some(name),
+            ("script" | "style" | "title" | "head", false) if self.skipping.is_none() => {
+                self.skipping = Some(name.to_string())
+            }
             // Containers and styling that change nothing here.
             (
                 "li" | "tr" | "tbody" | "thead" | "tfoot" | "span" | "u" | "font" | "small" | "big"
-                | "mark" | "sup" | "sub" | "center" | "html" | "body" | "nav" | "label" | "abbr"
-                | "figure" | "figcaption" | "caption" | "colgroup" | "col" | "code" | "kbd" | "tt"
-                | "samp" | "script" | "style" | "title" | "head" | "td" | "th",
+                | "s" | "del" | "strike" | "ins" | "mark" | "sup" | "sub" | "center" | "html"
+                | "body" | "nav" | "label" | "abbr" | "figure" | "figcaption" | "caption"
+                | "colgroup" | "col" | "code" | "kbd" | "tt" | "samp" | "script" | "style"
+                | "title" | "head" | "td" | "th",
                 _,
             ) => {}
             (_, false) => self.unknown += 1,
@@ -357,6 +510,54 @@ mod tests {
                 "{expected:?} not in {markdown:?}"
             );
         }
+    }
+
+    #[test]
+    fn looks_are_carried_in_the_text_and_closed_where_their_element_ends() {
+        let look = |css: &str, block: bool| Look::declared(css, block).marker();
+        let pop = css::POP;
+        // An inline element: the look opens after what the tag itself becomes.
+        assert_eq!(
+            converted("a <b style=\"color: red\">b</b> c"),
+            format!("a **{}b{pop}** c", look("color: red", false))
+        );
+        // A sheet in the head, a rule by class and one by what the element stands in.
+        let page = "<head><style>.n { color: #00f } div p { text-align: right }</style></head>\n\
+                    <div>\n<p class=\"n\">one\n<p>two</p>\n</div>\n<p>three</p>\n";
+        let (one, two) = (
+            look("color: #00f; text-align: right", true),
+            look("text-align: right", true),
+        );
+        let out = converted(page);
+        // The paragraph left open ends where the next one begins.
+        assert!(out.contains(&format!("{one}one {pop}")), "{out:?}");
+        assert!(out.contains(&format!("{two}two{pop}")), "{out:?}");
+        assert!(out.contains("three") && !out.contains("color"), "{out:?}");
+        assert_eq!(out.matches(css::OPEN).count(), out.matches(pop).count());
+        // Cells take the look of their row on, and elements that only mean a look say it.
+        let table = converted(
+            "<table><tr bgcolor=\"#eee\"><td align=\"right\">1</td><td><u>2</u></td></tr></table>\n",
+        );
+        let cell = Look {
+            fill: Some([238, 238, 238]),
+            align: Some(Align::Right),
+            ..Default::default()
+        };
+        assert!(
+            table.contains(&format!("{}1{pop}", cell.marker())),
+            "{table:?}"
+        );
+        let underlined = Look {
+            underline: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            table.contains(&format!("{}2{pop}", underlined.marker())),
+            "{table:?}"
+        );
+        // Nothing is opened where there is nothing to say, nor inside code.
+        assert_eq!(converted("<span class=\"x\">plain</span>"), "plain");
+        assert!(!converted("<pre><span style=\"color:red\">x</span></pre>\n").contains(css::OPEN));
     }
 
     #[test]

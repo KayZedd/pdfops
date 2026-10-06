@@ -590,7 +590,11 @@ impl<'a> Device<'a> for Collector {
             let continues = self.open
                 && self.words.last().is_some_and(|w| {
                     let gap = origin - w.end;
-                    (gap.x * along.x + gap.y * along.y).abs() < 0.15 * size
+                    // Kerning draws letters together by more than a space sets words
+                    // apart: a T and the o under its arm are still one word.
+                    let ahead = gap.x * along.x + gap.y * along.y;
+                    ahead < 0.15 * size
+                        && ahead > -0.3 * size
                         && (gap.x * along.y - gap.y * along.x).abs() < 0.4 * size
                         && (w.size - size).abs() < 0.1 * size
                         && w.invisible == invisible

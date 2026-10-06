@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::doc;
 use crate::font::{Style, TextFont};
+use crate::ops::css::{self, Align, Look, Size};
 use crate::ops::edit::embed_image;
 
 #[derive(ValueEnum, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq)]
@@ -53,6 +54,8 @@ struct Span {
     text: String,
     style: Style,
     link: Option<String>,
+    /// What styling asked for, where the text came from HTML.
+    look: Look,
 }
 
 #[derive(Debug, PartialEq)]
@@ -76,20 +79,58 @@ enum Block {
 
 /// Reads inline content up to `until`, or (for text sitting directly in a list item)
 /// up to the next block. Images found on the way are returned separately.
-fn inline(events: &[Event<'_>], at: &mut usize, until: Option<TagEnd>) -> (Vec<Span>, Vec<String>) {
+///
+/// `looks` holds the looks that are open, the innermost last. Text carries the marks
+/// that open and close them, see `css`; they are taken out of it here, and a look
+/// stays open across blocks until its mark closes it.
+fn inline(
+    events: &[Event<'_>],
+    at: &mut usize,
+    until: Option<TagEnd>,
+    looks: &mut Vec<Look>,
+) -> (Vec<Span>, Vec<String>) {
     let (mut spans, mut images) = (Vec::new(), Vec::new());
-    let (mut bold, mut italic) = (0u32, 0u32);
+    let (mut bold, mut italic, mut struck) = (0u32, 0u32, 0u32);
     let mut links: Vec<String> = Vec::new();
-    let mut push = |text: &str, mono: bool, bold: u32, italic: u32, links: &[String]| {
-        spans.push(Span {
-            text: text.to_string(),
-            style: Style {
-                bold: bold > 0,
-                italic: italic > 0,
-                mono,
-            },
-            link: links.last().cloned(),
-        });
+    let mut push = |text: &str,
+                    mono: bool,
+                    (bold, italic, struck): (u32, u32, u32),
+                    links: &[String],
+                    looks: &mut Vec<Look>| {
+        let mut rest = text;
+        loop {
+            let mark = rest.find([css::OPEN, css::POP]);
+            let plain = &rest[..mark.unwrap_or(rest.len())];
+            if !plain.is_empty() {
+                let mut look = looks.last().copied().unwrap_or_default();
+                if struck > 0 {
+                    look.strike = Some(true);
+                }
+                spans.push(Span {
+                    text: plain.to_string(),
+                    style: Style {
+                        bold: bold > 0 || look.bold == Some(true),
+                        italic: italic > 0 || look.italic == Some(true),
+                        mono,
+                    },
+                    link: links.last().cloned(),
+                    look,
+                });
+            }
+            let Some(mark) = mark else {
+                break;
+            };
+            rest = &rest[mark..];
+            if let Some(after) = rest.strip_prefix(css::POP) {
+                looks.pop();
+                rest = after;
+            } else {
+                let described = rest.find(css::END).unwrap_or(rest.len());
+                let look = Look::from_marker(&rest[css::OPEN.len_utf8()..described]);
+                looks.push(look.over(looks.last().copied().unwrap_or_default()));
+                rest = rest.get(described + css::END.len_utf8()..).unwrap_or("");
+            }
+        }
     };
     while let Some(event) = events.get(*at) {
         match event {
@@ -97,10 +138,10 @@ fn inline(events: &[Event<'_>], at: &mut usize, until: Option<TagEnd>) -> (Vec<S
                 *at += 1;
                 break;
             }
-            Event::Text(t) => push(t, false, bold, italic, &links),
-            Event::Code(t) => push(t, true, bold, italic, &links),
-            Event::SoftBreak => push(" ", false, bold, italic, &links),
-            Event::HardBreak => push("\n", false, bold, italic, &links),
+            Event::Text(t) => push(t, false, (bold, italic, struck), &links, looks),
+            Event::Code(t) => push(t, true, (bold, italic, struck), &links, looks),
+            Event::SoftBreak => push(" ", false, (bold, italic, struck), &links, looks),
+            Event::HardBreak => push("\n", false, (bold, italic, struck), &links, looks),
             Event::Start(Tag::Strong) => bold += 1,
             Event::End(TagEnd::Strong) => bold = bold.saturating_sub(1),
             Event::Start(Tag::Emphasis) => italic += 1,
@@ -119,8 +160,10 @@ fn inline(events: &[Event<'_>], at: &mut usize, until: Option<TagEnd>) -> (Vec<S
                     *at += 1;
                 }
             }
-            Event::Start(Tag::Strikethrough | Tag::Superscript | Tag::Subscript)
-            | Event::End(TagEnd::Strikethrough | TagEnd::Superscript | TagEnd::Subscript)
+            Event::Start(Tag::Strikethrough) => struck += 1,
+            Event::End(TagEnd::Strikethrough) => struck = struck.saturating_sub(1),
+            Event::Start(Tag::Superscript | Tag::Subscript)
+            | Event::End(TagEnd::Superscript | TagEnd::Subscript)
             | Event::InlineHtml(_)
             | Event::FootnoteReference(_)
             | Event::TaskListMarker(_)
@@ -136,7 +179,7 @@ fn inline(events: &[Event<'_>], at: &mut usize, until: Option<TagEnd>) -> (Vec<S
 }
 
 /// Reads blocks up to the end of the enclosing container.
-fn blocks(events: &[Event<'_>], at: &mut usize) -> Vec<Block> {
+fn blocks(events: &[Event<'_>], at: &mut usize, looks: &mut Vec<Look>) -> Vec<Block> {
     let mut out = Vec::new();
     let text = |out: &mut Vec<Block>, (spans, images): (Vec<Span>, Vec<String>), level: u8| {
         if spans.iter().any(|s| !s.text.trim().is_empty()) {
@@ -149,15 +192,17 @@ fn blocks(events: &[Event<'_>], at: &mut usize) -> Vec<Block> {
         match event {
             Event::End(_) => break,
             Event::Rule => out.push(Block::Rule),
-            Event::Start(Tag::Paragraph) => {
-                text(&mut out, inline(events, at, Some(TagEnd::Paragraph)), 0)
-            }
+            Event::Start(Tag::Paragraph) => text(
+                &mut out,
+                inline(events, at, Some(TagEnd::Paragraph), looks),
+                0,
+            ),
             Event::Start(Tag::Heading { level, .. }) => text(
                 &mut out,
-                inline(events, at, Some(TagEnd::Heading(*level))),
+                inline(events, at, Some(TagEnd::Heading(*level)), looks),
                 *level as u8,
             ),
-            Event::Start(Tag::BlockQuote(_)) => out.push(Block::Quote(blocks(events, at))),
+            Event::Start(Tag::BlockQuote(_)) => out.push(Block::Quote(blocks(events, at, looks))),
             Event::Start(Tag::CodeBlock(_)) => {
                 let mut code = String::new();
                 while let Some(Event::Text(t)) = events.get(*at) {
@@ -171,7 +216,7 @@ fn blocks(events: &[Event<'_>], at: &mut usize) -> Vec<Block> {
                 let mut items = Vec::new();
                 while let Some(Event::Start(Tag::Item)) = events.get(*at) {
                     *at += 1;
-                    items.push(blocks(events, at));
+                    items.push(blocks(events, at, looks));
                 }
                 *at += 1;
                 out.push(Block::List {
@@ -186,7 +231,7 @@ fn blocks(events: &[Event<'_>], at: &mut usize) -> Vec<Block> {
                     let mut cells = Vec::new();
                     while let Some(Event::Start(Tag::TableCell)) = events.get(*at) {
                         *at += 1;
-                        cells.push(inline(events, at, Some(TagEnd::TableCell)).0);
+                        cells.push(inline(events, at, Some(TagEnd::TableCell), looks).0);
                     }
                     *at += 1;
                     rows.push(cells);
@@ -204,11 +249,11 @@ fn blocks(events: &[Event<'_>], at: &mut usize) -> Vec<Block> {
                 }
                 *at += 1;
             }
-            Event::Start(_) => out.extend(blocks(events, at)),
+            Event::Start(_) => out.extend(blocks(events, at, looks)),
             // Text directly inside a list item, without a paragraph around it.
             Event::Text(_) | Event::Code(_) => {
                 *at -= 1;
-                text(&mut out, inline(events, at, None), 0);
+                text(&mut out, inline(events, at, None, looks), 0);
             }
             _ => {}
         }
@@ -222,6 +267,7 @@ struct Token {
     text: String,
     style: Style,
     link: Option<String>,
+    look: Look,
     /// A space precedes it in the source.
     spaced: bool,
     /// A hard line break precedes it.
@@ -243,6 +289,7 @@ fn tokens(spans: &[Span], force_bold: bool) -> Vec<Token> {
                     text: std::mem::take(word),
                     style,
                     link: span.link.clone(),
+                    look: span.look,
                     spaced: *spaced,
                     breaks: *breaks,
                 };
@@ -414,6 +461,7 @@ impl Writer {
                         text: text[from..to].to_string(),
                         style: token.style,
                         link: token.link.clone(),
+                        look: token.look,
                         spaced: token.spaced && from == place.start,
                         breaks: token.breaks && from == place.start,
                     }),
@@ -446,6 +494,16 @@ impl Writer {
     }
 
     fn draw_line(&mut self, line: &[(f64, Token)], x0: f64, baseline: f64, size: f64) {
+        let paint = |c: [u8; 3]| {
+            format!(
+                "{:.3} {:.3} {:.3}",
+                c[0] as f64 / 255.0,
+                c[1] as f64 / 255.0,
+                c[2] as f64 / 255.0
+            )
+        };
+        // Where the word before ended, and how it looked.
+        let mut before: Option<(f64, Look)> = None;
         for (offset, token) in line {
             let (font, names) = self.font(token.style);
             let (text, width) = (
@@ -453,15 +511,47 @@ impl Writer {
                 font.width(&token.text, size),
             );
             let x = x0 + offset;
-            let color = if token.link.is_some() {
-                "0.05 0.3 0.75 rg"
-            } else {
-                "0 g"
+            let look = token.look;
+            // A mark under, through or behind words takes in the space between them.
+            let from = |marked: bool| match before {
+                Some((end, last)) if marked && last == look && end <= x => end,
+                _ => x,
             };
-            let op = format!("BT\n{color}\n1 0 0 1 {x:.2} {baseline:.2} Tm\n{text}\nET\n");
+            let mut ops = String::new();
+            if let Some(color) = look.highlight {
+                let from = from(true);
+                ops += &format!(
+                    "{} rg\n{from:.2} {:.2} {:.2} {:.2} re\nf\n",
+                    paint(color),
+                    baseline - size * 0.25,
+                    x + width - from,
+                    size * 1.1
+                );
+            }
+            let color = match (look.color, &token.link) {
+                (Some(color), _) => paint(color),
+                (None, Some(_)) => "0.05 0.3 0.75".to_string(),
+                (None, None) => "0 0 0".to_string(),
+            };
+            ops += &format!("BT\n{color} rg\n1 0 0 1 {x:.2} {baseline:.2} Tm\n{text}\nET\n");
+            for (drawn, at) in [
+                (look.underline == Some(true), -0.12),
+                (look.strike == Some(true), 0.27),
+            ] {
+                if drawn {
+                    ops += &format!(
+                        "{color} rg\n{:.2} {:.2} {:.2} {:.2} re\nf\n",
+                        from(true),
+                        baseline + size * at,
+                        x + width - from(true),
+                        size * 0.06
+                    );
+                }
+            }
+            before = Some((x + width, look));
             let link = token.link.clone();
             let page = self.page();
-            page.ops += &op;
+            page.ops += &ops;
             if let Some(url) = link {
                 page.links.push((
                     [x, baseline - size * 0.25, x + width, baseline + size * 0.8],
@@ -471,12 +561,50 @@ impl Writer {
         }
     }
 
+    /// How far a line moves to the right to stand where `align` puts it in `width`.
+    fn aligned(&self, line: &[(f64, Token)], size: f64, width: f64, align: Option<Align>) -> f64 {
+        let left = line.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
+        let right = line
+            .iter()
+            .map(|(x, token)| x + self.measure(token, size))
+            .fold(0.0, f64::max);
+        match align {
+            Some(Align::Right) if left.is_finite() => width - right,
+            Some(Align::Center) if left.is_finite() => (width - right - left) / 2.0,
+            _ => 0.0,
+        }
+    }
+
     /// Lays out and draws a run of text, breaking pages between lines.
+    ///
+    /// The paragraph stands and is filled as its first words say: text taken from HTML
+    /// brings along how its paragraph is aligned and what lies behind it.
     fn text(&mut self, spans: &[Span], size: f64, x0: f64, width: f64, bold: bool) {
+        let look = spans.first().map(|s| s.look).unwrap_or_default();
         for line in self.wrap(&tokens(spans, bold), size, width) {
             self.need(size * LEADING);
-            self.draw_line(&line, x0, self.y - size, size);
+            if let Some(fill) = look.fill {
+                let bottom = self.y - size * (LEADING + 0.12);
+                self.page().ops += &format!(
+                    "{:.3} {:.3} {:.3} rg\n{x0:.2} {bottom:.2} {width:.2} {:.2} re\nf\n",
+                    fill[0] as f64 / 255.0,
+                    fill[1] as f64 / 255.0,
+                    fill[2] as f64 / 255.0,
+                    size * LEADING
+                );
+            }
+            let shift = self.aligned(&line, size, width, look.align);
+            self.draw_line(&line, x0 + shift, self.y - size, size);
             self.y -= size * LEADING;
+        }
+    }
+
+    /// The size of a block of text: what its styling asks for, or `usual`.
+    fn sized(&self, spans: &[Span], usual: f64) -> f64 {
+        match spans.first().and_then(|s| s.look.size) {
+            Some(Size::Points(points)) => (points as f64).clamp(4.0, 96.0),
+            Some(Size::Times(times)) => (self.base * times as f64).clamp(4.0, 96.0),
+            None => usual,
         }
     }
 
@@ -484,11 +612,13 @@ impl Writer {
         let base = self.base;
         match block {
             Block::Text { spans, level: 0 } => {
-                self.text(spans, base, x0, width, false);
+                let size = self.sized(spans, base);
+                self.text(spans, size, x0, width, false);
                 self.gap(base * 0.6);
             }
             Block::Text { spans, level } => {
-                let size = base * [1.0, 1.9, 1.5, 1.25, 1.1, 1.0, 1.0][(*level as usize).min(6)];
+                let usual = base * [1.0, 1.9, 1.5, 1.25, 1.1, 1.0, 1.0][(*level as usize).min(6)];
+                let size = self.sized(spans, usual);
                 self.gap(size * 0.6);
                 // A heading stays with the line that follows it.
                 self.need(size * LEADING + base * LEADING);
@@ -554,6 +684,7 @@ impl Writer {
                                 text: format!("{}.", n + i as u64),
                                 style: Style::default(),
                                 link: None,
+                                look: Look::default(),
                             };
                             let line = self.wrap(&tokens(&[label], false), base, indent);
                             if let Some(line) = line.first() {
@@ -702,16 +833,31 @@ impl Writer {
             let top = self.y;
             let mut x = x0;
             for (c, cell) in cells.iter().enumerate() {
-                let fill = if r == 0 { "0.92 g\n" } else { "1 g\n" };
+                let look = row
+                    .get(c)
+                    .and_then(|cell| cell.first())
+                    .map(|span| span.look)
+                    .unwrap_or_default();
+                let fill = match look.fill {
+                    Some(fill) => format!(
+                        "{:.3} {:.3} {:.3} rg\n",
+                        fill[0] as f64 / 255.0,
+                        fill[1] as f64 / 255.0,
+                        fill[2] as f64 / 255.0
+                    ),
+                    None if r == 0 => "0.92 g\n".to_string(),
+                    None => "1 g\n".to_string(),
+                };
                 self.page().ops += &format!(
                     "{fill}0.55 G\n0.5 w\n{x:.2} {:.2} {:.2} {row_height:.2} re\nB\n",
                     top - row_height,
                     widths[c]
                 );
                 for (i, line) in cell.iter().enumerate() {
+                    let shift = self.aligned(line, size, widths[c] - 2.0 * pad, look.align);
                     self.draw_line(
                         line,
-                        x + pad,
+                        x + pad + shift,
                         top - pad - size * 0.82 - i as f64 * size * LEADING,
                         size,
                     );
@@ -824,7 +970,7 @@ pub fn create(a: CreateArgs) -> Result<Value> {
     // mean nothing here are dropped and counted.
     let (source, html) = crate::ops::html::to_markdown(&source, options);
     let events: Vec<Event<'_>> = Parser::new_ext(&source, options).collect();
-    let content = blocks(&events, &mut 0);
+    let content = blocks(&events, &mut 0, &mut Vec::new());
 
     let mut chars = BTreeMap::new();
     let mut sources = Vec::new();
@@ -982,7 +1128,7 @@ mod tests {
 
     fn parse(markdown: &str) -> Vec<Block> {
         let events: Vec<Event<'_>> = Parser::new_ext(markdown, Options::ENABLE_TABLES).collect();
-        blocks(&events, &mut 0)
+        blocks(&events, &mut 0, &mut Vec::new())
     }
 
     fn plain(text: &str) -> Span {
@@ -990,6 +1136,7 @@ mod tests {
             text: text.to_string(),
             style: Style::default(),
             link: None,
+            look: Look::default(),
         }
     }
 
@@ -1082,6 +1229,7 @@ mod tests {
                     ..Default::default()
                 },
                 link: None,
+                look: Look::default(),
             },
         ];
         let t = tokens(&spans, false);
