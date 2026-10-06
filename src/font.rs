@@ -67,7 +67,7 @@ pub fn literal(bytes: &[u8]) -> String {
 pub struct TextFont {
     pub id: ObjectId,
     /// The embedded font's data for laying text out; `None` for a built-in font.
-    embedded: Option<Embedded>,
+    embedded: Option<Box<Embedded>>,
     /// Which built-in metrics apply when nothing is embedded.
     builtin: Style,
     /// The fonts that stand in where this one has no glyph, in the order they are tried.
@@ -126,6 +126,8 @@ struct Embedded {
     subset: HashMap<u16, (u16, f64)>,
     /// The glyph a character has before any shaping, as a glyph id in the font file.
     nominal: HashMap<char, u16>,
+    /// What each glyph of the subset reads as in the font's map back to text.
+    reads: HashMap<u16, String>,
 }
 
 /// One glyph of laid out text, in the order it is drawn. Distances are in 1/1000 em.
@@ -139,6 +141,11 @@ struct Shaped {
     /// Where the glyph sits relative to the pen: marks are placed this way.
     dx: f64,
     dy: f64,
+    /// On the first glyph of a cluster that the map back to text may not give back as
+    /// it was written: the text, and how many glyphs draw it. A glyph has one reading
+    /// in that map, while shaping reorders glyphs, splits a character over several,
+    /// stacks them and uses one glyph for different characters.
+    stated: Option<(String, usize)>,
 }
 
 /// A glyph as the shaper returns it, with the text it stands for.
@@ -223,6 +230,7 @@ impl Embedded {
                 j += 1;
             }
             let cluster = &raw[i..j];
+            let from = out.len();
             if cluster.iter().all(|g| self.subset.contains_key(&g.glyph)) {
                 out.extend(cluster.iter().map(|g| {
                     let (glyph, natural) = self.subset[&g.glyph];
@@ -232,6 +240,7 @@ impl Embedded {
                         natural,
                         dx: g.dx * self.scale,
                         dy: g.dy * self.scale,
+                        stated: None,
                     }
                 }));
             } else {
@@ -244,8 +253,44 @@ impl Embedded {
                         natural,
                         dx: 0.0,
                         dy: 0.0,
+                        stated: None,
                     });
                 }
+            }
+            if out.len() - from > 1 {
+                // Within a cluster the order of drawing is free, and a reader takes the
+                // text to end where the glyph drawn last does. A mark set back under its
+                // letter would end the cluster short of the letter, and what follows
+                // would seem a word apart: the glyph reaching furthest is drawn last.
+                let total: f64 = out[from..].iter().map(|g| g.advance).sum();
+                let mut pen = 0.0;
+                let mut placed: Vec<(f64, Shaped)> = out
+                    .drain(from..)
+                    .map(|g| {
+                        let at = pen + g.dx;
+                        pen += g.advance;
+                        (at, g)
+                    })
+                    .collect();
+                placed.sort_by(|a, b| (a.0 + a.1.natural).total_cmp(&(b.0 + b.1.natural)));
+                let (mut pen, last) = (0.0, placed.len() - 1);
+                for (k, (at, mut glyph)) in placed.into_iter().enumerate() {
+                    glyph.dx = at - pen;
+                    pen = at + glyph.natural;
+                    let rest = if k == last { total - pen } else { 0.0 };
+                    glyph.advance = glyph.dx + glyph.natural + rest;
+                    out.push(glyph);
+                }
+            }
+            let written = &text[cluster[0].cluster.clone()];
+            let read: String = out[from..]
+                .iter()
+                .map(|g| self.reads.get(&g.glyph).map_or("", String::as_str))
+                .collect();
+            // Several glyphs for one cluster are stated too, even where their readings
+            // add up: placed over one another, they have no order a reader can rely on.
+            if out.len() - from > 1 || (read != written && from < out.len()) {
+                out[from].stated = Some((written.to_string(), out.len() - from));
             }
             i = j;
         }
@@ -384,44 +429,64 @@ impl TextFont {
             .join("\n")
     }
 
-    /// The elements of a `TJ` array showing `text` in this font alone: strings of glyphs,
-    /// and between them the movements that kerning and shaping ask for.
+    /// The elements of the `TJ` arrays showing `text` in this font alone: strings of
+    /// glyphs, and between them the movements that kerning and shaping ask for. Each
+    /// array comes with the text to state around it, where its glyphs would not read
+    /// back as what was written; see `Shaped::stated`.
     ///
     /// A `TJ` array cannot raise or lower a glyph, so marks that the font places above
     /// or below their base stay on the baseline here; `show` places them.
-    pub fn elements(&self, text: &str) -> Vec<Object> {
+    pub fn elements(&self, text: &str) -> Vec<(Option<String>, Vec<Object>)> {
         let Some(embedded) = &self.embedded else {
-            return vec![Object::String(
-                winansi(text).unwrap_or_default(),
-                lopdf::StringFormat::Literal,
+            return vec![(
+                None,
+                vec![Object::String(
+                    winansi(text).unwrap_or_default(),
+                    lopdf::StringFormat::Literal,
+                )],
             )];
         };
-        let mut out = Vec::new();
+        let mut out: Vec<(Option<String>, Vec<Object>)> = vec![(None, Vec::new())];
         let mut run: Vec<u8> = Vec::new();
         // How far the pen is from where the next glyph belongs.
         let mut owed = 0.0f64;
+        let mut stating = 0usize;
+        let close = |run: &mut Vec<u8>, out: &mut Vec<(Option<String>, Vec<Object>)>| {
+            if !run.is_empty() {
+                let glyphs = Object::String(std::mem::take(run), lopdf::StringFormat::Hexadecimal);
+                out.last_mut().expect("never empty").1.push(glyphs);
+            }
+        };
         for glyph in embedded.layout(text) {
+            if let Some((written, glyphs)) = glyph.stated {
+                close(&mut run, &mut out);
+                out.push((Some(written), Vec::new()));
+                stating = glyphs;
+            }
             owed += glyph.dx;
             if owed.abs() >= 0.5 {
-                if !run.is_empty() {
-                    out.push(Object::String(
-                        std::mem::take(&mut run),
-                        lopdf::StringFormat::Hexadecimal,
-                    ));
-                }
+                close(&mut run, &mut out);
                 // A positive number in the array moves the pen back.
-                out.push(Object::Real(-owed as f32));
+                let back = Object::Real(-owed as f32);
+                out.last_mut().expect("never empty").1.push(back);
                 owed = 0.0;
             }
             run.extend(glyph.glyph.to_be_bytes());
             owed += glyph.advance - glyph.dx - glyph.natural;
+            if stating > 0 {
+                stating -= 1;
+                if stating == 0 {
+                    close(&mut run, &mut out);
+                    out.push((None, Vec::new()));
+                }
+            }
         }
-        if !run.is_empty() {
-            out.push(Object::String(run, lopdf::StringFormat::Hexadecimal));
-        }
+        close(&mut run, &mut out);
         if owed.abs() >= 0.5 {
-            out.push(Object::Real(-owed as f32));
+            let back = Object::Real(-owed as f32);
+            out.last_mut().expect("never empty").1.push(back);
         }
+        out.retain(|(_, shown)| !shown.is_empty());
         out
     }
 
@@ -451,7 +516,18 @@ impl TextFont {
             }
             array.clear();
         };
+        // How many glyphs are still to come in the cluster whose text is stated.
+        let mut stating = 0usize;
         for glyph in embedded.layout(text) {
+            if let Some((written, glyphs)) = &glyph.stated {
+                flush(&mut array, &mut run, &mut out);
+                let utf16: String = written
+                    .encode_utf16()
+                    .map(|unit| format!("{unit:04X}"))
+                    .collect();
+                out.push(format!("/Span <</ActualText <FEFF{utf16}>>> BDC"));
+                stating = *glyphs;
+            }
             if (glyph.dy - rise).abs() >= 0.5 {
                 // The movement owed so far belongs before the rise changes.
                 if owed.abs() >= 0.5 {
@@ -477,6 +553,13 @@ impl TextFont {
             }
             run.extend(glyph.glyph.to_be_bytes());
             owed += glyph.advance - glyph.dx - glyph.natural;
+            if stating > 0 {
+                stating -= 1;
+                if stating == 0 {
+                    flush(&mut array, &mut run, &mut out);
+                    out.push("EMC".to_string());
+                }
+            }
         }
         if owed.abs() >= 0.5 {
             if !run.is_empty() {
@@ -1034,13 +1117,14 @@ fn embed(
     font.set("ToUnicode", to_unicode);
     Ok(TextFont {
         id: doc.add_object(font),
-        embedded: Some(Embedded {
+        embedded: Some(Box::new(Embedded {
             data,
             index,
             scale,
             subset,
             nominal,
-        }),
+            reads: reads.into_iter().collect(),
+        })),
         builtin: Style::default(),
         stand_ins: Vec::new(),
     })
@@ -1218,7 +1302,10 @@ mod tests {
             (moved / 10.0 - (apart - together)).abs() < 0.6,
             "{moved} {apart} {together}"
         );
-        assert_eq!(font.elements("AVAVAV").len(), shown.split(' ').count() - 1);
+        // Plain letters read back as they are: one array, with nothing stated around it.
+        let arrays = font.elements("AVAVAV");
+        assert!(arrays.len() == 1 && arrays[0].0.is_none());
+        assert_eq!(arrays[0].1.len(), shown.split(' ').count() - 1);
     }
 
     #[test]

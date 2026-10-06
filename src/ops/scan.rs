@@ -300,22 +300,6 @@ impl Findings {
     }
 }
 
-/// Decodes a PDF text string: UTF-16 with a byte order mark, otherwise one byte per character.
-fn text_of(bytes: &[u8]) -> String {
-    match bytes {
-        [0xFE, 0xFF, rest @ ..] => {
-            let units: Vec<u16> = rest
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|p| u16::from_be_bytes(*p))
-                .collect();
-            String::from_utf16_lossy(&units)
-        }
-        _ => bytes.iter().map(|&b| b as char).collect(),
-    }
-}
-
 fn excerpt(text: &str, limit: usize) -> String {
     let clean: String = text
         .chars()
@@ -410,10 +394,10 @@ fn file_target(dict: &Dict<'_>) -> Option<String> {
         ["UF", "F"]
             .iter()
             .find_map(|key| d.get::<LazyString<'_>>(key))
-            .map(|s| text_of(&s))
+            .map(|s| doc::text_string(&s))
     };
     match dict.get::<LazyObject<'_>>("F")? {
-        LazyObject::String(s) => Some(text_of(&s)),
+        LazyObject::String(s) => Some(doc::text_string(&s)),
         LazyObject::Dict(spec) => name(&spec),
         _ => None,
     }
@@ -542,8 +526,8 @@ impl Walker<'_> {
 
     fn javascript(&mut self, dict: &Dict<'_>, id: Option<i32>) {
         let script = match dict.get::<LazyObject<'_>>("JS") {
-            Some(LazyObject::String(s)) => Some(text_of(&s)),
-            Some(LazyObject::Stream(s)) => head(&s, 4096).map(|b| text_of(&b)),
+            Some(LazyObject::String(s)) => Some(doc::text_string(&s)),
+            Some(LazyObject::Stream(s)) => head(&s, 4096).map(|b| doc::text_string(&b)),
             _ => None,
         };
         let sample = script.map(|s| json!({"script": excerpt(&s, 200)}));
@@ -566,7 +550,7 @@ impl Walker<'_> {
                 if let Some(win) = dict.get::<Dict<'_>>("Win") {
                     for (name, key) in [("program", "F"), ("parameters", "P")] {
                         if let Some(value) = win.get::<LazyString<'_>>(key) {
-                            sample[name] = json!(excerpt(&text_of(&value), 200));
+                            sample[name] = json!(excerpt(&doc::text_string(&value), 200));
                         }
                     }
                 }
@@ -575,7 +559,7 @@ impl Walker<'_> {
             b"URI" => {
                 let uri = dict
                     .get::<LazyString<'_>>("URI")
-                    .map(|u| text_of(&u))
+                    .map(|u| doc::text_string(&u))
                     .unwrap_or_default();
                 let lower = uri.trim_start().to_lowercase();
                 if lower.starts_with("javascript:") {
@@ -649,7 +633,7 @@ impl Walker<'_> {
         let name = ["UF", "F"]
             .iter()
             .find_map(|key| spec.get::<LazyString<'_>>(key))
-            .map(|s| text_of(&s))
+            .map(|s| doc::text_string(&s))
             .unwrap_or_default();
         let stream = spec.get::<Dict<'_>>("EF").and_then(|ef| {
             ["UF", "F", "DOS", "Mac", "Unix"]
@@ -954,6 +938,48 @@ struct Hidden {
 /// The reason given to invisible text that lies over something visible.
 const LAYER: &str = "invisible, over visible content";
 
+/// Whether text stated for glyphs is something else than the glyphs read as.
+///
+/// A file may state the text of what it draws, and readers take its word for it: the
+/// page shows one thing and hands over another. Shaping gives honest reasons to state
+/// text, a ligature or a reordered vowel sign, and then the letters are still those of
+/// the glyphs. Here most of them are not. Glyphs that read as nothing cannot be compared.
+fn restated(stated: &str, drawn: &str) -> bool {
+    let letters = |text: &str| -> Vec<char> {
+        text.chars()
+            .flat_map(|c| match c {
+                '\u{fb00}' => "ff".chars().collect::<Vec<_>>(),
+                '\u{fb01}' => "fi".chars().collect(),
+                '\u{fb02}' => "fl".chars().collect(),
+                '\u{fb03}' => "ffi".chars().collect(),
+                '\u{fb04}' => "ffl".chars().collect(),
+                '\u{fb05}' | '\u{fb06}' => "st".chars().collect(),
+                c => c.to_lowercase().collect(),
+            })
+            .filter(|c| c.is_alphanumeric())
+            .collect()
+    };
+    let (stated, drawn) = (letters(stated), letters(drawn));
+    if stated.len() < 3 || drawn.is_empty() {
+        return false;
+    }
+    // Letter for letter: one that is drawn once answers for one that is stated once.
+    let mut left: HashMap<char, usize> = HashMap::new();
+    for c in drawn {
+        *left.entry(c).or_default() += 1;
+    }
+    let shared = stated
+        .iter()
+        .filter(|c| {
+            left.get_mut(c)
+                .filter(|n| **n > 0)
+                .map(|n| *n -= 1)
+                .is_some()
+        })
+        .count();
+    shared * 2 < stated.len()
+}
+
 /// Why each word of a page cannot be seen, judged from the rendered page.
 ///
 /// A word that leaves no trace in the picture is hidden, whatever hides it: the
@@ -1022,6 +1048,12 @@ fn hidden_on(page: &hayro::hayro_syntax::page::Page<'_>, number: u32) -> Vec<Hid
             "too small to read"
         } else if word.invisible {
             if shows(b) { LAYER } else { "invisible" }
+        } else if word
+            .drawn
+            .as_ref()
+            .is_some_and(|drawn| restated(&word.text, drawn))
+        {
+            "stated to read as something else than is drawn"
         // Punctuation alone has too little ink to judge by. Neither can a word be judged
         // whose font this renderer cannot draw, or one under something translucent, which
         // a viewer shows through whatever the picture here says.
@@ -1466,8 +1498,10 @@ pub fn scan(a: ScanArgs) -> Result<Value> {
         checked.push(
             "text that leaves no trace in the rendered page: invisible, without contrast, covered by a flat shape, clipped, tiny or off the page",
         );
+        checked.push("text stated to read as something else than its glyphs do");
         not_checked.push("text hidden under a picture or pattern that is not a flat colour");
         not_checked.push("text inside annotations and form fields, and text they cover");
+        not_checked.push("text stated for glyphs that read as nothing by their font");
         not_checked.push("text under translucent or blended drawing, and text in fonts that cannot be drawn here");
     } else {
         not_checked.push("hidden text");
