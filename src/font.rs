@@ -259,9 +259,11 @@ impl Embedded {
             }
             if out.len() - from > 1 {
                 // Within a cluster the order of drawing is free, and a reader takes the
-                // text to end where the glyph drawn last does. A mark set back under its
-                // letter would end the cluster short of the letter, and what follows
-                // would seem a word apart: the glyph reaching furthest is drawn last.
+                // text to end where the glyph drawn last does, by the width the font
+                // states for it. A mark set back under its letter would end the cluster
+                // short of the letter, and one that the font gives a width of its own
+                // beyond it; either way what follows would seem a word apart. The glyph
+                // that ends nearest to where the cluster does is drawn last.
                 let total: f64 = out[from..].iter().map(|g| g.advance).sum();
                 let mut pen = 0.0;
                 let mut placed: Vec<(f64, Shaped)> = out
@@ -272,7 +274,15 @@ impl Embedded {
                         (at, g)
                     })
                     .collect();
-                placed.sort_by(|a, b| (a.0 + a.1.natural).total_cmp(&(b.0 + b.1.natural)));
+                let short = |glyph: &(f64, Shaped)| (glyph.0 + glyph.1.natural - total).abs();
+                if let Some(last) = (0..placed.len()).min_by(|&a, &b| {
+                    short(&placed[a])
+                        .total_cmp(&short(&placed[b]))
+                        .then(b.cmp(&a))
+                }) {
+                    let glyph = placed.remove(last);
+                    placed.push(glyph);
+                }
                 let (mut pen, last) = (0.0, placed.len() - 1);
                 for (k, (at, mut glyph)) in placed.into_iter().enumerate() {
                     glyph.dx = at - pen;
