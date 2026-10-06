@@ -328,19 +328,35 @@ fn marked_content(page: &Page<'_>, annotations: bool) -> Vec<Marked> {
             .iter()
             .any(|stream| stream.decoded().is_ok_and(|data| states(&data)));
     let mut out = Vec::new();
+    // A form may show others, and those others again: the work is counted, so that a
+    // file built to multiply it is given up on, and its page read from its glyphs.
+    let mut forms = 0;
     if any {
-        walk(page.typed_operations(), page.resources(), 0, &mut out);
+        walk(
+            page.typed_operations(),
+            page.resources(),
+            0,
+            &mut forms,
+            &mut out,
+        );
         for stream in &appearances {
-            form(stream, page.resources(), 0, &mut out);
+            form(stream, page.resources(), 0, &mut forms, &mut out);
         }
     }
     out
 }
 
 /// Adds the marked content of a form to `out`, if the interpreter would draw it.
-fn form(stream: &Stream<'_>, resources: &Resources<'_>, depth: u32, out: &mut Vec<Marked>) {
+fn form(
+    stream: &Stream<'_>,
+    resources: &Resources<'_>,
+    depth: u32,
+    forms: &mut usize,
+    out: &mut Vec<Marked>,
+) {
     let dict = stream.dict();
-    if depth > 16 || dict.get::<[f32; 4]>(b"BBox").is_none() {
+    *forms += 1;
+    if depth > 16 || *forms > 2000 || dict.get::<[f32; 4]>(b"BBox").is_none() {
         return;
     }
     let Ok(data) = stream.decoded() else {
@@ -351,11 +367,18 @@ fn form(stream: &Stream<'_>, resources: &Resources<'_>, depth: u32, out: &mut Ve
         TypedIter::new(&data),
         own.as_ref().unwrap_or(resources),
         depth + 1,
+        forms,
         out,
     );
 }
 
-fn walk(mut ops: TypedIter<'_>, resources: &Resources<'_>, depth: u32, out: &mut Vec<Marked>) {
+fn walk(
+    mut ops: TypedIter<'_>,
+    resources: &Resources<'_>,
+    depth: u32,
+    forms: &mut usize,
+    out: &mut Vec<Marked>,
+) {
     while let Some(op) = ops.next() {
         match op {
             TypedInstruction::BeginMarkedContentWithProperties(begin) => {
@@ -380,7 +403,7 @@ fn walk(mut ops: TypedIter<'_>, resources: &Resources<'_>, depth: u32, out: &mut
                         .is_some_and(|kind| kind.as_ref() == b"Form")
                 });
                 if let Some(stream) = drawn {
-                    form(&stream, resources, depth, out);
+                    form(&stream, resources, depth, forms, out);
                 }
             }
             _ => {}
