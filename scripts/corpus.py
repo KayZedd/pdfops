@@ -76,6 +76,7 @@ def examine(pdfops, path, scratch):
         "split": ["split", path, "--every", "5000", "-o", os.path.join(work, "parts")],
         "rotate": ["rotate", path, "-a", "90", "-o", out],
         "stamp": ["stamp", path, "-t", "DRAFT {page}/{pages}", "-o", out],
+        "stamp-at": ["stamp", path, "-t", "Checked\nby pdfops", "--x", "72", "--y", "72", "-o", out],
         "set-meta": ["set-meta", path, "--title", "Corpus", "-o", out],
         "compress": ["compress", path, "-o", out],
         "encrypt": ["encrypt", path, "--owner-password", "o", "-o", out],
@@ -86,7 +87,7 @@ def examine(pdfops, path, scratch):
     if IDENTITY:
         commands["sign"] = ["sign", path, "--cert", IDENTITY[0], "--key", IDENTITY[1], "--visible", "1:50,50,250,110",
                             "-o", out]
-    writes = {"pages", "merge", "rotate", "stamp", "set-meta", "compress", "encrypt", "annotate", "redact",
+    writes = {"pages", "merge", "rotate", "stamp", "stamp-at", "set-meta", "compress", "encrypt", "annotate", "redact",
               "replace", "sign", "sanitize"}
     input_sound = None
     findings = []

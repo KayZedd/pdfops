@@ -38,6 +38,9 @@ pub struct TextArgs {
     /// Stop after this many characters in total; the result says where to resume
     #[arg(long)]
     pub max_chars: Option<usize>,
+    /// Skip this many characters of the first page read: the resume_at_char of the result that cut that page
+    #[arg(long)]
+    pub from_char: Option<usize>,
     /// Run OCR on pages that have no extractable text, such as scans (needs tesseract)
     #[arg(long)]
     #[serde(default)]
@@ -268,31 +271,33 @@ pub fn text(a: TextArgs) -> Result<Value> {
             }
         }
     }
-    for (n, res) in texts {
+    for (i, (n, res)) in texts.into_iter().enumerate() {
+        // Only the page a previous call was cut in is entered part-way.
+        let from = if i == 0 { a.from_char.unwrap_or(0) } else { 0 };
         if budget == 0 {
-            resume = Some(n);
+            resume = Some((n, from));
             break;
         }
         match res {
             Ok(t) => {
                 let t = t.trim();
-                let chars = t.chars().count();
+                let chars = t.chars().count().saturating_sub(from);
                 let cut = chars > budget;
-                let shown: String = if cut {
-                    t.chars().take(budget).collect()
-                } else {
-                    t.to_string()
-                };
-                chars_total += chars.min(budget);
-                budget -= chars.min(budget);
+                let shown: String = t.chars().skip(from).take(budget).collect();
+                let taken = chars.min(budget);
+                chars_total += taken;
+                budget -= taken;
                 let mut page = json!({"page": n, "text": shown, "truncated": cut});
+                if from > 0 {
+                    page["from_char"] = json!(from);
+                }
                 if recognised.contains(&n) {
                     page["ocr"] = json!(true);
                 }
                 out.push(page);
                 if cut {
                     // The rest of this page was dropped, so it is where reading resumes.
-                    resume = Some(n);
+                    resume = Some((n, from + taken));
                     break;
                 }
             }
@@ -304,7 +309,8 @@ pub fn text(a: TextArgs) -> Result<Value> {
         "total_pages": total,
         "chars": chars_total,
         "pages": out,
-        "resume_at_page": resume,
+        "resume_at_page": resume.map(|r| r.0),
+        "resume_at_char": resume.map(|r| r.1),
     }))
 }
 

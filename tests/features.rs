@@ -215,6 +215,152 @@ fn stamp_places_images_with_transparency() {
 }
 
 #[test]
+fn stamp_puts_lines_of_text_at_a_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 1);
+    let out = dir.path().join("out.pdf");
+    call(
+        "pdf_stamp",
+        json!({"input": pdf, "output": out, "text": "First added\nSecond", "x": 100, "y": 300, "size": 12}),
+    );
+    let w = words(&out, 1);
+    let of = |text: &str| w.iter().find(|w| w.0 == text).unwrap().1;
+    // The box layout reports for the first line starts at the point given; the second
+    // line follows 1.2 times the size further down, at the same left edge.
+    let (first, second) = (of("First"), of("Second"));
+    assert!(
+        (first[0] - 100.0).abs() < 0.1 && (first[1] - 300.0).abs() < 0.1,
+        "{first:?}"
+    );
+    assert!(
+        (second[0] - 100.0).abs() < 0.1 && (second[1] - 314.4).abs() < 0.1,
+        "{second:?}"
+    );
+    assert!(texts(&out)[0].contains("alpha-1"));
+
+    // The right end of each line at the point.
+    call(
+        "pdf_stamp",
+        json!({"input": pdf, "output": out, "text": "Sum\n1 250,00", "x": 500, "y": 300, "align": "right"}),
+    );
+    let w = words(&out, 1);
+    let ends: Vec<f64> = ["Sum", "250,00"]
+        .iter()
+        .map(|t| w.iter().find(|w| w.0 == *t).unwrap().1[2])
+        .collect();
+    assert!(ends.iter().all(|e| (e - 500.0).abs() < 0.1), "{ends:?}");
+
+    for (args, said) in [
+        (
+            json!({"text": "x", "x": 1, "y": 1, "position": "footer"}),
+            "position",
+        ),
+        (
+            json!({"text": "x", "x": 1, "y": 1, "below": "Page"}),
+            "one place",
+        ),
+        (json!({"text": "x", "gap": 3}), "gap"),
+        (json!({"text": "a\nb"}), "watermark is one line"),
+    ] {
+        let mut args = args;
+        args["input"] = json!(pdf);
+        args["output"] = json!(out);
+        let e = call_err("pdf_stamp", args);
+        assert!(e.contains(said), "{e}");
+    }
+}
+
+#[test]
+fn stamp_goes_under_or_over_a_found_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 3);
+    let out = dir.path().join("out.pdf");
+    let keyword = words(&pdf, 2)
+        .into_iter()
+        .find(|w| w.0 == "Keyword")
+        .unwrap()
+        .1;
+
+    // Only page 2 holds the text, so only page 2 is stamped.
+    let v = call(
+        "pdf_stamp",
+        json!({"input": pdf, "output": out, "text": "Added line", "below": "keyword alpha-2"}),
+    );
+    assert_eq!(v["stamped_pages"], json!([2]), "{v}");
+    assert_eq!(v["placed_by"][0]["matches"], 1, "{v}");
+    // Nothing is on the page under the new line, and the result says so.
+    assert_eq!(v["placed_by"][0]["words_under_it"], 0, "{v}");
+    let added = words(&out, 2)
+        .into_iter()
+        .find(|w| w.0 == "Added")
+        .unwrap()
+        .1;
+    // Left edges in line, and a fifth of the 10 point size between the two boxes.
+    assert!(
+        (added[0] - keyword[0]).abs() < 0.1 && (added[1] - keyword[3] - 2.0).abs() < 0.1,
+        "{added:?} {keyword:?}"
+    );
+    assert!(!texts(&out)[0].contains("Added") && !texts(&out)[2].contains("Added"));
+
+    // Over the text, two lines end the given distance above it.
+    let v = call(
+        "pdf_stamp",
+        json!({"input": pdf, "output": out, "text": "Upper\nLower", "above": "Keyword", "gap": 5, "pages": "2-3"}),
+    );
+    assert_eq!(v["stamped_pages"], json!([2, 3]), "{v}");
+    assert_eq!(v["placed_by"][1]["page"], 3, "{v}");
+    let w = words(&out, 2);
+    let lower = w.iter().find(|w| w.0 == "Lower").unwrap().1;
+    let upper = w.iter().find(|w| w.0 == "Upper").unwrap().1;
+    assert!(
+        (lower[3] - (keyword[1] - 5.0)).abs() < 0.1 && (lower[1] - upper[1] - 12.0).abs() < 0.1,
+        "{upper:?} {lower:?} {keyword:?}"
+    );
+
+    // An image is placed the same way.
+    let png = dir.path().join("mark.png");
+    png_with_alpha(&png);
+    call(
+        "pdf_stamp",
+        json!({"input": pdf, "output": out, "image": png, "below": "Keyword", "width": 40, "gap": 10, "pages": "1"}),
+    );
+    let (left, top) = (keyword[0].round() as usize, keyword[3] + 10.0);
+    let bottom_up = (792.0 - top - 40.0).round() as usize;
+    let [inside] = ink(
+        &out,
+        dir.path(),
+        [[left, bottom_up, left + 20, bottom_up + 40]],
+    );
+    assert!(inside > 600, "{inside}");
+
+    // A stamp drawn across the text it was placed by counts the words it covers.
+    let v = call(
+        "pdf_stamp",
+        json!({"input": pdf, "output": out, "text": "Across", "below": "Keyword", "gap": -12, "pages": "1", "dry_run": true}),
+    );
+    assert_eq!(v["placed_by"][0]["words_under_it"], 1, "{v}");
+
+    let e = call_err(
+        "pdf_stamp",
+        json!({"input": pdf, "output": out, "text": "x", "below": "no such text"}),
+    );
+    assert!(e.contains("was not found"), "{e}");
+}
+
+#[test]
+fn replace_refuses_a_line_break_and_names_the_command_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 1);
+    let out = dir.path().join("out.pdf");
+    let e = call_err(
+        "pdf_replace",
+        json!({"input": pdf, "output": out, "find": "Keyword", "with": "Keyword\nmore"}),
+    );
+    assert!(e.contains("line break") && e.contains("pdf_stamp"), "{e}");
+    assert!(!out.exists());
+}
+
+#[test]
 fn stamp_draws_qr_codes() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out.pdf");

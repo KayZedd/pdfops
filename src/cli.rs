@@ -104,6 +104,8 @@ enum Command {
     /// Draw text (watermark, header, footer, page numbers), an image such as a signature, or a QR code
     ///
     /// Latin-1 text uses the built-in Helvetica and embeds nothing. Other text is drawn with a subset of the given font, or of installed fonts, and is shaped; what a given font lacks, installed ones draw.
+    ///
+    /// Without a place, text is a watermark, a header or a footer, and an image or QR code sits at a corner. With a place, any of them goes to a point given in the positions layout reports, or under or over the first match of a text on each page, left edges in line: that adds a line beneath a heading or a total without measuring anything. Lines of text are 1.2 times the font size apart. Nothing already on the page moves aside; where the stamp was placed by a found text, the result gives its box and the number of words lying under it.
     Stamp(edit::StampArgs),
     /// Add a highlight, underline, strike-out, box, note or link, on found text or on an area
     Annotate(annotate::AnnotateArgs),

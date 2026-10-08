@@ -45,6 +45,45 @@ fn text_selects_pages_and_respects_budget() {
 }
 
 #[test]
+fn text_resumes_inside_a_page_larger_than_the_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = sample(dir.path(), "a.pdf", 2);
+    let whole = texts(&pdf);
+    // A budget smaller than either page: following the two markers reads all of both.
+    let (mut page, mut from) = (json!(1), json!(0));
+    let mut read = vec![String::new(); 2];
+    let mut calls = 0;
+    while !page.is_null() {
+        let v = call(
+            "pdf_text",
+            json!({"input": pdf, "pages": format!("{page}-"), "max_chars": 9, "from_char": from}),
+        );
+        assert_eq!(
+            v["chars"],
+            9.min(whole.concat().len() - read.concat().len())
+        );
+        for p in v["pages"].as_array().unwrap() {
+            read[p["page"].as_u64().unwrap() as usize - 1] += p["text"].as_str().unwrap();
+        }
+        (page, from) = (v["resume_at_page"].clone(), v["resume_at_char"].clone());
+        calls += 1;
+        assert!(calls < 20, "reading does not advance: {v}");
+    }
+    assert_eq!(read, whole);
+    assert!(calls > 4);
+
+    // The characters skipped are those of the first page read only.
+    let v = call(
+        "pdf_text",
+        json!({"input": pdf, "from_char": 5, "max_chars": 1000}),
+    );
+    assert_eq!(v["pages"][0]["text"], whole[0][5..]);
+    assert_eq!(v["pages"][0]["from_char"], 5);
+    assert_eq!(v["pages"][1]["text"], whole[1]);
+    assert!(v["resume_at_page"].is_null() && v["resume_at_char"].is_null());
+}
+
+#[test]
 fn search_finds_literals_and_regexes() {
     let dir = tempfile::tempdir().unwrap();
     let pdf = sample(dir.path(), "a.pdf", 5);

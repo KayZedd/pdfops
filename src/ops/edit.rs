@@ -1,6 +1,6 @@
 //! Commands that modify a document in place: rotate, set-meta, encrypt, decrypt, compress, stamp.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::font::TextFont;
-use crate::ops::lossy;
+use crate::ops::{layout, lossy, redact};
 use crate::{doc, pagespec};
 
 #[derive(Args, Deserialize, JsonSchema, Debug)]
@@ -162,7 +162,7 @@ pub struct StampArgs {
     /// Where to write the result (may be the input file)
     #[arg(short, long)]
     pub output: PathBuf,
-    /// Text to draw; {page} and {pages} expand to the page number and page count
+    /// Text to draw; {page} and {pages} expand to the page number and page count, and a line break starts a new line
     #[arg(short, long)]
     pub text: Option<String>,
     /// PNG or JPEG file to draw instead of text, e.g. a signature scan or a company seal; PNG transparency is kept
@@ -171,25 +171,34 @@ pub struct StampArgs {
     /// Content of a QR code to draw instead of text, e.g. a URL
     #[arg(long)]
     pub qr: Option<String>,
-    /// Where text is drawn (default: watermark)
+    /// Where text is drawn when no place is given (default: watermark)
     #[arg(long, value_enum)]
     pub position: Option<StampPosition>,
     /// Corner or centre an image or QR code is placed at (default: bottom-right)
     #[arg(long, value_enum)]
     pub anchor: Option<Anchor>,
-    /// Left edge of an image or QR code in points from the page's left edge; with y, overrides anchor
+    /// Left edge of the text, image or QR code in points from the page's left edge; with y, overrides anchor
     #[arg(long)]
     pub x: Option<f64>,
-    /// Top edge of an image or QR code in points from the page's top edge, as reported by layout
+    /// Top edge of the text, image or QR code in points from the page's top edge, as reported by layout; for text, the top of its first line
     #[arg(long)]
     pub y: Option<f64>,
+    /// Text to find on each page: the stamp goes under its first match there, left edges in line, and pages without it are left alone
+    #[arg(long)]
+    pub below: Option<String>,
+    /// Text to find on each page: the stamp goes over its first match there, left edges in line, and pages without it are left alone
+    #[arg(long)]
+    pub above: Option<String>,
+    /// Distance between the found text and the stamp in points (default: a fifth of the font size for text, otherwise 2)
+    #[arg(long)]
+    pub gap: Option<f64>,
     /// Width of an image or QR code in points; height follows the aspect ratio (default: 120, QR 80)
     #[arg(long)]
     pub width: Option<f64>,
     /// Distance from the page edges when placing by anchor, in points (default: 24)
     #[arg(long)]
     pub margin: Option<f64>,
-    /// Horizontal alignment for header and footer (default: center)
+    /// Horizontal alignment for header and footer (default: center); for text at a place, the part of each line that sits there (default: left)
     #[arg(long, value_enum)]
     pub align: Option<Align>,
     /// Font size in points (default: 10, or fitted to the page for a watermark)
@@ -572,6 +581,15 @@ fn qr_ops(content: &str, x: f64, y: f64, side: f64) -> Result<String> {
 }
 
 /// What a stamp draws.
+/// What a page holds for a stamp placed by a text found on it.
+struct Found {
+    /// The box of the first match.
+    area: [f64; 4],
+    matches: usize,
+    /// The boxes of the words already on the page.
+    words: Vec<[f64; 4]>,
+}
+
 enum Mark {
     Text(TextFont, String),
     Image(ObjectId, f64),
@@ -588,19 +606,68 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
         bail!("give exactly one of text, image or qr");
     }
     let position = a.position.unwrap_or(StampPosition::Watermark);
-    let align = a.align.unwrap_or(Align::Center);
     let watermark = a.text.is_some() && position == StampPosition::Watermark;
-    let opacity = a.opacity.unwrap_or(if watermark { 0.25 } else { 1.0 });
-    if !(0.0..=1.0).contains(&opacity) {
-        bail!("opacity must be between 0 and 1");
-    }
     if a.size.is_some_and(|s| s <= 0.0) || a.width.is_some_and(|w| w <= 0.0) {
         bail!("size and width must be positive");
     }
     if a.x.is_some() != a.y.is_some() {
         bail!("give both x and y, or neither");
     }
+    let by_text = a.below.as_ref().or(a.above.as_ref());
+    if [a.x.is_some(), a.below.is_some(), a.above.is_some()]
+        .iter()
+        .filter(|given| **given)
+        .count()
+        > 1
+    {
+        bail!("give one place: x and y, below, or above");
+    }
+    let placed = a.x.is_some() || by_text.is_some();
+    if placed && a.position.is_some() {
+        bail!("position is for text without a place; leave it out with x and y, below or above");
+    }
+    if a.gap.is_some() && by_text.is_none() {
+        bail!("gap is the distance from a found text; give below or above with it");
+    }
+    let watermark = watermark && !placed;
+    if watermark && a.text.as_ref().is_some_and(|t| t.contains('\n')) {
+        bail!(
+            "a watermark is one line; give header or footer as the position, or a place, for text with line breaks"
+        );
+    }
+    let opacity = a.opacity.unwrap_or(if watermark { 0.25 } else { 1.0 });
+    if !(0.0..=1.0).contains(&opacity) {
+        bail!("opacity must be between 0 and 1");
+    }
     let [r, g, b] = parse_color(a.color.as_deref().unwrap_or("000000"))?;
+
+    let mut found: HashMap<u32, Found> = HashMap::new();
+    if let Some(text) = by_text {
+        let patterns = redact::compile(std::slice::from_ref(text), false, false)?;
+        if patterns.is_empty() {
+            bail!("the text to find is empty");
+        }
+        let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
+        let total = pdf.pages().len() as u32;
+        for n in pagespec::parse_or_all(a.pages.as_deref(), total)? {
+            let scanned = layout::scan(&pdf.pages()[n as usize - 1]);
+            let matches = redact::text_areas(&scanned, &patterns);
+            if let Some(first) = matches.first() {
+                let words = scanned.words.iter().map(|w| w.bbox).collect();
+                found.insert(
+                    n,
+                    Found {
+                        area: first.0,
+                        matches: matches.len(),
+                        words,
+                    },
+                );
+            }
+        }
+        if found.is_empty() {
+            bail!("'{text}' was not found; nothing was written");
+        }
+    }
 
     let mut d = doc::load(&a.input, a.password.as_deref())?;
     let ids = doc::page_ids(&d);
@@ -610,7 +677,11 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
     let mark = if let Some(text) = &a.text {
         // Page numbers are substituted per page, so the font must cover digits too.
         Mark::Text(
-            TextFont::new(&mut d, &format!("{text}0123456789"), a.font.as_deref())?,
+            TextFont::new(
+                &mut d,
+                &format!("{}0123456789", text.replace(['\r', '\n'], " ")),
+                a.font.as_deref(),
+            )?,
             text.clone(),
         )
     } else if let Some(path) = &a.image {
@@ -630,6 +701,16 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
     let mut unique = pages.clone();
     unique.sort_unstable();
     unique.dedup();
+    if by_text.is_some() {
+        unique.retain(|n| found.contains_key(n));
+    }
+    let text_size = a.size.unwrap_or(10.0);
+    let gap = a.gap.unwrap_or(if a.text.is_some() {
+        0.2 * text_size
+    } else {
+        2.0
+    });
+    let mut places = Vec::new();
     for &n in &unique {
         let id = ids[n as usize - 1];
         let (m, vw, vh) = visual_space(doc::page_box(&d, id), doc::rotation(&d, id));
@@ -640,17 +721,29 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
             m[0], m[1], m[2], m[3], m[4], m[5]
         );
 
+        // A given place: the left edge, then the top edge of the stamp, or its bottom edge
+        // when it goes over a found text.
+        let spot = match (a.x, a.y, found.get(&n)) {
+            (Some(x), Some(y), _) => Some((x, y, false)),
+            (_, _, Some(f)) if a.above.is_some() => Some((f.area[0], f.area[1] - gap, true)),
+            (_, _, Some(f)) => Some((f.area[0], f.area[3] + gap, false)),
+            _ => None,
+        };
+        // What the stamp takes up, from the top-left corner of the page.
+        let mut taken = [0.0; 4];
+        // Where the top-left corner of a stamp of this height comes to lie.
+        let corner = |height: f64| spot.map(|(x, y, over)| (x, if over { y - height } else { y }));
         // Images and QR codes: a box placed by anchor or by its top-left corner, in upright page space.
         let place = |ratio: f64, default_width: f64| {
             let width = a.width.unwrap_or(default_width);
             let height = width * ratio;
-            let (x, top) = match (a.x, a.y, a.anchor.unwrap_or(Anchor::BottomRight)) {
-                (Some(x), Some(y), _) => (x, y),
-                (_, _, Anchor::TopLeft) => (margin, margin),
-                (_, _, Anchor::TopRight) => (vw - margin - width, margin),
-                (_, _, Anchor::BottomLeft) => (margin, vh - margin - height),
-                (_, _, Anchor::BottomRight) => (vw - margin - width, vh - margin - height),
-                (_, _, Anchor::Center) => ((vw - width) / 2.0, (vh - height) / 2.0),
+            let (x, top) = match (corner(height), a.anchor.unwrap_or(Anchor::BottomRight)) {
+                (Some(at), _) => at,
+                (_, Anchor::TopLeft) => (margin, margin),
+                (_, Anchor::TopRight) => (vw - margin - width, margin),
+                (_, Anchor::BottomLeft) => (margin, vh - margin - height),
+                (_, Anchor::BottomRight) => (vw - margin - width, vh - margin - height),
+                (_, Anchor::Center) => ((vw - width) / 2.0, (vh - height) / 2.0),
             };
             // Content space has its origin at the bottom-left.
             (x, vh - top - height, width, height)
@@ -659,10 +752,12 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
             Mark::Image(image, ratio) => {
                 let name = add_resource(&d, &mut res, "XObject", "PdfopsIm", *image);
                 let (x, y, width, height) = place(*ratio, 120.0);
+                taken = [x, vh - y - height, x + width, vh - y];
                 ops += &format!("{width:.2} 0 0 {height:.2} {x:.2} {y:.2} cm\n/{name} Do\n");
             }
             Mark::Qr(content) => {
                 let (x, y, side, _) = place(1.0, 80.0);
+                taken = [x, vh - y - side, x + side, vh - y];
                 ops += &qr_ops(content, x, y, side)?;
             }
             Mark::Text(font, template) => {
@@ -674,7 +769,7 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
                 let text = template
                     .replace("{pages}", &total.to_string())
                     .replace("{page}", &n.to_string());
-                let size = if watermark {
+                if watermark {
                     // Fit the text to 70% of the diagonal unless a size was requested.
                     let size = a.size.unwrap_or_else(|| {
                         (0.7 * vw.hypot(vh) / font.width(&text, 1.0).max(0.001)).clamp(8.0, 144.0)
@@ -687,32 +782,80 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
                         vh / 2.0
                     );
                     ops += &format!(
-                        "BT\n1 0 0 1 {:.2} {:.2} Tm\n",
+                        "BT\n1 0 0 1 {:.2} {:.2} Tm\n{r:.3} {g:.3} {b:.3} rg\n{}\nET\n",
                         -font.width(&text, size) / 2.0,
-                        -size * 0.35
+                        -size * 0.35,
+                        font.show_named(&names, &text, size)
                     );
-                    size
                 } else {
-                    let size = a.size.unwrap_or(10.0);
-                    let width = font.width(&text, size);
-                    let x = match align {
-                        Align::Left => margin,
-                        Align::Center => (vw - width) / 2.0,
-                        Align::Right => vw - margin - width,
+                    let size = text_size;
+                    let lines: Vec<&str> = text.lines().collect();
+                    let leading = 1.2 * size;
+                    let below_first = lines.len().saturating_sub(1) as f64 * leading;
+                    // The baseline of the first line, from the bottom of the page. A line's box
+                    // is the one layout reports: four fifths of the size over the baseline.
+                    let (first, at) = match corner(size + below_first) {
+                        Some((x, top)) => (vh - top - 0.8 * size, Some(x)),
+                        None if position == StampPosition::Header => {
+                            (vh - margin - size * 0.72, None)
+                        }
+                        None => (margin + below_first, None),
                     };
-                    let y = if position == StampPosition::Header {
-                        vh - margin - size * 0.72
-                    } else {
-                        margin
-                    };
-                    ops += &format!("BT\n1 0 0 1 {x:.2} {y:.2} Tm\n");
-                    size
-                };
-                ops += &format!(
-                    "{r:.3} {g:.3} {b:.3} rg\n{}\nET\n",
-                    font.show_named(&names, &text, size)
-                );
+                    let top = vh - first - 0.8 * size;
+                    taken = [
+                        f64::INFINITY,
+                        top,
+                        f64::NEG_INFINITY,
+                        top + size + below_first,
+                    ];
+                    ops += &format!("BT\n{r:.3} {g:.3} {b:.3} rg\n");
+                    for (i, line) in lines.iter().enumerate() {
+                        let width = font.width(line, size);
+                        let x = match (at, a.align) {
+                            (Some(x), None | Some(Align::Left)) => x,
+                            (Some(x), Some(Align::Center)) => x - width / 2.0,
+                            (Some(x), Some(Align::Right)) => x - width,
+                            (None, Some(Align::Left)) => margin,
+                            (None, None | Some(Align::Center)) => (vw - width) / 2.0,
+                            (None, Some(Align::Right)) => vw - margin - width,
+                        };
+                        taken[0] = taken[0].min(x);
+                        taken[2] = taken[2].max(x + width);
+                        if !line.trim().is_empty() {
+                            ops += &format!(
+                                "1 0 0 1 {x:.2} {:.2} Tm\n{}\n",
+                                first - i as f64 * leading,
+                                font.show_named(&names, line, size)
+                            );
+                        }
+                    }
+                    ops += "ET\n";
+                }
             }
+        }
+        if let Some(Found {
+            area,
+            matches,
+            words,
+        }) = found.get(&n)
+        {
+            // Nothing on the page moves aside for a stamp, so say what it was drawn across.
+            let covered = words
+                .iter()
+                .filter(|w| {
+                    w[0] < taken[2]
+                        && taken[0] < w[2]
+                        && w[1] < taken[3] - 0.5
+                        && taken[1] + 0.5 < w[3]
+                })
+                .count();
+            places.push(json!({
+                "page": n,
+                "found_at": redact::round_box(area),
+                "matches": matches,
+                "bbox": redact::round_box(&taken),
+                "words_under_it": covered,
+            }));
         }
         append_content(&mut d, id, open_id, ops + "Q\n", res)?;
     }
@@ -721,6 +864,7 @@ pub fn stamp(a: StampArgs) -> Result<Value> {
         "output": a.output,
         "dry_run": a.dry_run,
         "stamped_pages": unique,
+        "placed_by": places,
         "size_bytes": size,
     }))
 }

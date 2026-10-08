@@ -2697,6 +2697,11 @@ pub fn replace(a: ReplaceArgs) -> Result<Value> {
     if a.find.is_empty() {
         bail!("the text to find is empty");
     }
+    if a.with.contains('\n') {
+        bail!(
+            "the new text has a line break, and replace keeps text on its line; nothing was written. To add a line under a text, use `pdfops stamp --below` (MCP tool pdf_stamp, below)"
+        );
+    }
     let patterns = compile(std::slice::from_ref(&a.find), a.regex, a.case_sensitive)?;
     let (pdf, _) = doc::open_lazy(&a.input, a.password.as_deref())?;
     let total = pdf.pages().len() as u32;

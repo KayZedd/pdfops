@@ -137,7 +137,7 @@ pdfops ocr-install --engine          # install tesseract itself where that needs
 | | `pages` | Keep, reorder, duplicate or delete pages |
 | | `split` | Split by page count or by ranges |
 | **Edit** | `rotate` | Rotate pages by multiples of 90 degrees |
-| | `stamp` | Watermark, header, footer, page numbers, an image such as a signature, or a QR code |
+| | `stamp` | Watermark, header, footer, page numbers, text at a point or under a found text, an image such as a signature, or a QR code |
 | | `annotate` | Add a highlight, underline, strike-out, box, note or link |
 | | `replace` | Replace text in place, in the document's own font where possible |
 | | `redact` | Remove text, images and drawings in areas or matching text, then verify |
@@ -173,6 +173,7 @@ Reading:
 
 ```sh
 pdfops text manual.pdf --pages 12- --max-chars 4000     # resume_at_page says where to continue
+pdfops text manual.pdf --pages 14- --from-char 4000 --max-chars 4000   # on, inside a page that was cut
 pdfops text scan.pdf --ocr --ocr-lang pol+eng           # OCR only the pages that have no text
 pdfops tables report.pdf --pages 4 --format markdown
 pdfops layout report.pdf --pages 4 --level words        # bbox, font and size per word
@@ -196,6 +197,8 @@ Editing:
 ```sh
 pdfops stamp in.pdf --text "Confidential · {page}/{pages}" --position footer -o out.pdf
 pdfops stamp in.pdf --image signature.png --x 380 --y 690 --width 140 --pages last -o out.pdf
+pdfops stamp in.pdf --text "Paid 2026-10-08" --x 72 --y 540 --size 11 -o out.pdf
+pdfops stamp in.pdf --text "Paid 2026-10-08" --below "Total due" -o out.pdf   # a line under that text
 pdfops stamp in.pdf --qr "https://example.com/doc/42" --anchor bottom-right -o out.pdf
 pdfops redact in.pdf --text "Jan Kowalski" --text "\d{11}" --regex -o redacted.pdf
 pdfops redact in.pdf --rect "2:100,200,300,220" -o redacted.pdf
@@ -371,6 +374,12 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
   where it cannot. In a table all of this stays within the cell.
 - **Dry run.** `redact`, `replace`, `annotate` and `stamp` take `--dry-run`: all the work,
   nothing written.
+- **Reading in parts.** `text --max-chars` stops at the budget and returns `resume_at_page` and
+  `resume_at_char`. Give them back as `--pages N-` and `--from-char`, and reading goes on where
+  it stopped, also in the middle of a page longer than the budget.
+- **Stamp** places text, an image or a QR code at a point (`--x`, `--y`), or under or over the
+  first match of a text on each page (`--below`, `--above`, `--gap`), so a line can be added
+  without measuring. A line break in the text starts a new line.
 - **Scan** reports scripts, actions, attachments, disguised content and hidden text by severity,
   and with `--clamav` what ClamAV's signatures recognise, where that is installed. **Sanitize**
   removes the active content and scans the result before writing it.
@@ -390,7 +399,10 @@ Typed entry points live in `pdfops::ops`, for example `pdfops::ops::read::text(T
 - **Tables without ruling lines** are inferred from how their text lines up, and say so
   (`detected_by: alignment`). An inference deserves a look.
 - **Replace** draws a line no narrower than 70% of its width. What a replacement still runs
-  over by is in `overflow_pt`, and `--dry-run` shows it before anything is written.
+  over by is in `overflow_pt`, and `--dry-run` shows it before anything is written. It does not
+  add lines: a replacement with a line break is refused.
+- **Stamp** draws over the page and moves nothing aside. Placed by a found text, it reports
+  its box and how many words lie under it (`words_under_it`).
 - **Create** follows the styling of HTML for how text looks: colour, background, bold, italic,
   underline, strike-through, size and alignment, from `style` attributes and `<style>` rules
   that go by tag, class and id. Layout is not read: no boxes, floats or grids.
